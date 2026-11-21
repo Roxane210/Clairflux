@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#f7f6f2" />
     <meta
       name="description"
-      content="ClairFlux — Suivi financier personnel multi-comptes BoursoBank & Revolut (EUR/USD), consultation hors-ligne."
+      content="ClairFlux — Suivi financier personnel multi-comptes BoursoBank & Revolut (EUR/USD), consultation et notes rapides hors-ligne."
     />
     <title>ClairFlux — Suivi financier multi-comptes</title>
 
@@ -104,7 +104,7 @@
         inline-size: 100%;
       }
 
-      /* Rail Desktop fixe 240px */
+      /* Rail Desktop fixe 240px actif à partir de 1024px */
       .cf-rail {
         display: none;
       }
@@ -122,7 +122,7 @@
         gap: 16px;
       }
 
-      /* En-tête mobile scrollable (respecte plafond sticky <= 15 %) */
+      /* En-tête scrollable (respecte plafond sticky <= 15 %) */
       .cf-header {
         display: flex;
         flex-wrap: wrap;
@@ -138,14 +138,14 @@
         gap: 8px;
       }
 
-      /* Barre basse mobile unique fixe (64px / 844px = 7.6 % <= 15 %) */
+      /* Barre basse mobile/tablette unique fixe (< 1024px, 64px / 844px = 7.6 % <= 15 %) */
       .cf-bottom-nav {
         position: fixed;
         inset-block-end: 0;
         inset-inline: 0;
         z-index: 20;
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
         block-size: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
         padding-block-end: env(safe-area-inset-bottom, 0px);
         background: var(--bg-surface);
@@ -153,6 +153,7 @@
       }
 
       .cf-nav-btn {
+        position: relative;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -175,7 +176,23 @@
         box-shadow: inset 0 2px 0 0 var(--accent);
       }
 
+      .cf-nav-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-inline-size: 20px;
+        block-size: 20px;
+        padding-inline: 6px;
+        border-radius: 999px;
+        background: var(--warning-soft);
+        border: 1px solid var(--warning);
+        color: var(--warning);
+        font-size: 0.6875rem;
+        font-weight: 700;
+      }
+
       .cf-nav-btn:focus-visible,
+      .cf-subtab-btn:focus-visible,
       .cf-btn:focus-visible,
       .cf-pill-btn:focus-visible,
       .cf-tx-trigger:focus-visible,
@@ -184,7 +201,7 @@
         outline-offset: 2px;
       }
 
-      @media (min-width: 768px) {
+      @media (min-width: 1024px) {
         .cf-rail {
           position: sticky;
           inset-block-start: 0;
@@ -206,7 +223,7 @@
         }
 
         .cf-nav-btn {
-          justify-content: flex-start;
+          justify-content: space-between;
           padding-inline: 12px;
           border-radius: var(--radius-control);
           font-size: 0.875rem;
@@ -226,6 +243,39 @@
           padding-inline: 32px;
           gap: 20px;
         }
+      }
+
+      /* Sous-onglets Transactions / Règles (surface plane, zéro cartes imbriquées) */
+      .cf-subtabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        border-block-end: 1px solid var(--border-subtle);
+        padding-inline: 16px;
+      }
+
+      .cf-subtab-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-block-size: 44px;
+        min-inline-size: 44px;
+        padding: 10px 14px;
+        border: 0;
+        border-block-end: 2px solid transparent;
+        background: transparent;
+        color: var(--text-secondary);
+        font-family: var(--font-sans);
+        font-size: 0.875rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .cf-subtab-btn[aria-selected='true'],
+      .cf-subtab-btn[aria-pressed='true'] {
+        color: var(--accent);
+        border-block-end-color: var(--accent);
       }
 
       /* Contrôles pilules réservés aux contrôles interactifs réels */
@@ -280,7 +330,8 @@
       }
 
       .cf-btn:disabled,
-      .cf-pill-btn:disabled {
+      .cf-pill-btn:disabled,
+      .cf-subtab-btn:disabled {
         opacity: 0.55;
         cursor: not-allowed;
       }
@@ -348,7 +399,7 @@
         gap: 16px;
       }
 
-      @container charts (min-width: 820px) {
+      @container charts (min-width: 860px) {
         .cf-charts-grid {
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
@@ -362,10 +413,114 @@
         min-inline-size: 0;
       }
 
+      .cf-chart-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
       .cf-chart-frame {
         inline-size: 100%;
         min-block-size: 260px;
         aspect-ratio: 16 / 9;
+      }
+
+      /* Jauges budgets (élévation unique, seuils 80 % / 100 %, repère rythme du mois) */
+      .cf-budget-list {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .cf-budget-row {
+        padding: 14px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        border-block-end: 1px solid var(--border-subtle);
+      }
+
+      .cf-budget-row:last-child {
+        border-block-end: 0;
+      }
+
+      .cf-budget-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .cf-budget-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.8125rem;
+        font-weight: 600;
+      }
+
+      .cf-budget-status[data-level='ok'] {
+        color: var(--accent);
+      }
+
+      .cf-budget-status[data-level='warning'] {
+        color: var(--warning);
+      }
+
+      .cf-budget-status[data-level='danger'] {
+        color: var(--danger);
+      }
+
+      .cf-budget-track {
+        position: relative;
+        inline-size: 100%;
+        block-size: 10px;
+        border-radius: 999px;
+        background: var(--bg-subtle);
+      }
+
+      .cf-budget-fill {
+        block-size: 100%;
+        border-radius: 999px;
+        transition: inline-size 180ms ease;
+      }
+
+      .cf-budget-fill[data-level='ok'] {
+        background: var(--accent);
+      }
+
+      .cf-budget-fill[data-level='warning'] {
+        background: var(--warning);
+      }
+
+      .cf-budget-fill[data-level='danger'] {
+        background: var(--danger);
+      }
+
+      .cf-budget-threshold {
+        position: absolute;
+        inset-block: -2px;
+        inset-inline-start: 80%;
+        inline-size: 2px;
+        background: var(--border-strong);
+      }
+
+      .cf-budget-pacing {
+        position: absolute;
+        inset-block: -4px;
+        inline-size: 2px;
+        background: var(--text-primary);
+      }
+
+      .cf-budget-foot {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 0.8125rem;
+        color: var(--text-secondary);
       }
 
       /* Grand livre adaptatif via @container (Table Desktop vs Liste compacte Mobile) */
@@ -538,8 +693,11 @@
         }
       }
 
-      /* Respect strict de prefers-reduced-motion pour View Transitions */
+      /* Respect strict de prefers-reduced-motion pour View Transitions & jauges */
       @media (prefers-reduced-motion: reduce) {
+        .cf-budget-fill {
+          transition: none;
+        }
         ::view-transition-group(*),
         ::view-transition-old(*),
         ::view-transition-new(*) {

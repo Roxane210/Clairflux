@@ -1,65 +1,84 @@
 # `@clairflux/web`
 
-Interface utilisateur React 19 + Vite + CSS natif Baseline + Recharts pour ClairFlux, ciblant le Web Desktop (`1440×900`) et l'application mobile Android APK Capacitor (`390×844` / `320px`, Offline-First lecture seule).
+Interface utilisateur React 19 + Vite 7 + CSS natif Baseline + Recharts pour ClairFlux, ciblant le Web Desktop (`>= 1024px` / `1440×900`) et l'application mobile Android APK Capacitor (`< 1024px` / `390×844` / `320px`, Offline-First avec Outbox locale).
 
 ---
 
 ## Interface
 
-Fichiers du socle Jalon 1 : [`index.html`](./index.html), [`vite.config.ts`](./vite.config.ts), [`src/main.tsx`](./src/main.tsx).
+### 1. Entrée, Shell & Configuration ([`index.html`](./index.html), [`vite.config.ts`](./vite.config.ts), [`capacitor.config.ts`](./capacitor.config.ts), [`src/main.tsx`](./src/main.tsx))
+- **`src/main.tsx`** : composant racine `ClairFluxApp` orchestrant la navigation par union discriminée `AppTab` (`'overview' | 'transactions' | 'sync'`), le sous-onglet `TransactionsSubTab` (`'operations' | 'rules'`), les filtres (`DashboardBankFilter`, `CurrencyViewMode`, `ExpenseComparisonMode`), le chargement paresseux `React.lazy` + `Suspense` (`DashboardCharts`, `TransactionsSection`, `BottomSheetNoteDialog`), la région `aria-live="polite"` et les transitions `runWithViewTransition`.
+- **`capacitor.config.ts`** : configuration Capacitor Android (`appId: 'com.clairflux.finance'`, `appName: 'ClairFlux'`, `webDir: 'dist'`, `server.androidScheme: 'https'`, `android.allowMixedContent: false`, `captureInput: true`).
+- **`vite.config.ts`** : découpage `manualChunks` en `vendor-react`, `vendor-d3` et `vendor-recharts`, et garde de sécurité `guardNoServerSecretsPlugin` bloquant toute variable serveur sensible préfixée `VITE_`.
 
-- **Architecture à 4 onglets via union discriminée `AppTab` (`'overview' | 'transactions' | 'rules' | 'sync'`)** :
-  - **Synthèse (`overview`)** : 4 KPIs financiers, sélecteur de périmètre `CurrencyScope` (`EUR consolidé` par défaut ou `Vue USD seul`, ou par banque/compte) et 2 graphiques Recharts chargés paresseusement via `React.lazy` + `Suspense` (`Solde cumulé 6M` et `Dépenses M-1 / Moyenne 3M` excluant les transferts internes).
-  - **Transactions (`transactions`)** : grand livre multi-comptes BoursoBank & Revolut exposant sur Desktop les colonnes *Date*, *Banque*, *Type de compte* (avec nom renommable & devise), *Libellé*, *Catégorie*, *Note personnalisée* et *Montant* (`tabular-nums`), et sur mobile des lignes compactes à 2 rangs via `@container`. Ouvre un tiroir natif `<dialog>` (`TransactionDrawerDialog`) pour annoter et recatégoriser.
-  - **Règles (`rules`)** : création de règles de catégorisation (`RulesView`) avec validation `:user-valid`/`:user-invalid` + `aria-invalid` synchronisé au `onBlur` et aperçu rétroactif local préservant `is_manual_category = true`.
-  - **Synchro Drive (`sync`)** : affichage du périmètre exclusif (`ALLOWED_DRIVE_FOLDERS`), déclenchement manuel (`Synchroniser maintenant`) et liste des statuts par fichier PDF (`SyncDriveView`).
-- **État réseau & simulation Offline-First Jalon 1** :
-  - Union discriminée `NetworkState` (`online` | `offline_readonly`) permettant de valider visuellement le passage en mode lecture seule hors-ligne depuis l'interface Mock-First.
-  - Helper `yieldToMain()` (`scheduler.yield()` avec fallback `setTimeout`) et `useDeferredValue` pour préserver la réactivité (`INP <= 200 ms`).
+### 2. Module Dashboard & Graphiques Recharts ([`src/features/dashboard/`](./src/features/dashboard/))
+- **[`types.ts`](./src/features/dashboard/types.ts)** : contrats UI partagés (`AppTab`, `TransactionsSubTab`, `ExpenseComparisonMode`, `DashboardBankFilter`, `CurrencyViewMode`, `BudgetLimit`, `ClairFluxDataset`, `KpiMetricsSummary`), `INITIAL_SEED_DATASET`, helpers `yieldToMain()`, `usePrefersReducedMotion()`, `runWithViewTransition()`, `computeKpiMetrics()`, `buildCumulativeBalanceSeries()`, `buildMonthlyExpenseSeries()`, `resolveSelectedTransactionContext()`.
+- **[`DashboardChrome.tsx`](./src/features/dashboard/DashboardChrome.tsx)** :
+  - `DesktopSidebar` (rail latéral Desktop `>= 1024px`) & `BottomTabBar` (barre de navigation basse mobile `< 1024px` avec badge du compteur Outbox).
+  - `OfflineStatusBanner` (bandeau d'état en ligne / hors-ligne avec compteur Outbox et bouton de synchronisation immédiate `flushNow`).
+  - `KpiSummaryCard` (4 KPIs en `JetBrains Mono tabular-nums` : solde consolidé, revenus, dépenses hors transferts, transferts internes).
+  - `BudgetAlertsPanel` : jauges de suivi budgétaire par catégorie avec alertes visuelles et textuelles aux seuils **80 %** (vigilance) et **100 %** (dépassement).
+  - `SyncDrivePanel` : affichage des 2 dossiers Drive exclusifs (`ALLOWED_DRIVE_FOLDERS`), statut des PDF et bouton *« Synchroniser Drive / Gemini »* (automatiquement désactivé hors-ligne avec libellé *« Connexion requise (hors-ligne) »*).
+- **[`DashboardCharts.tsx`](./src/features/dashboard/DashboardCharts.tsx)** :
+  - Contrôles de périmètre banque (`Tous les comptes`, `BoursoBank`, `Revolut`), mode devise (`EUR consolidé` / `USD seul`) et mode de comparaison des dépenses (`Sans comparaison`, `Mois précédent (M-1)`, `Moyenne 3 mois`).
+  - Graphique 1 : **Solde bancaire cumulé 6M** (`AreaChart` Recharts).
+  - Graphique 2 : **Dépenses mensuelles** (`AreaChart` Recharts sur 6 mois supportant les 3 modes `'none' | 'prev_month' | 'avg_3m'`, hors transferts internes).
 
-### Prévu aux jalons suivants
-- Branchement HTTP sur `@clairflux/api` (remplacement du jeu de données Mock-First par les appels API réels, polling borné sur `GET /api/sync/drive/status` uniquement pendant un run `running`, bouton *« Réessayer ce fichier »*, appel `POST /api/rules/preview` et bascule `is_internal_transfer`).
-- Couche de réplication locale (`src/offline/`) via `GET /api/sync/delta?since=<revision>` (IndexedDB / `@capacitor-community/sqlite` avec `PRAGMA defer_foreign_keys = ON` au bootstrap `since=0`) et stockage du Bearer token dans Android Keystore.
-- Web Worker dédié (`src/workers/`) pour le filtrage/tri au-delà de 500 opérations.
-- Primitives et intégrations natives complémentaires : Popover API (`[popover]`), `capacitor.config.ts` et interception `App.addListener('backButton')` sous Capacitor pour fermer le `<dialog>` ouvert.
+### 3. Module Grand Livre, Règles, Tiroir `<dialog>` & Export CSV ([`src/features/ledger/`](./src/features/ledger/))
+- **[`TransactionsSection.tsx`](./src/features/ledger/TransactionsSection.tsx)** :
+  - Bascule entre les sous-onglets **Opérations** (`operations`) et **Règles de catégorisation** (`rules`).
+  - Recherche instantanée différée (`useDeferredValue`), filtre rapide **« Avec notes »** (`onlyWithNotes`), bouton d'export CSV, tableau complet sur Desktop (colonnes *Date*, *Banque*, *Type de compte*, *Libellé*, *Catégorie*, *Note personnalisée*, *Montant*) et cartes compactes à 2 rangs sur mobile via `@container`.
+- **[`BottomSheetNoteDialog.tsx`](./src/features/ledger/BottomSheetNoteDialog.tsx)** :
+  - Tiroir modal natif `<dialog>` (`.showModal()`) permettant l'ajout/édition de **notes rapides y compris hors-ligne** (enregistrées dans l'Outbox locale avec confirmation immédiate), la modification de catégorie manuelle / statut `Transfert interne`, et le raccourci *« Créer une règle depuis ce libellé »*.
+- **[`RulesTab.tsx`](./src/features/ledger/RulesTab.tsx)** :
+  - Création/édition de règles de catégorisation (filtres banque et compte, validation `:user-valid`/`:user-invalid` + `aria-invalid` au `onBlur`), réordonnancement de priorité (`up`/`down`), activation/désactivation et bouton *« Réappliquer à l'historique »* respectant `is_manual_category = true`.
+- **[`csvExport.ts`](./src/features/ledger/csvExport.ts)** :
+  - `neutralizeCsvFormula` & `exportTransactionsToCsv` : génération CSV RFC 4180 avec préfixe UTF-8 BOM et neutralisation anti-injection de formules tableur (`=`, `+`, `-`, `@`, `\t`, `\r`) sur les cellules textuelles tout en conservant les montants numériques signés exacts.
+
+### 4. Moteur Offline-First, Outbox & Pont Android Capacitor ([`src/offline/`](./src/offline/))
+- **[`indexedDbStore.ts`](./src/offline/indexedDbStore.ts)** :
+  - Persistance locale `IndexedDB` (`clairflux_offline_v1`) avec les stores `snapshots` et `outbox_mutations` (`client_mutation_id` UUID, `kind: 'upsert_note' | 'update_category'`, statut `'pending' | 'syncing' | 'failed'`), validation Zod stricte (`ClairFluxDatasetSchema`, `OutboxMutationSchema`) à la lecture, et fallback mémoire automatique (`createMemoryOfflineStore`).
+- **[`deltaSyncEngine.ts`](./src/offline/deltaSyncEngine.ts)** :
+  - `pullDelta` (`GET /api/sync/delta?since=...`), `applyDeltaToDataset`, `flushOutbox` (`POST /api/sync/delta` idempotent par `client_mutation_id`, suppression uniquement après acquittement `applied | duplicate`), garde `canTriggerDriveSync` bloquant la synchro Drive/Gemini hors-ligne, `reapplyRulesOnTransactions`, et pont Android `setupAndroidBridge` (écoute réseau `online`/`offline` + plugin Capacitor `Network`, bouton matériel `backButton` fermant `<dialog open>` en priorité, retour haptique léger `Haptics.impact`).
+- **[`useOfflineStore.ts`](./src/offline/useOfflineStore.ts)** :
+  - Hook React `useOfflineStore(initialSeed)` et contrôleur `createOfflineController` fournissant l'optimistic UI hors-ligne et la synchronisation automatique au retour de la connexion.
 
 ---
 
 ## Invariants
 
-1. **Consultation complète hors-ligne / Écritures en ligne uniquement** :
-   - En état `offline_readonly`, 100 % des vues de consultation (KPIs, graphiques, grand livre, notes, règles, statuts Drive) restent accessibles.
-   - Zéro outbox locale : tous les contrôles de mutation passent désactivés avec libellé explicite *« Connexion requise pour modifier »*.
-2. **Zéro secret & zéro CDN externe** :
-   - Le plugin Vite `guardNoServerSecretsPlugin` bloque au build toute variable `VITE_*` contenant un motif sensible (`DATABASE_URL`, `GEMINI_API_KEY`, `CLAIRFLUX_ACCESS_SECRET_HASH`, `CLAIRFLUX_SESSION_SECRET`, `GOOGLE_DRIVE`, `SERVICE_ACCOUNT`, `INTERNAL_WORKER_TOKEN`, `PRIVATE_KEY`).
-   - Polices **Plus Jakarta Sans** (600, 700), **DM Sans** (400, 500, 600) et **JetBrains Mono** (400, 500, 600 avec `.tabular-amount` `font-variant-numeric: tabular-nums`) bundlées localement via `@fontsource/*` (zéro requête vers `fonts.googleapis.com`).
-3. **Primitives Web Baseline & Android System WebView** :
-   - `<dialog>` + `.showModal()` avec `overscroll-behavior: contain` sur `dialog:modal` et `dialog::backdrop`.
-   - CSS Container Queries (`@container`), `:has()` borné à `.cf-field-group` (jamais `body:has`/`:root:has`), `:user-valid`/`:user-invalid`, `content-visibility: auto` couplé à `contain-intrinsic-size: auto 72px` sous le fold, View Transitions désactivées sous `@media (prefers-reduced-motion: reduce)`.
-   - Unités `100dvh` / `100dvw` et `env(safe-area-inset-*)` (zéro `100vh`/`100vw`).
-4. **Ergonomie, géométrie & accessibilité WCAG 2.1 AA** :
-   - Élévation unique (`.cf-surface`, zéro cartes imbriquées), zéro pills statiques sur les métadonnées passives.
-   - Cibles tactiles `>= 44×44 px`, plafond sticky mobile `<= 15 %` (barre basse `64px + env(safe-area-inset-bottom)` sur `844 px`, en-tête scrollable), `overflow-x: clip`, zéro débordement horizontal à `390px` et `320px`.
-   - Contraste `>= 4.5:1` (texte) / `>= 3:1` (graphiques Recharts), aucune information par couleur seule, zéro `dangerouslySetInnerHTML`.
-5. **Code-Splitting & Performance** :
-   - `React.memo` sur composants de présentation, `React.lazy` + `Suspense` pour `recharts`, `manualChunks` Vite séparant `vendor-react`, `vendor-d3` et `vendor-recharts`.
+1. **Offline-First avec Outbox locale & garde Drive hors-ligne** :
+   - Hors connexion, 100 % des vues (KPIs, graphiques Recharts 6M & Dépenses, grand livre, notes, règles, budgets) restent consultables depuis le snapshot local.
+   - Les notes rapides et recatégorisations manuelles effectuées hors-ligne sont persistées dans `outbox_mutations` avec `client_mutation_id` UUID et synchronisées de manière idempotente dès le retour réseau.
+   - La synchronisation Google Drive / Gemini (`triggerDriveSync`) est strictement interdite et désactivée hors-ligne.
+2. **Protection des choix manuels** :
+   - `reapplyRulesOnTransactions` exclut toute transaction ayant `is_manual_category = true`, `transfer_group_id !== null` ou `is_manual_transfer_override = true`.
+3. **Zéro secret & polices 100 % locales** :
+   - Aucune clé serveur (`DATABASE_URL`, `GEMINI_API_KEY`, `CLAIRFLUX_ACCESS_SECRET_HASH`, `CLAIRFLUX_SESSION_SECRET`, `GOOGLE_DRIVE`, `SERVICE_ACCOUNT`, `INTERNAL_WORKER_TOKEN`, `PRIVATE_KEY`) ne peut entrer dans le bundle `VITE_*`.
+   - Polices **Plus Jakarta Sans** (600, 700), **DM Sans** (400, 500, 600) et **JetBrains Mono** (400, 500, 600 avec `font-variant-numeric: tabular-nums`) bundlées en `.woff2` via `@fontsource/*` (zéro CDN externe).
+4. **Ergonomie Baseline, Géométrie & WCAG 2.1 AA** :
+   - Élévation unique (`.cf-surface`, zéro cartes imbriquées), zéro pills statiques sur les métadonnées passives, cibles tactiles `>= 44×44 px`, plafond sticky mobile `<= 15 %` (`BottomTabBar` `64px + env(safe-area-inset-bottom)` sous `< 1024px`, en-tête scrollable), zéro débordement horizontal à `390px` et `320px`.
+   - `<dialog>` natif avec `overscroll-behavior: contain` sur `dialog:modal` et `dialog::backdrop`, `@container` queries, `:has()` borné à `.cf-field-group`, `:user-valid`/`:user-invalid`, `content-visibility: auto` + `contain-intrinsic-size: auto 72px` sous le fold, View Transitions et animations Recharts désactivées sous `prefers-reduced-motion: reduce`.
 
 ---
 
 ## Side Effects
 
-- **Rendu DOM & chargement paresseux** : manipulation du DOM via React 19, ouverture/fermeture modale via `HTMLDialogElement.showModal()` / `.close()`, et chargement asynchrone des chunks JS Recharts.
-- **Écoute système navigateur** : abonnement `window.matchMedia('(prefers-reduced-motion: reduce)')` pour désactiver les View Transitions et animations Recharts.
-- *(Aucune requête réseau ni écriture SQLite/Keystore n'est encore émise dans le socle Mock-First de Jalon 1.)*
+- **Stockage local `IndexedDB` (`clairflux_offline_v1`)** : lecture/écriture validée par Zod des snapshots et de la file `outbox_mutations`.
+- **Requêtes HTTP delta sync & Drive** : appels `GET /api/sync/delta`, `POST /api/sync/delta` (flush Outbox) et `POST /api/sync/drive` via `fetch`.
+- **DOM, Blob CSV & Pont Capacitor Android** : manipulation modale `<dialog>.showModal()` / `.close()`, génération de fichier CSV local (`URL.createObjectURL`), écoute `navigator.onLine` / événements `online`/`offline` et listeners optionnels Capacitor (`Network`, `App.addListener('backButton')`, `Haptics`).
 
 ---
 
 ## Verification
 
 ```bash
-# Vérification TypeScript stricte dans @clairflux/web
+# Vérification TypeScript stricte (@clairflux/web + capacitor.config.ts)
 npm run typecheck --workspace=@clairflux/web
 
-# Build Vite production (séparation des chunks vendor-react / vendor-d3 / vendor-recharts et garde secrets VITE_*)
-npm run build
+# Tests unitaires et d'intégration Frontend & Offline (13 tests : ledger.test.ts + offline.test.ts)
+npm test --workspace=@clairflux/web
+
+# Build Vite de production (vérification des chunks vendor-react / vendor-d3 / vendor-recharts et garde secrets)
+npm run build --workspace=@clairflux/web
 ```
