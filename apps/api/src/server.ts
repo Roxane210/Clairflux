@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { serve, type ServerType } from '@hono/node-server';
@@ -16,7 +19,6 @@ import {
   type Account,
   type AccountId,
   type Bank,
-  type Cents,
   type Currency,
   type DeltaSyncResponse,
   type RuleId,
@@ -42,6 +44,8 @@ import { EnvValidationError, parseApiEnv, type ApiEnv } from './config/env.js';
 import { createNeonClients, type NeonClients } from './db/client.js';
 import {
   accounts,
+  appliedClientMutations,
+  budgetLimits,
   categorizationRules,
   driveFiles,
   driveSyncRuns,
@@ -51,28 +55,28 @@ import {
   transactions,
 } from './db/schema.js';
 import {
+  ApkStatusSchema,
   computeAnalyticsOverview,
   computeBudgetAlert,
   computeRuleReapplication,
   isSafeRegexPattern,
   type AnalyticsAccountInput,
   type AnalyticsTransactionInput,
+  type ApkArtifactRepository,
+  type ApkStatus,
   type BudgetItem,
+  type DeltaMutationRepository,
+  type OutboxMutation,
   type OutboxMutationOutcome,
+  type PatchTransactionResult,
+  type PostSyncDeltaResponse,
   type PutBudgetInput,
   type RuleEvalRule,
   type RuleEvalTransaction,
   type RuleView,
   type TransactionDetail,
+  type TransactionPatchInput,
 } from './routes/contracts.js';
-
-interface BudgetConfigEntry {
-  readonly category: string;
-  readonly monthly_limit_cents: Cents;
-  readonly currency: Currency;
-  readonly revision: SyncRevision;
-  readonly updated_at: string;
-}
 
 const DEFAULT_USD_TO_EUR_MICRO = 924_500;
 
@@ -123,6 +127,7 @@ async function fetchLatestSyncRevision(clients: NeonClients): Promise<SyncRevisi
       COALESCE((SELECT MAX(revision) FROM transactions), 0),
       COALESCE((SELECT MAX(revision) FROM transaction_notes), 0),
       COALESCE((SELECT MAX(revision) FROM categorization_rules), 0),
+      COALESCE((SELECT MAX(revision) FROM budget_limits), 0),
       COALESCE((SELECT MAX(revision) FROM drive_files), 0),
       COALESCE((SELECT MAX(revision) FROM drive_sync_runs), 0)
     )::bigint AS max_rev`,
@@ -132,13 +137,230 @@ async function fetchLatestSyncRevision(clients: NeonClients): Promise<SyncRevisi
   return toSyncRevision(Number.isSafeInteger(rawRev) && rawRev >= 0 ? rawRev : 0);
 }
 
-async function allocateNextRevision(
-  tx: Parameters<Parameters<NeonClients['poolDb']['transaction']>[0]>[0],
-): Promise<SyncRevision> {
+type NeonTx = Parameters<Parameters<NeonClients['poolDb']['transaction']>[0]>[0];
+
+async function allocateNextRevision(tx: NeonTx): Promise<SyncRevision> {
   const result = await tx.execute(sql`SELECT nextval('sync_revision_seq')::bigint AS next_rev`);
   const parsed = NextRevRowSchema.safeParse(result.rows[0]);
   const rev = parsed.success ? parsed.data.next_rev : 1;
   return toSyncRevision(Number.isSafeInteger(rev) && rev >= 0 ? rev : 1);
+}
+
+// ============================================================================
+// Outbox Idempotency (Canonical Payload SHA-256 + SQL Persistence)
+// ============================================================================
+
+export interface AppliedClientMutationRecord {
+  readonly clientMutationId: string;
+  readonly payloadHash: string;
+  readonly appliedAt: Date;
+  readonly resultStatus: string;
+  readonly resultRevision: number;
+}
+
+export interface OutboxMutationPersistence {
+  findAppliedMutation(clientMutationId: string): Promise<AppliedClientMutationRecord | null>;
+  applyAndRecordMutation(params: {
+    readonly mutation: OutboxMutation;
+    readonly payloadHash: string;
+  }): Promise<
+    | { readonly kind: 'applied'; readonly revision: SyncRevision }
+    | { readonly kind: 'duplicate'; readonly revision: SyncRevision }
+    | { readonly kind: 'not_found' }
+    | { readonly kind: 'conflict' }
+  >;
+  getLatestRevision(): Promise<SyncRevision>;
+}
+
+export function computeCanonicalMutationPayloadHash(mutation: OutboxMutation): string {
+  const canonicalPayload = (() => {
+    switch (mutation.kind) {
+      case 'upsert_note':
+        return {
+          kind: mutation.kind,
+          transaction_id: mutation.transaction_id,
+          note: mutation.note,
+        };
+      case 'set_category':
+        return {
+          kind: mutation.kind,
+          transaction_id: mutation.transaction_id,
+          category: mutation.category,
+        };
+      case 'set_internal_transfer':
+        return {
+          kind: mutation.kind,
+          transaction_id: mutation.transaction_id,
+          is_internal_transfer: mutation.is_internal_transfer,
+        };
+    }
+  })();
+
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalPayload), 'utf8')
+    .digest('hex');
+}
+
+export function createIdempotentDeltaMutationRepository(
+  persistence: OutboxMutationPersistence,
+): DeltaMutationRepository {
+  return {
+    async applyOutboxBatch(mutations): Promise<PostSyncDeltaResponse> {
+      const results: OutboxMutationOutcome[] = [];
+      let latestRev = await persistence.getLatestRevision();
+
+      for (const mutation of mutations) {
+        const payloadHash = computeCanonicalMutationPayloadHash(mutation);
+        const existing = await persistence.findAppliedMutation(mutation.client_mutation_id);
+        if (existing !== null) {
+          if (existing.payloadHash !== payloadHash) {
+            results.push({
+              client_mutation_id: mutation.client_mutation_id,
+              status: 'rejected',
+              reason: 'CONFLICT',
+              message: 'client_mutation_id déjà enregistré avec un payload différent.',
+            });
+            continue;
+          }
+          const existingRev = toSyncRevision(existing.resultRevision);
+          latestRev = toSyncRevision(Math.max(latestRev, existingRev));
+          results.push({
+            client_mutation_id: mutation.client_mutation_id,
+            status: 'duplicate',
+            revision: existingRev,
+          });
+          continue;
+        }
+
+        const applied = await persistence.applyAndRecordMutation({ mutation, payloadHash });
+        switch (applied.kind) {
+          case 'applied':
+            latestRev = toSyncRevision(Math.max(latestRev, applied.revision));
+            results.push({
+              client_mutation_id: mutation.client_mutation_id,
+              status: 'applied',
+              revision: applied.revision,
+            });
+            break;
+          case 'duplicate':
+            latestRev = toSyncRevision(Math.max(latestRev, applied.revision));
+            results.push({
+              client_mutation_id: mutation.client_mutation_id,
+              status: 'duplicate',
+              revision: applied.revision,
+            });
+            break;
+          case 'not_found':
+            results.push({
+              client_mutation_id: mutation.client_mutation_id,
+              status: 'rejected',
+              reason: 'RESOURCE_NOT_FOUND',
+              message: 'Transaction introuvable.',
+            });
+            break;
+          case 'conflict':
+            results.push({
+              client_mutation_id: mutation.client_mutation_id,
+              status: 'rejected',
+              reason: 'CONFLICT',
+              message: 'client_mutation_id déjà enregistré avec un payload différent.',
+            });
+            break;
+        }
+      }
+
+      return {
+        results,
+        latest_revision: latestRev,
+      };
+    },
+  };
+}
+
+// ============================================================================
+// Filesystem Android APK Artifact Repository
+// ============================================================================
+
+const DEFAULT_APK_PATH = '/shared-apk/clairflux-release.apk';
+const DEFAULT_APK_VERSION = '1.0.0-rc1';
+const APK_DOWNLOAD_FILENAME = 'clairflux-release.apk';
+
+async function computeFileSha256(filePath: string): Promise<string> {
+  return new Promise<string>((resolveHash, rejectHash) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk) => {
+      hash.update(chunk);
+    });
+    stream.on('end', () => {
+      resolveHash(hash.digest('hex'));
+    });
+    stream.on('error', rejectHash);
+  });
+}
+
+async function resolveApkSha256(apkPath: string): Promise<string> {
+  try {
+    const sidecarRaw = await readFile(`${apkPath}.sha256`, 'utf8');
+    const match = /^([a-f0-9]{64})(?:\s|$)/i.exec(sidecarRaw.trim());
+    if (match !== null && match[1] !== undefined) {
+      return match[1].toLowerCase();
+    }
+  } catch {
+    // Sidecar missing or unreadable: fall back to streaming SHA-256 of the APK file
+  }
+  return computeFileSha256(apkPath);
+}
+
+export function createFilesystemApkRepository(
+  apkPath: string = process.env['APK_OUTPUT_PATH']?.trim() || DEFAULT_APK_PATH,
+  version: string = process.env['CLAIRFLUX_APP_VERSION']?.trim() || DEFAULT_APK_VERSION,
+): ApkArtifactRepository {
+  const unavailableStatus = (): ApkStatus => ({
+    available: false,
+    version,
+    sizeBytes: null,
+    sha256: null,
+    builtAt: null,
+  });
+
+  return {
+    async getStatus(): Promise<ApkStatus> {
+      try {
+        const fileStat = await stat(apkPath);
+        if (!fileStat.isFile()) {
+          return unavailableStatus();
+        }
+        const sha256 = await resolveApkSha256(apkPath);
+        return ApkStatusSchema.parse({
+          available: true,
+          version,
+          sizeBytes: fileStat.size,
+          sha256,
+          builtAt: fileStat.mtime.toISOString(),
+        });
+      } catch {
+        return unavailableStatus();
+      }
+    },
+
+    async readBinary() {
+      try {
+        const fileStat = await stat(apkPath);
+        if (!fileStat.isFile()) {
+          return null;
+        }
+        const buf = await readFile(apkPath);
+        return {
+          bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
+          sizeBytes: buf.byteLength,
+          filename: APK_DOWNLOAD_FILENAME,
+        };
+      } catch {
+        return null;
+      }
+    },
+  };
 }
 
 function mapAccountRow(row: typeof accounts.$inferSelect, usdRateMicro: number): Account {
@@ -163,21 +385,19 @@ function mapAccountRow(row: typeof accounts.$inferSelect, usdRateMicro: number):
   };
 }
 
+class ConcurrentMutationConflictError extends Error {
+  public constructor() {
+    super('Concurrent client_mutation_id conflict');
+    this.name = 'ConcurrentMutationConflictError';
+  }
+}
+
 export function createNeonAppDependencies(
   env: ApiEnv,
   clients: NeonClients,
   internalWorkerToken: string = parseInternalWorkerToken(),
-): AppDependencies {
-  const budgetStore = new Map<string, BudgetConfigEntry>();
-  const idempotencyStore = new Map<string, SyncRevision>();
-  let localSequenceFallback = 0;
-
-  const nextLocalRevision = async (): Promise<SyncRevision> => {
-    const dbRev = await fetchLatestSyncRevision(clients);
-    localSequenceFallback = Math.max(localSequenceFallback + 1, dbRev + 1);
-    return toSyncRevision(localSequenceFallback);
-  };
-
+  apkRepository: ApkArtifactRepository = createFilesystemApkRepository(),
+): AppDependencies & { readonly apk: ApkArtifactRepository } {
   const healthRepository: AppDependencies['healthRepository'] = {
     async ping(): Promise<boolean> {
       try {
@@ -215,6 +435,147 @@ export function createNeonAppDependencies(
       };
     },
   };
+
+  async function patchTransactionInTx(
+    tx: NeonTx,
+    id: TransactionId,
+    patch: TransactionPatchInput,
+  ): Promise<PatchTransactionResult> {
+    const existingRows = await tx
+      .select({
+        txRow: transactions,
+        account: accounts,
+      })
+      .from(transactions)
+      .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+      .where(and(eq(transactions.id, id), isNull(transactions.deletedAt)))
+      .limit(1);
+
+    const existing = existingRows[0];
+    if (existing === undefined) {
+      return { ok: false, reason: 'not_found' };
+    }
+
+    const now = new Date();
+    let highestRevision = await allocateNextRevision(tx);
+
+    const updatePayload: Partial<typeof transactions.$inferInsert> = {
+      updatedAt: now,
+      revision: highestRevision,
+    };
+
+    if (patch.category !== undefined) {
+      updatePayload.category = patch.category;
+      updatePayload.isManualCategory = true;
+      updatePayload.matchedRuleId = null;
+    } else if (patch.is_manual_category !== undefined) {
+      updatePayload.isManualCategory = patch.is_manual_category;
+    }
+
+    if (patch.is_internal_transfer !== undefined) {
+      updatePayload.isInternalTransfer = patch.is_internal_transfer;
+      updatePayload.isManualTransferOverride = true;
+      if (!patch.is_internal_transfer) {
+        updatePayload.transferGroupId = null;
+      }
+    }
+
+    const [updatedTx] = await tx
+      .update(transactions)
+      .set(updatePayload)
+      .where(eq(transactions.id, id))
+      .returning();
+
+    if (updatedTx === undefined) {
+      return { ok: false, reason: 'not_found' };
+    }
+
+    let noteView: { content: string; updated_at: string } | null = null;
+    if (patch.note !== undefined) {
+      const noteRev = await allocateNextRevision(tx);
+      highestRevision = noteRev;
+      if (patch.note === null) {
+        await tx
+          .update(transactionNotes)
+          .set({ deletedAt: now, updatedAt: now, revision: noteRev })
+          .where(eq(transactionNotes.transactionId, id));
+        noteView = null;
+      } else {
+        const [upsertedNote] = await tx
+          .insert(transactionNotes)
+          .values({
+            transactionId: id,
+            content: patch.note,
+            revision: noteRev,
+            updatedAt: now,
+            deletedAt: null,
+          })
+          .onConflictDoUpdate({
+            target: transactionNotes.transactionId,
+            set: {
+              content: patch.note,
+              revision: noteRev,
+              updatedAt: now,
+              deletedAt: null,
+            },
+          })
+          .returning();
+        if (upsertedNote !== undefined) {
+          noteView = {
+            content: upsertedNote.content,
+            updated_at: upsertedNote.updatedAt.toISOString(),
+          };
+        }
+      }
+    } else {
+      const currentNoteRows = await tx
+        .select()
+        .from(transactionNotes)
+        .where(and(eq(transactionNotes.transactionId, id), isNull(transactionNotes.deletedAt)))
+        .limit(1);
+      const currentNote = currentNoteRows[0];
+      if (currentNote !== undefined) {
+        noteView = {
+          content: currentNote.content,
+          updated_at: currentNote.updatedAt.toISOString(),
+        };
+      }
+    }
+
+    const detail: TransactionDetail = {
+      id: parseTransactionId(updatedTx.id),
+      account_id: parseAccountId(updatedTx.accountId),
+      bank: existing.account.bank,
+      account_type: existing.account.accountType,
+      account_nickname: existing.account.nickname,
+      external_ref_masked: existing.account.externalRefMasked,
+      booking_date: updatedTx.bookingDate,
+      value_date: updatedTx.valueDate,
+      raw_label: updatedTx.rawLabel,
+      clean_label: updatedTx.cleanLabel,
+      amount_cents: toCents(updatedTx.amountCents),
+      currency: updatedTx.currency,
+      fx_rate_micro: toFxRateMicro(updatedTx.fxRateMicro),
+      amount_eur_cents: toCents(updatedTx.amountEurCents),
+      category: updatedTx.category,
+      is_manual_category: updatedTx.isManualCategory,
+      matched_rule_id:
+        updatedTx.matchedRuleId !== null ? parseRuleId(updatedTx.matchedRuleId) : null,
+      is_internal_transfer: updatedTx.isInternalTransfer,
+      is_manual_transfer_override: updatedTx.isManualTransferOverride,
+      transfer_group_id: updatedTx.transferGroupId,
+      source_drive_file_id: updatedTx.sourceDriveFileId,
+      note: noteView,
+      revision: toSyncRevision(updatedTx.revision),
+      updated_at: updatedTx.updatedAt.toISOString(),
+    };
+
+    return {
+      ok: true,
+      transaction: detail,
+      latest_revision: highestRevision,
+    };
+  }
 
   const transactionsRepository: NonNullable<AppDependencies['transactionsRepository']> = {
     async listTransactions(filter) {
@@ -323,142 +684,7 @@ export function createNeonAppDependencies(
     },
 
     async patchTransaction(id, patch) {
-      return clients.poolDb.transaction(async (tx) => {
-        const existingRows = await tx
-          .select({
-            txRow: transactions,
-            account: accounts,
-          })
-          .from(transactions)
-          .innerJoin(accounts, eq(transactions.accountId, accounts.id))
-          .where(and(eq(transactions.id, id), isNull(transactions.deletedAt)))
-          .limit(1);
-
-        const existing = existingRows[0];
-        if (existing === undefined) {
-          return { ok: false, reason: 'not_found' } as const;
-        }
-
-        const now = new Date();
-        let highestRevision = await allocateNextRevision(tx);
-
-        const updatePayload: Partial<typeof transactions.$inferInsert> = {
-          updatedAt: now,
-          revision: highestRevision,
-        };
-
-        if (patch.category !== undefined) {
-          updatePayload.category = patch.category;
-          updatePayload.isManualCategory = true;
-          updatePayload.matchedRuleId = null;
-        } else if (patch.is_manual_category !== undefined) {
-          updatePayload.isManualCategory = patch.is_manual_category;
-        }
-
-        if (patch.is_internal_transfer !== undefined) {
-          updatePayload.isInternalTransfer = patch.is_internal_transfer;
-          updatePayload.isManualTransferOverride = true;
-          if (!patch.is_internal_transfer) {
-            updatePayload.transferGroupId = null;
-          }
-        }
-
-        const [updatedTx] = await tx
-          .update(transactions)
-          .set(updatePayload)
-          .where(eq(transactions.id, id))
-          .returning();
-
-        if (updatedTx === undefined) {
-          return { ok: false, reason: 'not_found' } as const;
-        }
-
-        let noteView: { content: string; updated_at: string } | null = null;
-        if (patch.note !== undefined) {
-          const noteRev = await allocateNextRevision(tx);
-          highestRevision = noteRev;
-          if (patch.note === null) {
-            await tx
-              .update(transactionNotes)
-              .set({ deletedAt: now, updatedAt: now, revision: noteRev })
-              .where(eq(transactionNotes.transactionId, id));
-            noteView = null;
-          } else {
-            const [upsertedNote] = await tx
-              .insert(transactionNotes)
-              .values({
-                transactionId: id,
-                content: patch.note,
-                revision: noteRev,
-                updatedAt: now,
-                deletedAt: null,
-              })
-              .onConflictDoUpdate({
-                target: transactionNotes.transactionId,
-                set: {
-                  content: patch.note,
-                  revision: noteRev,
-                  updatedAt: now,
-                  deletedAt: null,
-                },
-              })
-              .returning();
-            if (upsertedNote !== undefined) {
-              noteView = {
-                content: upsertedNote.content,
-                updated_at: upsertedNote.updatedAt.toISOString(),
-              };
-            }
-          }
-        } else {
-          const currentNoteRows = await tx
-            .select()
-            .from(transactionNotes)
-            .where(and(eq(transactionNotes.transactionId, id), isNull(transactionNotes.deletedAt)))
-            .limit(1);
-          const currentNote = currentNoteRows[0];
-          if (currentNote !== undefined) {
-            noteView = {
-              content: currentNote.content,
-              updated_at: currentNote.updatedAt.toISOString(),
-            };
-          }
-        }
-
-        const detail: TransactionDetail = {
-          id: parseTransactionId(updatedTx.id),
-          account_id: parseAccountId(updatedTx.accountId),
-          bank: existing.account.bank,
-          account_type: existing.account.accountType,
-          account_nickname: existing.account.nickname,
-          external_ref_masked: existing.account.externalRefMasked,
-          booking_date: updatedTx.bookingDate,
-          value_date: updatedTx.valueDate,
-          raw_label: updatedTx.rawLabel,
-          clean_label: updatedTx.cleanLabel,
-          amount_cents: toCents(updatedTx.amountCents),
-          currency: updatedTx.currency,
-          fx_rate_micro: toFxRateMicro(updatedTx.fxRateMicro),
-          amount_eur_cents: toCents(updatedTx.amountEurCents),
-          category: updatedTx.category,
-          is_manual_category: updatedTx.isManualCategory,
-          matched_rule_id:
-            updatedTx.matchedRuleId !== null ? parseRuleId(updatedTx.matchedRuleId) : null,
-          is_internal_transfer: updatedTx.isInternalTransfer,
-          is_manual_transfer_override: updatedTx.isManualTransferOverride,
-          transfer_group_id: updatedTx.transferGroupId,
-          source_drive_file_id: updatedTx.sourceDriveFileId,
-          note: noteView,
-          revision: toSyncRevision(updatedTx.revision),
-          updated_at: updatedTx.updatedAt.toISOString(),
-        };
-
-        return {
-          ok: true,
-          transaction: detail,
-          latest_revision: highestRevision,
-        } as const;
-      });
+      return clients.poolDb.transaction((tx) => patchTransactionInTx(tx, id, patch));
     },
   };
 
@@ -758,14 +984,31 @@ export function createNeonAppDependencies(
         }
 
         const recalc = await runRuleRecalcInTx(tx);
-        const rows = await tx
-          .select()
-          .from(categorizationRules)
-          .where(isNull(categorizationRules.deletedAt))
-          .orderBy(asc(categorizationRules.priority), asc(categorizationRules.createdAt));
+        const [rows, countRows] = await Promise.all([
+          tx
+            .select()
+            .from(categorizationRules)
+            .where(isNull(categorizationRules.deletedAt))
+            .orderBy(asc(categorizationRules.priority), asc(categorizationRules.createdAt)),
+          tx
+            .select({
+              ruleId: transactions.matchedRuleId,
+              count: sql<number>`count(*)::int`,
+            })
+            .from(transactions)
+            .where(and(isNull(transactions.deletedAt), isNotNull(transactions.matchedRuleId)))
+            .groupBy(transactions.matchedRuleId),
+        ]);
+
+        const countMap = new Map<string, number>();
+        for (const cRow of countRows) {
+          if (cRow.ruleId !== null) {
+            countMap.set(cRow.ruleId, cRow.count);
+          }
+        }
 
         return {
-          rules: rows.map((row) => mapRuleView(row, 0)),
+          rules: rows.map((row) => mapRuleView(row, countMap.get(row.id) ?? 0)),
           retroactive_stats: {
             updated_count: recalc.updatedCount,
             skipped_protected_count: recalc.skippedProtectedCount,
@@ -828,84 +1071,123 @@ export function createNeonAppDependencies(
 
   const budgetsRepository: NonNullable<AppDependencies['budgetsRepository']> = {
     async listBudgets(query) {
-      const latestRev = await fetchLatestSyncRevision(clients);
-      const entries = Array.from(budgetStore.values()).filter((entry) =>
-        query.currency === undefined ? true : entry.currency === query.currency,
-      );
+      const rowsPromise =
+        query.currency !== undefined
+          ? clients.httpDb
+              .select()
+              .from(budgetLimits)
+              .where(eq(budgetLimits.currency, query.currency))
+              .orderBy(asc(budgetLimits.category))
+          : clients.httpDb
+              .select()
+              .from(budgetLimits)
+              .orderBy(asc(budgetLimits.category));
 
-      const spentEurMap = await computeMonthlySpentByCategory(query.month, 'EUR');
-      const spentUsdMap = await computeMonthlySpentByCategory(query.month, 'USD');
+      const [rows, latestRev, spentEurMap, spentUsdMap] = await Promise.all([
+        rowsPromise,
+        fetchLatestSyncRevision(clients),
+        computeMonthlySpentByCategory(query.month, 'EUR'),
+        computeMonthlySpentByCategory(query.month, 'USD'),
+      ]);
 
-      const budgets: BudgetItem[] = entries.map((entry) => {
+      const budgets: BudgetItem[] = rows.map((row) => {
+        const limitCents = toCents(row.limitCents);
         const spentRaw =
-          entry.currency === 'EUR'
-            ? (spentEurMap.get(entry.category) ?? 0)
-            : (spentUsdMap.get(entry.category) ?? 0);
+          row.currency === 'EUR'
+            ? (spentEurMap.get(row.category) ?? 0)
+            : (spentUsdMap.get(row.category) ?? 0);
         const spentCents = toCents(spentRaw);
-        const alert = computeBudgetAlert(spentCents, entry.monthly_limit_cents);
+        const alert = computeBudgetAlert(spentCents, limitCents);
         return {
-          category: entry.category,
-          monthly_limit_cents: entry.monthly_limit_cents,
-          currency: entry.currency,
+          category: row.category,
+          monthly_limit_cents: limitCents,
+          currency: row.currency,
           spent_cents: spentCents,
           remaining_cents: alert.remaining_cents,
           usage_percent: alert.usage_percent,
           alert_status: alert.status,
-          revision: entry.revision,
-          updated_at: entry.updated_at,
+          revision: toSyncRevision(row.revision),
+          updated_at: row.updatedAt.toISOString(),
         };
       });
 
       return {
         month: query.month,
         budgets,
-        latest_revision: toSyncRevision(Math.max(latestRev, localSequenceFallback)),
+        latest_revision: latestRev,
       };
     },
 
     async upsertBudget(input: PutBudgetInput) {
-      const rev = await nextLocalRevision();
-      const nowIso = new Date().toISOString();
-      const entry: BudgetConfigEntry = {
-        category: input.category,
-        monthly_limit_cents: input.monthly_limit_cents,
-        currency: input.currency,
-        revision: rev,
-        updated_at: nowIso,
-      };
-      budgetStore.set(input.category, entry);
+      const now = new Date();
+      const upserted = await clients.poolDb.transaction(async (tx) => {
+        const rev = await allocateNextRevision(tx);
+        const [row] = await tx
+          .insert(budgetLimits)
+          .values({
+            category: input.category,
+            limitCents: input.monthly_limit_cents,
+            currency: input.currency,
+            revision: rev,
+            updatedAt: now,
+          })
+          .onConflictDoUpdate({
+            target: budgetLimits.category,
+            set: {
+              limitCents: input.monthly_limit_cents,
+              currency: input.currency,
+              revision: rev,
+              updatedAt: now,
+            },
+          })
+          .returning();
 
-      const currentMonth = nowIso.slice(0, 7);
-      const spentMap = await computeMonthlySpentByCategory(currentMonth, input.currency);
-      const spentCents = toCents(spentMap.get(input.category) ?? 0);
-      const alert = computeBudgetAlert(spentCents, input.monthly_limit_cents);
+        if (row === undefined) {
+          throw new Error('Failed to upsert budget limit');
+        }
+        return row;
+      });
+
+      const currentMonth = now.toISOString().slice(0, 7);
+      const spentMap = await computeMonthlySpentByCategory(currentMonth, upserted.currency);
+      const spentCents = toCents(spentMap.get(upserted.category) ?? 0);
+      const limitCents = toCents(upserted.limitCents);
+      const alert = computeBudgetAlert(spentCents, limitCents);
+      const rev = toSyncRevision(upserted.revision);
 
       return {
         budget: {
-          category: entry.category,
-          monthly_limit_cents: entry.monthly_limit_cents,
-          currency: entry.currency,
+          category: upserted.category,
+          monthly_limit_cents: limitCents,
+          currency: upserted.currency,
           spent_cents: spentCents,
           remaining_cents: alert.remaining_cents,
           usage_percent: alert.usage_percent,
           alert_status: alert.status,
           revision: rev,
-          updated_at: nowIso,
+          updated_at: upserted.updatedAt.toISOString(),
         },
         latest_revision: rev,
       };
     },
 
     async deleteBudget(category: string) {
-      if (!budgetStore.has(category)) {
-        return null;
-      }
-      budgetStore.delete(category);
-      const rev = await nextLocalRevision();
-      return {
-        deleted_category: category,
-        latest_revision: rev,
-      };
+      return clients.poolDb.transaction(async (tx) => {
+        const [deleted] = await tx
+          .delete(budgetLimits)
+          .where(eq(budgetLimits.category, category))
+          .returning();
+
+        if (deleted === undefined) {
+          return null;
+        }
+
+        const rev = await allocateNextRevision(tx);
+        return {
+          deleted_category: deleted.category,
+          latest_revision: rev,
+        };
+      });
     },
   };
 
@@ -1173,55 +1455,102 @@ export function createNeonAppDependencies(
     },
   };
 
-  const deltaMutationRepository: NonNullable<AppDependencies['deltaMutationRepository']> = {
-    async applyOutboxBatch(mutations) {
-      const results: OutboxMutationOutcome[] = [];
-      let latestRev = await fetchLatestSyncRevision(clients);
+  const findAppliedMutationInDb = async (
+    clientMutationId: string,
+  ): Promise<AppliedClientMutationRecord | null> => {
+    const rows = await clients.httpDb
+      .select()
+      .from(appliedClientMutations)
+      .where(eq(appliedClientMutations.clientMutationId, clientMutationId))
+      .limit(1);
 
-      for (const mutation of mutations) {
-        const alreadyProcessedRev = idempotencyStore.get(mutation.client_mutation_id);
-        if (alreadyProcessedRev !== undefined) {
-          results.push({
-            client_mutation_id: mutation.client_mutation_id,
-            status: 'duplicate',
-            revision: alreadyProcessedRev,
-          });
-          continue;
-        }
-
-        const patchResult = await transactionsRepository.patchTransaction(mutation.transaction_id, {
-          ...(mutation.kind === 'upsert_note' ? { note: mutation.note } : {}),
-          ...(mutation.kind === 'set_category' ? { category: mutation.category } : {}),
-          ...(mutation.kind === 'set_internal_transfer'
-            ? { is_internal_transfer: mutation.is_internal_transfer }
-            : {}),
-        });
-
-        if (!patchResult.ok) {
-          results.push({
-            client_mutation_id: mutation.client_mutation_id,
-            status: 'rejected',
-            reason: 'RESOURCE_NOT_FOUND',
-            message: 'Transaction introuvable.',
-          });
-          continue;
-        }
-
-        idempotencyStore.set(mutation.client_mutation_id, patchResult.latest_revision);
-        latestRev = patchResult.latest_revision;
-        results.push({
-          client_mutation_id: mutation.client_mutation_id,
-          status: 'applied',
-          revision: patchResult.latest_revision,
-        });
-      }
-
-      return {
-        results,
-        latest_revision: latestRev,
-      };
-    },
+    const row = rows[0];
+    if (row === undefined) {
+      return null;
+    }
+    return {
+      clientMutationId: row.clientMutationId,
+      payloadHash: row.payloadHash,
+      appliedAt: row.appliedAt,
+      resultStatus: row.resultStatus,
+      resultRevision: row.resultRevision,
+    };
   };
+
+  const deltaMutationRepository = createIdempotentDeltaMutationRepository({
+    findAppliedMutation: findAppliedMutationInDb,
+    getLatestRevision: () => fetchLatestSyncRevision(clients),
+    async applyAndRecordMutation({ mutation, payloadHash }) {
+      const patch: TransactionPatchInput = {
+        ...(mutation.kind === 'upsert_note' ? { note: mutation.note } : {}),
+        ...(mutation.kind === 'set_category' ? { category: mutation.category } : {}),
+        ...(mutation.kind === 'set_internal_transfer'
+          ? { is_internal_transfer: mutation.is_internal_transfer }
+          : {}),
+      };
+
+      try {
+        return await clients.poolDb.transaction(async (tx) => {
+          const existingRows = await tx
+            .select()
+            .from(appliedClientMutations)
+            .where(eq(appliedClientMutations.clientMutationId, mutation.client_mutation_id))
+            .limit(1);
+
+          const existing = existingRows[0];
+          if (existing !== undefined) {
+            if (existing.payloadHash !== payloadHash) {
+              return { kind: 'conflict' } as const;
+            }
+            return {
+              kind: 'duplicate',
+              revision: toSyncRevision(existing.resultRevision),
+            } as const;
+          }
+
+          const patchResult = await patchTransactionInTx(tx, mutation.transaction_id, patch);
+          if (!patchResult.ok) {
+            return { kind: 'not_found' } as const;
+          }
+
+          const [inserted] = await tx
+            .insert(appliedClientMutations)
+            .values({
+              clientMutationId: mutation.client_mutation_id,
+              payloadHash,
+              appliedAt: new Date(),
+              resultStatus: 'applied',
+              resultRevision: patchResult.latest_revision,
+            })
+            .onConflictDoNothing({ target: appliedClientMutations.clientMutationId })
+            .returning();
+
+          if (inserted === undefined) {
+            throw new ConcurrentMutationConflictError();
+          }
+
+          return {
+            kind: 'applied',
+            revision: patchResult.latest_revision,
+          } as const;
+        });
+      } catch (err) {
+        if (err instanceof ConcurrentMutationConflictError) {
+          const winner = await findAppliedMutationInDb(mutation.client_mutation_id);
+          if (winner !== null) {
+            if (winner.payloadHash !== payloadHash) {
+              return { kind: 'conflict' };
+            }
+            return {
+              kind: 'duplicate',
+              revision: toSyncRevision(winner.resultRevision),
+            };
+          }
+        }
+        throw err;
+      }
+    },
+  });
 
   const driveSyncService: AppDependencies['driveSyncService'] = {
     async triggerManualSync() {
@@ -1337,6 +1666,7 @@ export function createNeonAppDependencies(
     budgetsRepository,
     analyticsRepository,
     deltaMutationRepository,
+    apk: apkRepository,
   };
 }
 

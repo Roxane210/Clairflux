@@ -7,6 +7,7 @@ import {
   type DriveSyncFileStatus,
 } from '@clairflux/shared';
 import { memo, type ReactElement } from 'react';
+import { ApkDownloadCard } from '../apk/ApkDownloadCard';
 import { BANK_LABELS, type AppTab, type BudgetLimit } from './types';
 
 // ============================================================================
@@ -187,7 +188,7 @@ export interface OfflineStatusBannerProps {
   readonly pendingOutboxCount: number;
   readonly revision: number;
   readonly syncMessage: string | null;
-  readonly onFlushNow: () => void;
+  readonly onFlushOutbox: () => void;
 }
 
 export const OfflineStatusBanner = memo(function OfflineStatusBanner({
@@ -195,7 +196,7 @@ export const OfflineStatusBanner = memo(function OfflineStatusBanner({
   pendingOutboxCount,
   revision,
   syncMessage,
-  onFlushNow,
+  onFlushOutbox,
 }: OfflineStatusBannerProps): ReactElement | null {
   if (isOnline && pendingOutboxCount === 0 && !syncMessage) {
     return null;
@@ -219,7 +220,7 @@ export const OfflineStatusBanner = memo(function OfflineStatusBanner({
         gap: '10px',
       }}
     >
-      <div style={{ display: 'grid', gap: '2px' }}>
+      <div style={{ display: 'grid', gap: '2px', minInlineSize: 0 }}>
         <span style={{ fontWeight: 600 }}>
           {!isOnline
             ? 'Hors-ligne — Consultation et notes rapides locales actives (Synchro Drive/Gemini verrouillée)'
@@ -227,12 +228,14 @@ export const OfflineStatusBanner = memo(function OfflineStatusBanner({
         </span>
         <span className="tabular-amount" style={{ fontSize: '0.8125rem' }}>
           Révision #{revision}
-          {pendingOutboxCount > 0 ? ` · ${pendingOutboxCount} modification(s) en file outbox` : ''}
+          {pendingOutboxCount > 0
+            ? ` · ${pendingOutboxCount} note(s) rapide(s) / recatégorisation(s) en attente dans l’outbox`
+            : ''}
         </span>
       </div>
       {isOnline && pendingOutboxCount > 0 ? (
-        <button type="button" className="cf-btn" onClick={onFlushNow}>
-          Synchroniser l'outbox
+        <button type="button" className="cf-btn" onClick={onFlushOutbox}>
+          Synchroniser l'outbox maintenant
         </button>
       ) : null}
     </div>
@@ -413,7 +416,7 @@ export interface SyncDrivePanelProps {
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
   readonly onTriggerDriveSync: () => void;
-  readonly onFlushNow: () => void;
+  readonly onFlushOutbox: () => void;
 }
 
 export const SyncDrivePanel = memo(function SyncDrivePanel({
@@ -422,111 +425,122 @@ export const SyncDrivePanel = memo(function SyncDrivePanel({
   pendingOutboxCount,
   syncMessage,
   onTriggerDriveSync,
-  onFlushNow,
+  onFlushOutbox,
 }: SyncDrivePanelProps): ReactElement {
   return (
-    <section className="cf-surface" style={{ padding: '16px' }} aria-labelledby="sync-heading">
-      <div
-        style={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          gap: '12px',
-          paddingBlockEnd: '16px',
-          borderBlockEnd: '1px solid var(--border-subtle)',
-        }}
-      >
-        <div style={{ minInlineSize: 0, display: 'grid', gap: '4px' }}>
-          <h2 id="sync-heading" tabIndex={-1} style={{ fontSize: '1.125rem' }}>
-            Synchronisation Google Drive (manuelle uniquement)
-          </h2>
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem', overflowWrap: 'anywhere' }}>
-            Périmètre exclusif lecture seule : BoursoBank ({ALLOWED_DRIVE_FOLDERS.boursobank}) et Revolut (
-            {ALLOWED_DRIVE_FOLDERS.revolut})
-          </p>
-        </div>
+    <>
+      <section className="cf-surface" style={{ padding: '16px' }} aria-labelledby="sync-heading">
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '12px',
+            paddingBlockEnd: '16px',
+            borderBlockEnd: '1px solid var(--border-subtle)',
+          }}
+        >
+          <div style={{ minInlineSize: 0, display: 'grid', gap: '4px' }}>
+            <h2 id="sync-heading" tabIndex={-1} style={{ fontSize: '1.125rem' }}>
+              Synchronisation Google Drive (manuelle uniquement)
+            </h2>
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem', overflowWrap: 'anywhere' }}>
+              Périmètre exclusif lecture seule : BoursoBank ({ALLOWED_DRIVE_FOLDERS.boursobank}) et Revolut (
+              {ALLOWED_DRIVE_FOLDERS.revolut})
+            </p>
+            {pendingOutboxCount > 0 ? (
+              <p
+                className="tabular-amount"
+                style={{ color: 'var(--warning)', fontSize: '0.8125rem', fontWeight: 600 }}
+              >
+                {pendingOutboxCount} note(s) rapide(s) / recatégorisation(s) en attente dans l’outbox
+              </p>
+            ) : null}
+          </div>
 
-        <div className="cf-header-actions">
-          {pendingOutboxCount > 0 && isOnline ? (
-            <button type="button" className="cf-btn" onClick={onFlushNow}>
-              Envoyer l'outbox ({pendingOutboxCount})
+          <div className="cf-header-actions">
+            {pendingOutboxCount > 0 && isOnline ? (
+              <button type="button" className="cf-btn" onClick={onFlushOutbox}>
+                Synchroniser l'outbox maintenant
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="cf-btn cf-btn-primary"
+              disabled={!isOnline}
+              onClick={onTriggerDriveSync}
+            >
+              {isOnline ? 'Synchroniser Drive / Gemini' : 'Connexion requise (hors-ligne)'}
             </button>
-          ) : null}
-          <button
-            type="button"
-            className="cf-btn cf-btn-primary"
-            disabled={!isOnline}
-            onClick={onTriggerDriveSync}
-          >
-            {isOnline ? 'Synchroniser Drive / Gemini' : 'Connexion requise (hors-ligne)'}
-          </button>
+          </div>
         </div>
-      </div>
 
-      {!isOnline ? (
-        <p
-          role="note"
-          style={{
-            paddingBlock: '12px',
-            borderBlockEnd: '1px solid var(--border-subtle)',
-            color: 'var(--warning)',
-            fontWeight: 600,
-          }}
-        >
-          Synchronisation Drive/Gemini indisponible hors-ligne. Vos notes rapides restent consultables et
-          enregistrées dans la file locale.
-        </p>
-      ) : syncMessage ? (
-        <p
-          role="status"
-          style={{
-            paddingBlock: '12px',
-            borderBlockEnd: '1px solid var(--border-subtle)',
-            color: 'var(--accent)',
-            fontWeight: 600,
-          }}
-        >
-          {syncMessage}
-        </p>
-      ) : null}
-
-      <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {driveFiles.map((file, index) => (
-          <div
-            key={file.drive_file_id}
-            className={index >= 8 ? 'cf-tx-row-deferred' : undefined}
+        {!isOnline ? (
+          <p
+            role="note"
             style={{
               paddingBlock: '12px',
-              borderBlockEnd: index === driveFiles.length - 1 ? 0 : '1px solid var(--border-subtle)',
-              display: 'flex',
-              flexWrap: 'wrap',
-              justifyContent: 'space-between',
-              gap: '8px',
+              borderBlockEnd: '1px solid var(--border-subtle)',
+              color: 'var(--warning)',
+              fontWeight: 600,
             }}
           >
-            <div style={{ minInlineSize: 0 }}>
-              <p style={{ fontWeight: 600, overflowWrap: 'anywhere' }}>{file.file_name}</p>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem', overflowWrap: 'anywhere' }}>
-                {BANK_LABELS[file.bank]} · Dossier {file.drive_folder_id}
-              </p>
-              {file.status === 'failed' && file.error_message ? (
-                <p style={{ color: 'var(--danger)', fontSize: '0.8125rem' }}>{file.error_message}</p>
-              ) : null}
-            </div>
-            <span
-              className="tabular-amount"
+            Synchronisation Drive/Gemini indisponible hors-ligne. Vos notes rapides restent consultables et
+            enregistrées dans la file locale.
+          </p>
+        ) : syncMessage ? (
+          <p
+            role="status"
+            style={{
+              paddingBlock: '12px',
+              borderBlockEnd: '1px solid var(--border-subtle)',
+              color: 'var(--accent)',
+              fontWeight: 600,
+            }}
+          >
+            {syncMessage}
+          </p>
+        ) : null}
+
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {driveFiles.map((file, index) => (
+            <div
+              key={file.drive_file_id}
+              className={index >= 8 ? 'cf-tx-row-deferred' : undefined}
               style={{
-                color: file.status === 'failed' ? 'var(--danger)' : 'var(--text-secondary)',
-                fontWeight: 600,
+                paddingBlock: '12px',
+                borderBlockEnd: index === driveFiles.length - 1 ? 0 : '1px solid var(--border-subtle)',
+                display: 'flex',
+                flexWrap: 'wrap',
+                justifyContent: 'space-between',
+                gap: '8px',
               }}
             >
-              {CHECKPOINT_STATUS_LABELS[file.status]} · Essai #{file.attempt_count}
-            </span>
-          </div>
-        ))}
-      </div>
-    </section>
+              <div style={{ minInlineSize: 0 }}>
+                <p style={{ fontWeight: 600, overflowWrap: 'anywhere' }}>{file.file_name}</p>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem', overflowWrap: 'anywhere' }}>
+                  {BANK_LABELS[file.bank]} · Dossier {file.drive_folder_id}
+                </p>
+                {file.status === 'failed' && file.error_message ? (
+                  <p style={{ color: 'var(--danger)', fontSize: '0.8125rem' }}>{file.error_message}</p>
+                ) : null}
+              </div>
+              <span
+                className="tabular-amount"
+                style={{
+                  color: file.status === 'failed' ? 'var(--danger)' : 'var(--text-secondary)',
+                  fontWeight: 600,
+                }}
+              >
+                {CHECKPOINT_STATUS_LABELS[file.status]} · Essai #{file.attempt_count}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+      <ApkDownloadCard isOnline={isOnline} />
+    </>
   );
 });
 

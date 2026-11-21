@@ -1,151 +1,109 @@
 ---
 name: audit-bot
-description: Robot d'audit automatisé en 6 points pour ClairFlux (normes swarm-egm-engineering, compatibilité Baseline modern-web-guidance, ergonomie/accessibilité mobbin/prototype/frontend-ui-engineering, intégrité métier ClairFlux, tests/lint/build et rapport PASS/FAIL). Invocable via /audit-bot ou /run-workflow audit-bot.
+description: Robot d'audit automatisé en 6 points pour ClairFlux (normes swarm-egm-engineering, compatibilité Baseline modern-web-guidance, ergonomie/accessibilité mobbin/prototype/frontend-ui-engineering, intégrité métier ClairFlux Jalon 3 dont APK et Outbox E2E, tests/typecheck/build/YAML et rapport PASS/FAIL). Invocable via /audit-bot, /run-workflow audit-bot ou `npm run audit`.
 ---
 
 # Robot d'Audit Automatisé ClairFlux (`audit-bot`)
 
-Ce workflow exécute un contrôle qualité complet en **6 points** sur le dépôt **ClairFlux**. Il peut être exécuté directement étape par étape ou orchestré en parallèle via l'outil `run_workflow` (exemple de script fourni en annexe).
+Ce workflow exécute un contrôle qualité complet en **6 points** sur le dépôt **ClairFlux** via la commande déterministe racine :
 
-> **Règle d'honnêteté absolue** : Ne jamais déclarer `PASS` sur un point non vérifié directement dans les fichiers ou sorties de commandes actuelles. Si l'application n'est pas encore codée (Phase 0 / Pré-Code), les points manquants doivent être rapportés honnêtement comme `FAIL (Non implémenté / Manquant)` avec la liste précise des prérequis à produire.
+```bash
+npm run audit
+# Exécute : node scripts/run-audit-bot.mjs (Node 22 ESM pur, zéro dépendance externe ni Docker CLI)
+```
+
+Il complète l'exécution de la suite de recette E2E Vitest dédiée :
+
+```bash
+npx vitest run apps/web/src/e2e-audit.test.ts
+```
+
+> **Règle d'honnêteté absolue** : Ne jamais déclarer `PASS` sur un point non vérifié directement dans les fichiers ou sorties de commandes actuelles. `scripts/run-audit-bot.mjs` sort avec le code `0` uniquement si 100 % des contrôles des 6 points sont `PASS` (sinon code `1`).
 
 ---
 
-## Point 1 — Audit de Gouvernance & Normes Pré-Code (`swarm-egm-engineering`)
+## Point 1 — Audit de Gouvernance & Normes (`swarm-egm-engineering`)
 
-Vérifier l'existence, la complétude et le respect effectif des artefacts normatifs :
-- [ ] `docs/TECHNICAL_STANDARDS.md` présent, non vide, sans marqueurs `DRAFT` / `TODO` bloquants.
-- [ ] `docs/ADR/` contient les ADR structurants (Sync Drive exclusive & déduplication, Neon + Drizzle + Checkpoints SQL, Capacitor Offline-First Delta Sync, UI Baseline + Recharts).
-- [ ] `docs/DATA_MODEL_DRIZZLE_SPEC.md` présent et aligné avec les schémas réels (s'ils existent).
-- [ ] `docs/API_DELTA_SYNC_CONTRACT.md` présent et aligné avec les routes/contrats API réels.
-- [ ] Vérifier le respect des standards Matt Pocock (aucun `any` explicite non justifié dans `src/`, validation runtime `zod`, `strict: true` dans `tsconfig.json`).
+Vérifié automatiquement par `scripts/run-audit-bot.mjs` :
+- [x] `docs/TECHNICAL_STANDARDS.md`, `docs/DATA_MODEL_DRIZZLE_SPEC.md`, `docs/API_DELTA_SYNC_CONTRACT.md` présents et non vides.
+- [x] `docs/ADR/` contient les 4 ADR structurants (`0001` à `0004`).
+- [x] `fx_rate_micro` et arithmétique en centimes entiers (`CentsSchema`, `amount_cents`, `amount_eur_cents`) vérifiés dans `packages/shared`, `apps/api/src/db/schema.ts` et `apps/sync-worker/src/gemini-pipeline.ts`.
+- [x] Standards Matt Pocock : zéro `any` explicite dans `apps/` et `packages/`, validation Zod aux frontières, `strict: true` dans `tsconfig.base.json`.
+- [x] Clé `GEMINI_API_KEY` transmise via header HTTP `x-goog-api-key` (jamais en query string URL).
+- [x] 2 dossiers Google Drive exclusifs (`1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` BoursoBank & `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` Revolut) verrouillés dans `packages/shared`, `apps/api/src/db/schema.ts` (`CHECK` SQL) et `apps/sync-worker/src/drive-pdf.ts`.
+- [x] Polices `@fontsource/*` bundlées localement (`main.tsx`), zéro CDN externe (`fonts.googleapis.com` interdit).
+- [x] Zéro secret serveur (`DATABASE_URL`, `GEMINI_API_KEY`, `CLAIRFLUX_ACCESS_SECRET_HASH`, `CLAIRFLUX_SESSION_SECRET`, `INTERNAL_WORKER_TOKEN`, `AIzaSy`, `postgresql://`) dans `apps/web/dist/`.
 
 ---
 
 ## Point 2 — Audit Compatibilité Navigateur & Standards Baseline (`modern-web-guidance`)
 
-Auditer le code frontend (`src/` CSS/TSX/HTML) contre `.agent/skills/modern-web-guidance/SKILL.md` et `BASELINE_CLAIRFLUX.md` (Desktop Chrome/Safari/Firefox + Android System WebView Capacitor) :
-- [ ] **Modales & Popovers** : utilisation native de `<dialog>` (`showModal()`) et `[popover]` plutôt que des div-modales avec `z-index` empirique ; présence de `overscroll-behavior: contain` sur `dialog:modal` et `dialog::backdrop`.
-- [ ] **Container Queries & Viewport** : présence de `container-type: inline-size` / `@container` pour les composants adaptatifs ; usage de `dvh`/`dvw` plutôt que `100vh`/`100vw` sur mobile.
-- [ ] **Sélecteurs modernes** : usage approprié et borné de `:has()` (jamais `body:has(...)`) et validation formulaire via `:user-valid` / `:user-invalid` avec synchronisation `aria-invalid`.
-- [ ] **Transitions & Rendu différé** : usage gardé de `document.startViewTransition` (avec test de support + `@media (prefers-reduced-motion: reduce)`) et `content-visibility: auto` couplé à `contain-intrinsic-size` sur les longues listes sous le fold.
-- [ ] **Core Web Vitals** :
-  - Budget **INP <= 200ms** protégé (découpage des tâches longues via `scheduler.yield()` + fallback ou Web Worker pour traitements lourds, zéro layout thrashing).
-  - Polices bundlées localement pour Offline-First et préchargées proprement (LCP).
-  - Aucun polyfill importé inconditionnellement (toujours derrière détection de fonctionnalité).
+Vérifié dans `apps/web/index.html` et `apps/web/src/features/` par `scripts/run-audit-bot.mjs` et `apps/web/src/e2e-audit.test.ts` :
+- [x] **Modales & Tiroirs natifs** : `<dialog>` (`dialog.cf-dialog:modal` + `showModal()`) plutôt que div-modales avec `z-index` empirique ; présence de `overscroll-behavior: contain` sur `dialog.cf-dialog:modal` et `dialog.cf-dialog::backdrop`.
+- [x] **Container Queries** : `container: kpis / inline-size`, `container: charts / inline-size`, `container: ledger / inline-size` et `@container`.
+- [x] **Sélecteurs modernes** : `:has()` borné (`.cf-field-group:has(...)`, jamais `body:has(...)`) et validation formulaire `:user-valid` / `:user-invalid`.
+- [x] **Rendu différé sous le fold** : `content-visibility: auto` couplé à `contain-intrinsic-size: auto 72px`.
 
 ---
 
 ## Point 3 — Audit Ergonomie & Accessibilité (`mobbin`, `prototype`, `frontend-ui-engineering`)
 
-Vérifier les gabarits Desktop (`1440×900`) et Mobile Android (`390×844`) dans le code UI et CSS :
-- [ ] **Typographie exacte** : `Plus Jakarta Sans` (titres), `DM Sans` (corps), `JetBrains Mono` avec `font-variant-numeric: tabular-nums` sur **tous** les montants, soldes et pourcentages.
-- [ ] **Élévation unique** : zéro cartes imbriquées (*nested cards*), zéro *pills* statiques décoratives.
-- [ ] **Cibles tactiles** : tous les contrôles interactifs (boutons, tiroirs, liens nav, filtres) >= `44×44px`.
-- [ ] **Plafond sticky mobile <= 15 %** : somme des hauteurs `sticky`/`fixed` simultanées sur mobile `390×844` `<= 126px` (<= 15 % de 844px).
-- [ ] **Zéro débordement horizontal mobile** : aucun élément ne dépasse `390px` (ni `320px`) en largeur (`scrollWidth <= clientWidth`).
-- [ ] **Accessibilité WCAG 2.1 AA** : contrastes >= 4.5:1 / 3:1, navigation clavier complète, labels explicites sur champs et boutons icônes, états vides/erreurs/hors-ligne gérés sans couleur seule.
+Vérifié dans `apps/web/index.html` pour Desktop (`1440×900`) et Mobile Android (`390×844`) :
+- [x] **Typographie & alignement numérique** : `Plus Jakarta Sans`, `DM Sans`, `JetBrains Mono` avec `font-variant-numeric: tabular-nums` (`.tabular-amount`).
+- [x] **Cibles tactiles** : `min-block-size: 44px` et `min-inline-size: 44px`.
+- [x] **Plafond sticky mobile <= 15 %** : barre basse `--mobile-nav-height: 64px` (`64px / 844px = 7.6 % <= 15 %`).
+- [x] **Breakpoint adaptatif `1024px`** : rail latéral fixe `240px` à partir de `1024px`, navigation basse mobile en dessous.
 
 ---
 
-## Point 4 — Audit d'Intégrité des Fonctionnalités Métier ClairFlux
+## Point 4 — Audit d'Intégrité Fonctionnelle ClairFlux (Jalon 3 : APK + E2E Outbox)
 
-Vérifier par inspection directe du code (et des tests associés) la présence exacte de chaque exigence métier :
-- [ ] **2 dossiers Google Drive exclusifs** :
-  - BoursoBank : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-  - Revolut : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
-  - Aucun autre dossier Drive accepté (contrôle côté backend/worker + SQL `CHECK` ou validation stricte).
-- [ ] **Colonnes Banque & Type de compte** : présentes dans le modèle Drizzle, l'API et affichées dans les vues Transactions Desktop & Mobile.
-- [ ] **Notes personnalisées** : modèle, API delta sync, stockage offline Android et tiroir d'édition rapide en UI.
-- [ ] **Onglet dédié aux règles de catégorisation** : route/onglet complet (CRUD règles, priorité, test/aperçu, validation `:user-valid`/`:user-invalid`).
-- [ ] **Graphiques Recharts obligatoires** :
-  - **Solde cumulé 6M** (données 6 derniers mois, `tabular-nums` dans tooltip/axes),
-  - **Dépenses M-1 / Moyenne 3M** (comparatif clair par catégorie ou période).
-- [ ] **Sécurité APK / Docker** : aucun secret (`GEMINI_API_KEY`, credentials Drive, `DATABASE_URL` Neon) présent dans le bundle frontend ou les assets Android Capacitor.
-
----
-
-## Point 5 — Exécution Automatisée Tests, Lint & Build
-
-Exécuter dans le workspace `d:\Applications\Clairflux` (si `package.json` existe) :
-1. `npm test` (tous les tests unitaires/intégration — 0 test skippé ou relâché)
-2. `npm run lint` (typage strict / linter — 0 erreur)
-3. `npm run build` (build production propre — 0 erreur)
-
-*(Si `package.json` ou l'un des scripts n'existe pas encore, noter explicitement `FAIL — script ou projet absent` dans le rapport).*
+Vérifié statiquement (`scripts/run-audit-bot.mjs`) et fonctionnellement (`apps/web/src/e2e-audit.test.ts`) :
+- [x] **Graphiques Recharts** : Solde cumulé 6M (`buildCumulativeBalanceSeries`, scopes `all`/`boursobank`/`revolut` + `eur_consolidated`/`usd_only`) et Dépenses mensuelles (`buildMonthlyExpenseSeries`, modes `none`/`prev_month`/`avg_3m`, transferts internes exclus).
+- [x] **Alertes Budgets** : seuils `80 %` (vigilance) et `100 %` (dépassement) dans `BudgetAlertsPanel`.
+- [x] **Sous-onglet Règles** : `TransactionsSection` + `RulesTab` avec protection stricte de `is_manual_category = true`.
+- [x] **Export CSV anti-injection** : `neutralizeCsvFormula` neutralisant `=`, `+`, `-`, `@`, `\t`, `\r`.
+- [x] **Scénario E2E Mobile Offline Outbox (`apps/web/src/e2e-audit.test.ts`)** :
+  - Passage hors-ligne (`createOfflineController(..., { initialOnline: false })`),
+  - Saisie d'une note rapide stockée dans le store IndexedDB `outbox_mutations` (`clairflux_offline_v1`) sans appel réseau,
+  - Retour en ligne (`setOnline(true)`) déclenchant le flush réel vers `createApp(...)` (`POST /api/sync/delta`) en mémoire avec `client_mutation_id` idempotent (`1er flush = applied`, `2e replay = duplicate`).
+- [x] **Chaîne de compilation & distribution APK Android** :
+  - Endpoints API protégés `GET /api/apk/status` et `GET /api/apk/download` (`apps/api/src/routes/register-routes.ts`),
+  - Carte UI `ApkDownloadCard` (`apps/web/src/features/apk/ApkDownloadCard.tsx`),
+  - Conteneur reproductible `Dockerfile.apk-builder` + `scripts/build-apk.sh`,
+  - Workflow GitHub Actions `.github/workflows/build-apk.yml`.
 
 ---
 
-## Point 6 — Rapport d'Audit Synthétique & Verdict (`PASS` / `FAIL`)
+## Point 5 — Exécution Automatisée Typecheck, Tests, Build & Validation YAML
 
-Écrire le rapport consolidé dans `docs/AUDIT_REPORT.md` (ou dans le répertoire d'artefacts si en lecture seule pré-projet) et afficher un résumé clair en français pour le Product Owner :
+Exécuté réellement par `scripts/run-audit-bot.mjs` dans `d:/Applications/Clairflux` :
+1. `npm run typecheck` (`tsc --noEmit` strict sur tous les workspaces)
+2. `npm test` (`vitest run` sur l'ensemble du monorepo, incluant `apps/web/src/e2e-audit.test.ts`)
+3. `npm run build` (`vite build` sur `@clairflux/web`)
+4. Validation YAML de `docker-compose.yml` et `.github/workflows/build-apk.yml` (via PyYAML ou fallback structurel Node)
 
-```markdown
-# Rapport d'Audit ClairFlux — [YYYY-MM-DD HH:MM]
+---
 
-**Verdict global : PASS | FAIL**
+## Point 6 — Tableau Synthétique PASS / FAIL & Verdict
 
-| # | Axe d'audit | Statut | Points bloquants / Constats clés |
-|---|---|---|---|
-| 1 | Normes & EGM (`swarm-egm-engineering`) | PASS / FAIL | ... |
-| 2 | Baseline & WebView (`modern-web-guidance`) | PASS / FAIL | ... |
-| 3 | Ergonomie & A11y (`mobbin`, `prototype`, `frontend-ui`) | PASS / FAIL | ... |
-| 4 | Fonctionnalités métier ClairFlux | PASS / FAIL | ... |
-| 5 | Tests (`npm test`), Lint (`npm run lint`), Build (`npm run build`) | PASS / FAIL | ... |
-
-## Corrections requises (par priorité)
-1. **[BLOQUANT]** ...
-2. **[MAJEUR]** ...
-3. **[MINEUR]** ...
-```
+`node scripts/run-audit-bot.mjs` affiche un tableau synthétique `PASS` / `FAIL` pour les points 1 à 5 et quitte avec :
+- `0` si 100 % des axes sont `PASS`
+- `1` dès qu'au moins un contrôle est `FAIL`
 
 ---
 
 ## Annexe — Orchestration Parallèle via `run_workflow`
 
-Lorsqu'un audit complet est lancé via l'outil `run_workflow`, utiliser le canevas Python ci-dessous pour paralléliser les axes 1 à 4 pendant l'exécution des checks 5, puis agréger le rapport final (Point 6) :
+Lorsqu'un audit étendu est lancé via `run_workflow`, exécuter directement `npm run audit` pour la vérification déterministe complète, ou paralléliser les revues complémentaires (Point 1 à Point 4) en parallèle de Point 5 avant synthèse finale :
 
 ```python
-phase("Audits parallèles ClairFlux (Axes 1 à 4) + Checks CLI (Axe 5)")
+phase("Audit Automatisé ClairFlux (CLI npm run audit + E2E)")
 
-schema_axe = {
-    "type": "object",
-    "properties": {
-        "statut": {"type": "string", "enum": ["PASS", "FAIL"]},
-        "constats": {"type": "array", "items": {"type": "string"}},
-        "corrections": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["statut", "constats", "corrections"],
-}
-
-axes = [
-    ("Axe 1 — Normes EGM & Standards", "Vérifie Point 1 de .agent/workflows/audit-bot.md dans le workspace."),
-    ("Axe 2 — Baseline & Modern Web Guidance", "Vérifie Point 2 de .agent/workflows/audit-bot.md contre .agent/skills/modern-web-guidance/."),
-    ("Axe 3 — Ergonomie Fintech & Accessibilité", "Vérifie Point 3 de .agent/workflows/audit-bot.md contre mobbin, prototype et frontend-ui-engineering."),
-    ("Axe 4 — Intégrité Métier ClairFlux", "Vérifie Point 4 de .agent/workflows/audit-bot.md (2 dossiers Drive exacts, Banque/Type de compte, Notes, Règles, Recharts 6M & M-1/3M, zéro secret client)."),
-]
-
-resultats_axes = await parallel(
-    axes,
-    lambda item: agent(
-        f"{item[1]} Inspecte les fichiers réels et appelle finish avec le bilan factuel.",
-        schema=schema_axe,
-        role=item[0],
-        model="flash",
-    ),
+cli_audit = await agent(
+    "Exécute `npm run audit` et `npx vitest run apps/web/src/e2e-audit.test.ts` dans d:/Applications/Clairflux et retourne le tableau PASS/FAIL exact.",
+    schema={"type": "object", "properties": {"exit_code": {"type": "integer"}, "resume": {"type": "string"}}, "required": ["exit_code", "resume"]},
+    role="Exécuteur Audit Bot",
 )
-
-check_cli = await agent(
-    "Exécute Point 5 de .agent/workflows/audit-bot.md (npm test, npm run lint, npm run build si package.json existe) et retourne la sortie factuelle exacte.",
-    schema=schema_axe,
-    role="Axe 5 — Tests, Lint & Build",
-)
-
-phase("Synthèse & Rapport Final (Axe 6)")
-rapport = await agent(
-    f"Génère le rapport final Point 6 dans docs/AUDIT_REPORT.md à partir de : axes={resultats_axes}, cli={check_cli}. Verdict PASS uniquement si tous les axes sont PASS.",
-    schema={"type": "string"},
-    role="Rapporteur Audit ClairFlux",
-)
-log(rapport)
+log(cli_audit)
 ```

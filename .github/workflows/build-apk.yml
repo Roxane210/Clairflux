@@ -1,0 +1,86 @@
+# Workflow CI/CD de compilation APK Android ClairFlux (https://github.com/Roxane210/Clairflux)
+name: Build Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: "URL de base de l'API ClairFlux embarquée dans l'APK (optionnel)"
+        required: false
+        type: string
+        default: '/api'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build & Package ClairFlux APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Temurin JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK 35
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Run unit & integration tests
+        run: npm test
+
+      - name: Build & sign Android APK
+        env:
+          APK_OUTPUT_DIR: ${{ github.workspace }}/out-apk
+          VITE_API_BASE_URL: ${{ inputs.api_base_url || vars.VITE_API_BASE_URL || '/api' }}
+          VITE_APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '1.0.0-ci' }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            KEYSTORE_FILE="${{ runner.temp }}/clairflux-release.keystore"
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_FILE}"
+            export ANDROID_KEYSTORE_PATH="${KEYSTORE_FILE}"
+          fi
+          bash scripts/build-apk.sh
+
+      - name: Upload APK and SHA-256 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clairflux-android-apk
+          path: |
+            out-apk/clairflux-release.apk
+            out-apk/clairflux-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 30

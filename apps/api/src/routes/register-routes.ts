@@ -12,6 +12,7 @@ import { z } from 'zod';
 import {
   AccountsQuerySchema,
   AnalyticsOverviewQuerySchema,
+  ApkStatusSchema,
   CreateRuleBodySchema,
   DeleteBudgetSchema,
   DeltaSyncQuerySchema,
@@ -35,6 +36,7 @@ import {
   type AccountsRepository,
   type AnalyticsOverviewQuery,
   type AnalyticsRepository,
+  type ApkArtifactRepository,
   type AppEnv,
   type BudgetsRepository,
   type DeltaMutationRepository,
@@ -56,7 +58,10 @@ export interface RouteDependencies {
   readonly budgetsRepository?: BudgetsRepository | undefined;
   readonly analyticsRepository?: AnalyticsRepository | undefined;
   readonly deltaMutationRepository?: DeltaMutationRepository | undefined;
+  readonly apk?: ApkArtifactRepository | undefined;
 }
+
+export type M2RouteDependencies = RouteDependencies;
 
 const EmptyTriggerBodySchema = z.object({}).strict();
 
@@ -193,6 +198,23 @@ function createDefaultDeltaMutationRepository(): DeltaMutationRepository {
   };
 }
 
+function createDefaultApkRepository(): ApkArtifactRepository {
+  return {
+    async getStatus() {
+      return {
+        available: false,
+        version: '0.0.0',
+        sizeBytes: null,
+        sha256: null,
+        builtAt: null,
+      };
+    },
+    async readBinary() {
+      return null;
+    },
+  };
+}
+
 export function registerDomainRoutes(
   app: Hono<AppEnv>,
   deps: RouteDependencies,
@@ -206,6 +228,7 @@ export function registerDomainRoutes(
     deps.analyticsRepository ?? createDefaultAnalyticsRepository(getNow);
   const deltaMutationRepo =
     deps.deltaMutationRepository ?? createDefaultDeltaMutationRepository();
+  const apkRepo = deps.apk ?? createDefaultApkRepository();
 
   // ==========================================================================
   // GET /api/accounts
@@ -747,5 +770,35 @@ export function registerDomainRoutes(
       default:
         return assertNever(syncResult);
     }
+  });
+
+  // ==========================================================================
+  // 7. Android APK Status & Download: GET /api/apk/status, GET /api/apk/download
+  // ==========================================================================
+  app.get('/api/apk/status', async (c) => {
+    const status = ApkStatusSchema.parse(await apkRepo.getStatus());
+    return c.json(status, 200);
+  });
+
+  app.get('/api/apk/download', async (c) => {
+    const artifact = await apkRepo.readBinary();
+    if (artifact === null) {
+      return errorResponse(
+        c,
+        404,
+        'RESOURCE_NOT_FOUND',
+        'APK ClairFlux non encore compilé.',
+      );
+    }
+
+    const safeFilename =
+      artifact.filename.replace(/["\\\r\n]/g, '').trim() || 'clairflux-release.apk';
+
+    return c.body(Buffer.from(artifact.bytes), 200, {
+      'Content-Type': 'application/vnd.android.package-archive',
+      'Content-Disposition': `attachment; filename="${safeFilename}"`,
+      'Content-Length': String(artifact.sizeBytes),
+      'Cache-Control': 'no-store',
+    });
   });
 }

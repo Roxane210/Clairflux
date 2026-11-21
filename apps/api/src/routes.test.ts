@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ALLOWED_DRIVE_FOLDERS,
@@ -25,6 +29,7 @@ import {
   signSessionToken,
   type AppDependencies,
   type BudgetItem,
+  type DeltaMutationRepository,
   type DeltaSyncQuery,
   type OutboxMutationOutcome,
   type RuleView,
@@ -32,6 +37,7 @@ import {
 } from './app.js';
 import {
   AnalyticsOverviewResponseSchema,
+  ApkStatusSchema,
   PostSyncDeltaResponseSchema,
   computeAnalyticsOverview,
   computeBudgetAlert,
@@ -39,9 +45,16 @@ import {
   isSafeRegexPattern,
   type AnalyticsAccountInput,
   type AnalyticsTransactionInput,
+  type ApkArtifactRepository,
   type RuleEvalRule,
   type RuleEvalTransaction,
 } from './routes/contracts.js';
+import {
+  computeCanonicalMutationPayloadHash,
+  createFilesystemApkRepository,
+  createIdempotentDeltaMutationRepository,
+  type AppliedClientMutationRecord,
+} from './server.js';
 
 const TEST_SESSION_SECRET = 'clairflux-test-session-secret-minimum-32-chars';
 const FIXED_NOW = new Date('2026-11-21T14:00:00.000Z');
@@ -136,6 +149,8 @@ interface StoredBudget {
 function createStatefulTestHarness(options?: {
   readonly allowedWebOrigin?: string | undefined;
   readonly onGetDelta?: (query: DeltaSyncQuery) => void;
+  readonly apk?: ApkArtifactRepository | undefined;
+  readonly deltaMutationRepository?: DeltaMutationRepository | undefined;
 }) {
   let currentRev = 1495;
   const nextRevision = (): SyncRevision => {
@@ -610,7 +625,50 @@ function createStatefulTestHarness(options?: {
 
   let ruleSeq = 10;
 
-  const deps: AppDependencies = {
+  const defaultDeltaMutationRepository: DeltaMutationRepository = {
+    async applyOutboxBatch(mutations) {
+      const results: OutboxMutationOutcome[] = [];
+      for (const mutation of mutations) {
+        const existingRev = idempotencyMap.get(mutation.client_mutation_id);
+        if (existingRev !== undefined) {
+          results.push({
+            client_mutation_id: mutation.client_mutation_id,
+            status: 'duplicate',
+            revision: existingRev,
+          });
+          continue;
+        }
+        const patchRes = patchTxInternal(mutation.transaction_id, {
+          ...(mutation.kind === 'upsert_note' ? { note: mutation.note } : {}),
+          ...(mutation.kind === 'set_category' ? { category: mutation.category } : {}),
+          ...(mutation.kind === 'set_internal_transfer'
+            ? { is_internal_transfer: mutation.is_internal_transfer }
+            : {}),
+        });
+        if (!patchRes.ok) {
+          results.push({
+            client_mutation_id: mutation.client_mutation_id,
+            status: 'rejected',
+            reason: 'RESOURCE_NOT_FOUND',
+            message: 'Transaction introuvable.',
+          });
+          continue;
+        }
+        idempotencyMap.set(mutation.client_mutation_id, patchRes.latest_revision);
+        results.push({
+          client_mutation_id: mutation.client_mutation_id,
+          status: 'applied',
+          revision: patchRes.latest_revision,
+        });
+      }
+      return {
+        results,
+        latest_revision: toSyncRevision(currentRev),
+      };
+    },
+  };
+
+  const deps: AppDependencies & { readonly apk?: ApkArtifactRepository | undefined } = {
     sessionSecret: TEST_SESSION_SECRET,
     ...(options?.allowedWebOrigin !== undefined
       ? { allowedWebOrigin: options.allowedWebOrigin }
@@ -972,48 +1030,8 @@ function createStatefulTestHarness(options?: {
         });
       },
     },
-    deltaMutationRepository: {
-      async applyOutboxBatch(mutations) {
-        const results: OutboxMutationOutcome[] = [];
-        for (const mutation of mutations) {
-          const existingRev = idempotencyMap.get(mutation.client_mutation_id);
-          if (existingRev !== undefined) {
-            results.push({
-              client_mutation_id: mutation.client_mutation_id,
-              status: 'duplicate',
-              revision: existingRev,
-            });
-            continue;
-          }
-          const patchRes = patchTxInternal(mutation.transaction_id, {
-            ...(mutation.kind === 'upsert_note' ? { note: mutation.note } : {}),
-            ...(mutation.kind === 'set_category' ? { category: mutation.category } : {}),
-            ...(mutation.kind === 'set_internal_transfer'
-              ? { is_internal_transfer: mutation.is_internal_transfer }
-              : {}),
-          });
-          if (!patchRes.ok) {
-            results.push({
-              client_mutation_id: mutation.client_mutation_id,
-              status: 'rejected',
-              reason: 'RESOURCE_NOT_FOUND',
-              message: 'Transaction introuvable.',
-            });
-            continue;
-          }
-          idempotencyMap.set(mutation.client_mutation_id, patchRes.latest_revision);
-          results.push({
-            client_mutation_id: mutation.client_mutation_id,
-            status: 'applied',
-            revision: patchRes.latest_revision,
-          });
-        }
-        return {
-          results,
-          latest_revision: toSyncRevision(currentRev),
-        };
-      },
-    },
+    deltaMutationRepository: options?.deltaMutationRepository ?? defaultDeltaMutationRepository,
+    ...(options?.apk !== undefined ? { apk: options.apk } : {}),
   };
 
   return { app: createApp(deps), txs };
@@ -1038,6 +1056,8 @@ describe('ClairFlux API — Jalon 2 Routes Complètes & Sync Delta', () => {
         { path: '/api/budgets', method: 'DELETE' },
         { path: '/api/analytics/overview' },
         { path: '/api/sync/delta', method: 'POST' },
+        { path: '/api/apk/status' },
+        { path: '/api/apk/download' },
       ];
 
       for (const endpoint of endpoints) {
@@ -1518,6 +1538,226 @@ describe('ClairFlux API — Jalon 2 Routes Complètes & Sync Delta', () => {
         status: 'duplicate',
         revision: firstResult1.revision,
       });
+    });
+
+    it('persiste client_mutation_id + payload_hash et retourne duplicate après redémarrage serveur API (applied_client_mutations)', async () => {
+      const persistedAppliedMutations = new Map<string, AppliedClientMutationRecord>();
+      let persistedRevision = 2000;
+      let applyCalls = 0;
+
+      const buildRestartableServer = () => {
+        const deltaRepo = createIdempotentDeltaMutationRepository({
+          async findAppliedMutation(clientMutationId) {
+            return persistedAppliedMutations.get(clientMutationId) ?? null;
+          },
+          async getLatestRevision() {
+            return toSyncRevision(persistedRevision);
+          },
+          async applyAndRecordMutation({ mutation, payloadHash }) {
+            const existing = persistedAppliedMutations.get(mutation.client_mutation_id);
+            if (existing !== undefined) {
+              return existing.payloadHash === payloadHash
+                ? { kind: 'duplicate', revision: toSyncRevision(existing.resultRevision) }
+                : { kind: 'conflict' };
+            }
+            if (mutation.transaction_id === TX_UNKNOWN_ID) {
+              return { kind: 'not_found' };
+            }
+            applyCalls += 1;
+            persistedRevision += 1;
+            const rev = toSyncRevision(persistedRevision);
+            persistedAppliedMutations.set(mutation.client_mutation_id, {
+              clientMutationId: mutation.client_mutation_id,
+              payloadHash,
+              appliedAt: FIXED_NOW,
+              resultStatus: 'applied',
+              resultRevision: rev,
+            });
+            return { kind: 'applied', revision: rev };
+          },
+        });
+
+        return createStatefulTestHarness({ deltaMutationRepository: deltaRepo }).app;
+      };
+
+      const token = createToken();
+      const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+      const mutId = '20000000-0000-4000-8000-000000000001';
+
+      const mutationPayload = {
+        client_mutation_id: mutId,
+        kind: 'upsert_note' as const,
+        transaction_id: TX_CARREFOUR_ID,
+        note: 'Persistance SQL après redémarrage',
+      };
+
+      // Server instance #1 applies the mutation and records payload_hash in applied_client_mutations
+      const serverInstance1 = buildRestartableServer();
+      const firstRes = await serverInstance1.request('/api/sync/delta', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          mutations: [
+            {
+              ...mutationPayload,
+              client_updated_at: '2026-11-21T14:00:00.000Z',
+            },
+          ],
+        }),
+      });
+      expect(firstRes.status).toBe(200);
+      const firstBody = PostSyncDeltaResponseSchema.parse(await firstRes.json());
+      expect(firstBody.results[0]).toEqual({
+        client_mutation_id: mutId,
+        status: 'applied',
+        revision: toSyncRevision(2001),
+      });
+      expect(applyCalls).toBe(1);
+
+      const storedRecord = persistedAppliedMutations.get(mutId);
+      expect(storedRecord).toBeDefined();
+      expect(storedRecord?.payloadHash).toBe(computeCanonicalMutationPayloadHash(mutationPayload));
+      expect(storedRecord?.payloadHash).toMatch(/^[a-f0-9]{64}$/);
+      expect(storedRecord?.resultStatus).toBe('applied');
+      expect(storedRecord?.resultRevision).toBe(2001);
+
+      // Server instance #2 (fresh process, zero in-memory cache) replays the same mutation -> 'duplicate'
+      const serverInstance2 = buildRestartableServer();
+      const replayRes = await serverInstance2.request('/api/sync/delta', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          mutations: [
+            {
+              ...mutationPayload,
+              client_updated_at: '2026-11-21T15:30:00.000Z',
+            },
+          ],
+        }),
+      });
+      expect(replayRes.status).toBe(200);
+      const replayBody = PostSyncDeltaResponseSchema.parse(await replayRes.json());
+      expect(replayBody.results[0]).toEqual({
+        client_mutation_id: mutId,
+        status: 'duplicate',
+        revision: toSyncRevision(2001),
+      });
+      expect(applyCalls).toBe(1);
+
+      // Replaying the same client_mutation_id with a different payload -> 'rejected' CONFLICT
+      const conflictRes = await serverInstance2.request('/api/sync/delta', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          mutations: [
+            {
+              client_mutation_id: mutId,
+              kind: 'upsert_note',
+              transaction_id: TX_CARREFOUR_ID,
+              note: 'Payload altéré avec le même UUID',
+            },
+          ],
+        }),
+      });
+      expect(conflictRes.status).toBe(200);
+      const conflictBody = PostSyncDeltaResponseSchema.parse(await conflictRes.json());
+      expect(conflictBody.results[0]?.status).toBe('rejected');
+      if (conflictBody.results[0]?.status === 'rejected') {
+        expect(conflictBody.results[0].reason).toBe('CONFLICT');
+      }
+      expect(applyCalls).toBe(1);
+    });
+  });
+
+  describe('Android APK Endpoints (GET /api/apk/status & GET /api/apk/download)', () => {
+    it('retourne 401 sans auth, available:false + 404 JSON si absent, puis available:true + 200 binaire si présent', async () => {
+      const tmpDir = await mkdtemp(join(tmpdir(), 'clairflux-apk-test-'));
+      try {
+        const apkPath = join(tmpDir, 'clairflux-release.apk');
+        const apkRepo = createFilesystemApkRepository(apkPath, '1.4.0-test');
+        const { app } = createStatefulTestHarness({ apk: apkRepo });
+        const token = createToken();
+
+        // 1. Unauthenticated requests -> 401 UNAUTHORIZED
+        const unauthStatusRes = await app.request('/api/apk/status');
+        expect(unauthStatusRes.status).toBe(401);
+        expect(ApiErrorEnvelopeSchema.parse(await unauthStatusRes.json()).error.code).toBe(
+          'UNAUTHORIZED',
+        );
+
+        const unauthDownloadRes = await app.request('/api/apk/download');
+        expect(unauthDownloadRes.status).toBe(401);
+        expect(ApiErrorEnvelopeSchema.parse(await unauthDownloadRes.json()).error.code).toBe(
+          'UNAUTHORIZED',
+        );
+
+        // 2. APK absent -> status available: false, download 404 structured JSON
+        const missingStatusRes = await app.request('/api/apk/status', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        expect(missingStatusRes.status).toBe(200);
+        const missingStatus = ApkStatusSchema.parse(await missingStatusRes.json());
+        expect(missingStatus).toEqual({
+          available: false,
+          version: '1.4.0-test',
+          sizeBytes: null,
+          sha256: null,
+          builtAt: null,
+        });
+
+        const missingDownloadRes = await app.request('/api/apk/download', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        expect(missingDownloadRes.status).toBe(404);
+        const missingDownloadBody = ApiErrorEnvelopeSchema.parse(await missingDownloadRes.json());
+        expect(missingDownloadBody.error.code).toBe('RESOURCE_NOT_FOUND');
+        expect(missingDownloadBody.error.message).toBe('APK ClairFlux non encore compilé.');
+        expect(missingDownloadBody.error.retryable).toBe(false);
+        expect(missingDownloadBody.error.request_id).toBeTruthy();
+
+        // 3. APK present without sidecar -> on-the-fly SHA-256 + binary download 200
+        const fakeApkBytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x43, 0x46, 0x58, 0x01]);
+        const expectedSha256 = createHash('sha256').update(fakeApkBytes).digest('hex');
+        await writeFile(apkPath, fakeApkBytes);
+
+        const presentStatusRes = await app.request('/api/apk/status', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        expect(presentStatusRes.status).toBe(200);
+        const presentStatus = ApkStatusSchema.parse(await presentStatusRes.json());
+        expect(presentStatus.available).toBe(true);
+        expect(presentStatus.version).toBe('1.4.0-test');
+        expect(presentStatus.sizeBytes).toBe(fakeApkBytes.byteLength);
+        expect(presentStatus.sha256).toBe(expectedSha256);
+        expect(presentStatus.builtAt).not.toBeNull();
+        expect(Number.isNaN(Date.parse(presentStatus.builtAt ?? ''))).toBe(false);
+
+        const presentDownloadRes = await app.request('/api/apk/download', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        expect(presentDownloadRes.status).toBe(200);
+        expect(presentDownloadRes.headers.get('Content-Type')).toBe(
+          'application/vnd.android.package-archive',
+        );
+        expect(presentDownloadRes.headers.get('Content-Disposition')).toBe(
+          'attachment; filename="clairflux-release.apk"',
+        );
+        expect(presentDownloadRes.headers.get('Content-Length')).toBe(
+          String(fakeApkBytes.byteLength),
+        );
+        expect(presentDownloadRes.headers.get('Cache-Control')).toBe('no-store');
+        const downloadedBytes = new Uint8Array(await presentDownloadRes.arrayBuffer());
+        expect(downloadedBytes).toEqual(fakeApkBytes);
+
+        // 4. Sidecar .sha256 present -> read directly by createFilesystemApkRepository
+        const sidecarDigest = 'a'.repeat(64);
+        await writeFile(`${apkPath}.sha256`, `${sidecarDigest}  clairflux-release.apk\n`, 'utf8');
+        const sidecarStatus = await apkRepo.getStatus();
+        expect(sidecarStatus.available).toBe(true);
+        expect(sidecarStatus.sha256).toBe(sidecarDigest);
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
+      }
     });
   });
 });

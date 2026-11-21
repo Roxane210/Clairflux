@@ -951,6 +951,30 @@ export interface AnalyticsRepository {
 }
 
 // ============================================================================
+// 6. APK Artifact Contracts (GET /api/apk/status, GET /api/apk/download)
+// ============================================================================
+
+export const ApkStatusSchema = z.object({
+  available: z.boolean(),
+  version: z.string(),
+  sizeBytes: z.number().int().nonnegative().nullable(),
+  sha256: z.string().nullable(),
+  builtAt: z.string().nullable(),
+});
+export type ApkStatus = z.infer<typeof ApkStatusSchema>;
+
+export interface ApkBinaryArtifact {
+  readonly bytes: Uint8Array;
+  readonly sizeBytes: number;
+  readonly filename: string;
+}
+
+export interface ApkArtifactRepository {
+  getStatus(): Promise<ApkStatus>;
+  readBinary(): Promise<ApkBinaryArtifact | null>;
+}
+
+// ============================================================================
 // Pure Analytics & Recurrence Computation Helpers
 // ============================================================================
 

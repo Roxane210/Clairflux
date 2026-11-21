@@ -46,7 +46,7 @@ const HEADING_BY_TAB: Readonly<Record<AppTab['kind'], string>> = {
 function ClairFluxApp(): ReactElement {
   const prefersReducedMotion = usePrefersReducedMotion();
   const store = useOfflineStore(INITIAL_SEED_DATASET);
-  const { dataset, isOnline, pendingOutboxCount, syncMessage } = store;
+  const { dataset, isOnline, pendingOutboxCount, syncMessage, flushNow } = store;
 
   const [activeTab, setActiveTab] = useState<AppTab>({ kind: 'overview' });
   const [activeSubTab, setActiveSubTab] = useState<TransactionsSubTab>('operations');
@@ -88,7 +88,7 @@ function ClairFluxApp(): ReactElement {
     [prefersReducedMotion],
   );
 
-  const handleFlushNow = useCallback((): void => { void store.flushNow(); }, [store]);
+  const handleFlushOutbox = useCallback((): void => { void flushNow(); }, [flushNow]);
   const handleTriggerDriveSync = useCallback((): void => { void store.triggerDriveSync(); }, [store]);
 
   const renderTabContent = (): ReactElement => {
@@ -144,7 +144,7 @@ function ClairFluxApp(): ReactElement {
             pendingOutboxCount={pendingOutboxCount}
             syncMessage={syncMessage}
             onTriggerDriveSync={handleTriggerDriveSync}
-            onFlushNow={handleFlushNow}
+            onFlushOutbox={handleFlushOutbox}
           />
         );
       default:
@@ -162,7 +162,7 @@ function ClairFluxApp(): ReactElement {
             <p style={{ color: 'var(--text-secondary)' }}>Suivi consolidé BoursoBank & Revolut (EUR / USD)</p>
           </div>
         </header>
-        <OfflineStatusBanner isOnline={isOnline} pendingOutboxCount={pendingOutboxCount} revision={dataset.revision} syncMessage={syncMessage} onFlushNow={handleFlushNow} />
+        <OfflineStatusBanner isOnline={isOnline} pendingOutboxCount={pendingOutboxCount} revision={dataset.revision} syncMessage={syncMessage} onFlushOutbox={handleFlushOutbox} />
         {renderTabContent()}
         <div aria-live="polite" style={{ position: 'absolute', inlineSize: '1px', blockSize: '1px', overflow: 'hidden', clipPath: 'inset(50%)' }}>
           {syncMessage ?? ''}

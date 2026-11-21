@@ -391,6 +391,45 @@ export const syncMeta = pgTable('sync_meta', {
   updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
 });
 
+export const budgetLimits = pgTable(
+  'budget_limits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    category: varchar('category', { length: 80 }).notNull().unique(),
+    limitCents: bigint('limit_cents', { mode: 'number' }).notNull(),
+    currency: currencyEnum('currency').notNull().default('EUR'),
+    revision: bigint('revision', { mode: 'number' }).notNull().default(nextRevisionDefault),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+  },
+  (t) => [
+    check('chk_budget_limits_category_non_empty', sql`char_length(trim(category)) > 0`),
+    check('chk_budget_limits_positive', sql`limit_cents > 0`),
+    index('idx_budget_limits_revision').on(t.revision),
+  ],
+);
+
+export const appliedClientMutations = pgTable(
+  'applied_client_mutations',
+  {
+    clientMutationId: uuid('client_mutation_id').primaryKey(),
+    payloadHash: varchar('payload_hash', { length: 64 }).notNull(),
+    appliedAt: timestamp('applied_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    resultStatus: varchar('result_status', { length: 24 }).notNull(),
+    resultRevision: bigint('result_revision', { mode: 'number' }).notNull(),
+  },
+  (t) => [
+    check(
+      'chk_applied_client_mutations_payload_hash_non_empty',
+      sql`char_length(trim(payload_hash)) > 0`,
+    ),
+    check(
+      'chk_applied_client_mutations_result_status',
+      sql`result_status IN ('applied', 'duplicate', 'rejected')`,
+    ),
+    index('idx_applied_client_mutations_applied_at').on(t.appliedAt.desc()),
+  ],
+);
+
 // ============================================================================
 // Drizzle Relations
 // ============================================================================
@@ -493,6 +532,12 @@ export type NewTransactionNoteRow = typeof transactionNotes.$inferInsert;
 export type SyncMetaRow = typeof syncMeta.$inferSelect;
 export type NewSyncMetaRow = typeof syncMeta.$inferInsert;
 
+export type BudgetLimitRow = typeof budgetLimits.$inferSelect;
+export type NewBudgetLimitRow = typeof budgetLimits.$inferInsert;
+
+export type AppliedClientMutationRow = typeof appliedClientMutations.$inferSelect;
+export type NewAppliedClientMutationRow = typeof appliedClientMutations.$inferInsert;
+
 export const schema = {
   syncRevisionSeq,
   bankEnum,
@@ -512,6 +557,8 @@ export const schema = {
   transactions,
   transactionNotes,
   syncMeta,
+  budgetLimits,
+  appliedClientMutations,
   accountsRelations,
   driveSyncRunsRelations,
   driveFilesRelations,
