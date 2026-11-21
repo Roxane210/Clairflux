@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#f7f6f2" />
+    <meta
+      name="description"
+      content="ClairFlux — Suivi financier personnel multi-comptes BoursoBank & Revolut (EUR/USD), consultation hors-ligne."
+    />
+    <title>ClairFlux — Suivi financier multi-comptes</title>
+
+    <!-- Polices bundlées localement via @fontsource/* dans src/main.tsx (100 % Offline-First, zéro CDN externe) -->
+    <style>
+      :root {
+        --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+        --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
+        --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+        --bg-canvas: #f7f6f2;
+        --bg-surface: #ffffff;
+        --bg-subtle: #efede6;
+        --border-subtle: #dedad0;
+        --border-strong: #c2bdb0;
+
+        --text-primary: #14171a;
+        --text-secondary: #4a515a;
+        --text-muted: #5c646e;
+
+        --accent: #0f5c4d;
+        --accent-hover: #0b473b;
+        --accent-soft: #e6f2ef;
+
+        --danger: #b42318;
+        --danger-soft: #fef3f2;
+        --warning: #92400e;
+        --warning-soft: #fef6e6;
+
+        --radius-surface: 12px;
+        --radius-control: 8px;
+        --nav-rail-width: 240px;
+        --mobile-nav-height: 64px;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html {
+        overflow-x: clip;
+        background: var(--bg-canvas);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 16px;
+        line-height: 1.5;
+        -webkit-text-size-adjust: 100%;
+      }
+
+      body {
+        margin: 0;
+        min-block-size: 100dvh;
+        overflow-x: clip;
+        background: var(--bg-canvas);
+        color: var(--text-primary);
+        font-size: 0.875rem;
+      }
+
+      h1,
+      h2,
+      h3 {
+        margin: 0;
+        font-family: var(--font-display);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        text-wrap: balance;
+      }
+
+      p {
+        margin: 0;
+      }
+
+      .tabular-amount {
+        font-family: var(--font-mono);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .cf-touch-target {
+        min-block-size: 44px;
+        min-inline-size: 44px;
+      }
+
+      /* Élévation unique : une seule surface bordée sur le canvas, zéro cartes imbriquées */
+      .cf-surface {
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-surface);
+      }
+
+      .cf-shell {
+        display: flex;
+        min-block-size: 100dvh;
+        inline-size: 100%;
+      }
+
+      /* Rail Desktop fixe 240px */
+      .cf-rail {
+        display: none;
+      }
+
+      .cf-main {
+        flex: 1 1 auto;
+        min-inline-size: 0;
+        max-inline-size: 1200px;
+        margin-inline: auto;
+        padding-block: calc(16px + env(safe-area-inset-top, 0px))
+          calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px) + 24px);
+        padding-inline: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      /* En-tête mobile scrollable (respecte plafond sticky <= 15 %) */
+      .cf-header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .cf-header-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+
+      /* Barre basse mobile unique fixe (64px / 844px = 7.6 % <= 15 %) */
+      .cf-bottom-nav {
+        position: fixed;
+        inset-block-end: 0;
+        inset-inline: 0;
+        z-index: 20;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        block-size: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
+        padding-block-end: env(safe-area-inset-bottom, 0px);
+        background: var(--bg-surface);
+        border-block-start: 1px solid var(--border-subtle);
+      }
+
+      .cf-nav-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-block-size: 44px;
+        min-inline-size: 44px;
+        padding-inline: 8px;
+        border: 0;
+        background: transparent;
+        color: var(--text-secondary);
+        font-family: var(--font-sans);
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+        text-align: center;
+      }
+
+      .cf-nav-btn[aria-current='page'] {
+        color: var(--accent);
+        box-shadow: inset 0 2px 0 0 var(--accent);
+      }
+
+      .cf-nav-btn:focus-visible,
+      .cf-btn:focus-visible,
+      .cf-pill-btn:focus-visible,
+      .cf-tx-trigger:focus-visible,
+      .cf-field-input:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      @media (min-width: 768px) {
+        .cf-rail {
+          position: sticky;
+          inset-block-start: 0;
+          flex: 0 0 var(--nav-rail-width);
+          inline-size: var(--nav-rail-width);
+          block-size: 100dvh;
+          display: flex;
+          flex-direction: column;
+          justify-content: space-between;
+          padding: 24px 16px;
+          background: var(--bg-surface);
+          border-inline-end: 1px solid var(--border-subtle);
+        }
+
+        .cf-rail-nav {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+
+        .cf-nav-btn {
+          justify-content: flex-start;
+          padding-inline: 12px;
+          border-radius: var(--radius-control);
+          font-size: 0.875rem;
+        }
+
+        .cf-nav-btn[aria-current='page'] {
+          background: var(--accent-soft);
+          box-shadow: none;
+        }
+
+        .cf-bottom-nav {
+          display: none;
+        }
+
+        .cf-main {
+          padding-block: 24px 32px;
+          padding-inline: 32px;
+          gap: 20px;
+        }
+      }
+
+      /* Contrôles pilules réservés aux contrôles interactifs réels */
+      .cf-scope-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .cf-pill-btn {
+        min-block-size: 44px;
+        min-inline-size: 44px;
+        padding-inline: 14px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 999px;
+        background: var(--bg-surface);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 0.875rem;
+        font-weight: 500;
+        cursor: pointer;
+      }
+
+      .cf-pill-btn[aria-pressed='true'] {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #ffffff;
+      }
+
+      .cf-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-block-size: 44px;
+        min-inline-size: 44px;
+        padding-inline: 16px;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-control);
+        background: var(--bg-surface);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 0.875rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .cf-btn-primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #ffffff;
+      }
+
+      .cf-btn:disabled,
+      .cf-pill-btn:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      /* Container Queries (@container) pour KPIs, Graphiques & Grand Livre */
+      .cf-kpi-container {
+        container: kpis / inline-size;
+      }
+
+      .cf-kpi-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .cf-kpi-cell {
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        border-block-end: 1px solid var(--border-subtle);
+      }
+
+      .cf-kpi-cell:last-child {
+        border-block-end: 0;
+      }
+
+      @container kpis (min-width: 560px) {
+        .cf-kpi-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .cf-kpi-cell {
+          border-inline-end: 1px solid var(--border-subtle);
+        }
+        .cf-kpi-cell:nth-child(2n) {
+          border-inline-end: 0;
+        }
+        .cf-kpi-cell:nth-last-child(-n + 2) {
+          border-block-end: 0;
+        }
+      }
+
+      @container kpis (min-width: 900px) {
+        .cf-kpi-grid {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+        .cf-kpi-cell {
+          border-block-end: 0;
+          border-inline-end: 1px solid var(--border-subtle);
+        }
+        .cf-kpi-cell:nth-child(2n) {
+          border-inline-end: 1px solid var(--border-subtle);
+        }
+        .cf-kpi-cell:last-child {
+          border-inline-end: 0;
+        }
+      }
+
+      .cf-charts-container {
+        container: charts / inline-size;
+      }
+
+      .cf-charts-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 16px;
+      }
+
+      @container charts (min-width: 820px) {
+        .cf-charts-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      .cf-chart-card {
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-inline-size: 0;
+      }
+
+      .cf-chart-frame {
+        inline-size: 100%;
+        min-block-size: 260px;
+        aspect-ratio: 16 / 9;
+      }
+
+      /* Grand livre adaptatif via @container (Table Desktop vs Liste compacte Mobile) */
+      .cf-ledger-container {
+        container: ledger / inline-size;
+      }
+
+      .cf-ledger-table-wrap {
+        display: none;
+        scrollbar-gutter: stable;
+      }
+
+      .cf-ledger-mobile-list {
+        display: flex;
+        flex-direction: column;
+      }
+
+      @container ledger (min-width: 760px) {
+        .cf-ledger-table-wrap {
+          display: block;
+          overflow-x: auto;
+        }
+        .cf-ledger-mobile-list {
+          display: none;
+        }
+      }
+
+      .cf-table {
+        inline-size: 100%;
+        border-collapse: collapse;
+        text-align: start;
+      }
+
+      .cf-table th,
+      .cf-table td {
+        padding: 12px 14px;
+        border-block-end: 1px solid var(--border-subtle);
+        vertical-align: middle;
+      }
+
+      .cf-table th {
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+
+      .cf-tx-trigger {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        inline-size: 100%;
+        min-block-size: 44px;
+        padding: 12px 14px;
+        border: 0;
+        border-block-end: 1px solid var(--border-subtle);
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        text-align: start;
+        cursor: pointer;
+      }
+
+      .cf-tx-row-deferred {
+        content-visibility: auto;
+        contain-intrinsic-size: auto 72px;
+      }
+
+      .cf-row-line {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        min-inline-size: 0;
+      }
+
+      .cf-truncate {
+        min-inline-size: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* Validation post-interaction :user-valid / :user-invalid + :has() borné */
+      .cf-field-group {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .cf-field-label {
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+
+      .cf-field-input {
+        min-block-size: 44px;
+        padding: 8px 12px;
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-control);
+        background: var(--bg-surface);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        font-size: 0.875rem;
+      }
+
+      .cf-field-input:user-valid {
+        border-color: var(--accent);
+      }
+
+      .cf-field-input:is(:user-invalid, .user-invalid-fallback) {
+        border-color: var(--danger);
+        background: var(--danger-soft);
+      }
+
+      .cf-field-group:has(:is(:user-invalid, .user-invalid-fallback)) .cf-field-label {
+        color: var(--danger);
+      }
+
+      .cf-field-error {
+        display: none;
+        align-items: center;
+        gap: 6px;
+        color: var(--danger);
+        font-size: 0.8125rem;
+        font-weight: 500;
+      }
+
+      .cf-field-input:is(:user-invalid, .user-invalid-fallback) ~ .cf-field-error {
+        display: flex;
+      }
+
+      /* Natif <dialog> + blocage scroll arrière-plan via overscroll-behavior: contain */
+      dialog.cf-dialog:modal {
+        overscroll-behavior: contain;
+        margin: 0;
+        padding: 20px;
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-surface);
+        color: var(--text-primary);
+        inset-block-start: auto;
+        inset-block-end: 0;
+        inset-inline: 0;
+        inline-size: 100dvw;
+        max-inline-size: 100dvw;
+        max-block-size: 85dvh;
+        border-radius: 16px 16px 0 0;
+        padding-block-end: calc(20px + env(safe-area-inset-bottom, 0px));
+      }
+
+      dialog.cf-dialog::backdrop {
+        overflow: hidden;
+        overscroll-behavior: contain;
+        background: rgb(20 23 26 / 0.45);
+      }
+
+      @media (min-width: 768px) {
+        dialog.cf-dialog:modal {
+          inset-block: 0;
+          inset-inline-start: auto;
+          inset-inline-end: 0;
+          inline-size: min(420px, 100dvw);
+          max-inline-size: 420px;
+          block-size: 100dvh;
+          max-block-size: 100dvh;
+          border-radius: 0;
+          border-inline-start: 1px solid var(--border-subtle);
+          padding-block-end: 20px;
+        }
+      }
+
+      /* Respect strict de prefers-reduced-motion pour View Transitions */
+      @media (prefers-reduced-motion: reduce) {
+        ::view-transition-group(*),
+        ::view-transition-old(*),
+        ::view-transition-new(*) {
+          animation: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

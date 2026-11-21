@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Android / Capacitor artifacts & signing secrets
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties
+android/app/build/
+android/.gradle/
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
