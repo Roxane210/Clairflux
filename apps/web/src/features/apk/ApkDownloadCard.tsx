@@ -1,6 +1,7 @@
 import { assertNever } from '@clairflux/shared';
 import { memo, useCallback, useEffect, useState, type ReactElement } from 'react';
 import { z } from 'zod';
+import { buildApiEndpointUrl } from '../../offline/apiUrl';
 import type { FetchLike } from '../../offline/deltaSyncEngine';
 
 // ============================================================================
@@ -54,25 +55,6 @@ function resolveEnvApiBaseUrl(): string {
   return '';
 }
 
-function normalizeSafeApiBaseUrl(rawBaseUrl?: string): string {
-  const trimmed = (rawBaseUrl ?? resolveEnvApiBaseUrl()).trim();
-  if (trimmed.length === 0) {
-    return '';
-  }
-  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
-    return trimmed.replace(/\/+$/, '');
-  }
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return '';
-    }
-    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
-  } catch {
-    return '';
-  }
-}
-
 export function parseApkStatus(raw: unknown): ApkStatus {
   return ApkStatusSchema.parse(raw);
 }
@@ -106,11 +88,11 @@ export function formatApkBuiltAt(builtAt: string | null): string {
 }
 
 export function buildApkStatusUrl(apiBaseUrl?: string): string {
-  return `${normalizeSafeApiBaseUrl(apiBaseUrl)}/api/apk/status`;
+  return buildApiEndpointUrl(apiBaseUrl ?? resolveEnvApiBaseUrl(), '/api/apk/status');
 }
 
 export function buildApkDownloadUrl(apiBaseUrl?: string): string {
-  return `${normalizeSafeApiBaseUrl(apiBaseUrl)}/api/apk/download`;
+  return buildApiEndpointUrl(apiBaseUrl ?? resolveEnvApiBaseUrl(), '/api/apk/download');
 }
 
 export async function resolveApkCardState(

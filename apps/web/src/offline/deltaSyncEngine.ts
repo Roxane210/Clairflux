@@ -6,6 +6,7 @@ import {
   type Transaction,
 } from '@clairflux/shared';
 import { z } from 'zod';
+import { buildApiEndpointUrl } from './apiUrl';
 import type { ClairFluxDataset } from '../features/dashboard/types';
 import type { OfflineStore, OutboxMutation } from './indexedDbStore';
 
@@ -88,10 +89,6 @@ function defaultFetch(input: string, init?: RequestInit): Promise<Response> {
   return globalThis.fetch(input, init);
 }
 
-function normalizeApiBaseUrl(apiBaseUrl: string): string {
-  return apiBaseUrl.trim().replace(/\/+$/, '');
-}
-
 function deriveSecondaryMutationUuid(primaryUuid: string): string {
   const lastChar = primaryUuid.at(-1);
   if (lastChar === undefined) {
@@ -120,8 +117,10 @@ export async function pullDelta(
   fetcher: FetchLike = defaultFetch,
 ): Promise<PullDeltaResult> {
   const safeSince = Number.isSafeInteger(sinceRevision) && sinceRevision >= 0 ? sinceRevision : 0;
-  const baseUrl = normalizeApiBaseUrl(apiBaseUrl);
-  const url = `${baseUrl}/api/sync/delta?since=${encodeURIComponent(String(safeSince))}`;
+  const url = buildApiEndpointUrl(
+    apiBaseUrl,
+    `/api/sync/delta?since=${encodeURIComponent(String(safeSince))}`,
+  );
 
   let response: Response;
   try {
@@ -355,8 +354,7 @@ export async function flushOutbox(
   await store.updateOutboxStatus(batchIds, 'syncing');
 
   const { wireMutations, wireToParentId, parentExpectedCount } = serializeOutboxBatch(batch);
-  const baseUrl = normalizeApiBaseUrl(apiBaseUrl);
-  const url = `${baseUrl}/api/sync/delta`;
+  const url = buildApiEndpointUrl(apiBaseUrl, '/api/sync/delta');
 
   let response: Response;
   try {

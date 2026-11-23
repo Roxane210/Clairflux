@@ -107,6 +107,15 @@ describe('buildApkDownloadUrl & buildApkStatusUrl', () => {
       'https://clairflux.example.com/subpath/api/apk/download',
     );
     expect(buildApkDownloadUrl('/proxy/')).toBe('/proxy/api/apk/download');
+    expect(buildApkDownloadUrl('/api')).toBe('/api/apk/download');
+    expect(buildApkStatusUrl('/api')).toBe('/api/apk/status');
+    expect(buildApkStatusUrl('/api/')).toBe('/api/apk/status');
+    expect(buildApkDownloadUrl('https://clairflux.example.com/api')).toBe(
+      'https://clairflux.example.com/api/apk/download',
+    );
+    expect(buildApkStatusUrl('https://clairflux.example.com/api/')).toBe(
+      'https://clairflux.example.com/api/apk/status',
+    );
   });
 
   it('rejects unsafe schemes and protocol-relative bases by falling back to same-origin path', () => {

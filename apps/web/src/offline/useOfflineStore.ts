@@ -11,6 +11,7 @@ import {
 } from '@clairflux/shared';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ClairFluxDataset } from '../features/dashboard/types';
+import { buildApiEndpointUrl } from './apiUrl';
 import {
   applyDeltaToDataset,
   canTriggerDriveSync,
@@ -587,9 +588,8 @@ export function createOfflineController(
         return;
       }
 
-      const normalizedBase = apiBaseUrl.trim().replace(/\/+$/, '');
       try {
-        const response = await fetcher(`${normalizedBase}/api/sync/drive`, {
+        const response = await fetcher(buildApiEndpointUrl(apiBaseUrl, '/api/sync/drive'), {
           method: 'POST',
           credentials: 'include',
           headers: {

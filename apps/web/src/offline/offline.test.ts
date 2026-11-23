@@ -840,4 +840,46 @@ describe('ClairFlux Offline-First Engine & Capacitor Bridge', () => {
     expect(postedKinds).not.toContain('set_category');
     expect(controller.getState().pendingOutboxCount).toBe(0);
   });
+
+  it('ne duplique pas le préfixe /api lorsque apiBaseUrl vaut /api (Docker / PRODUCTION_DEPLOY)', async () => {
+    const store = createMemoryOfflineStore();
+    const seed = buildSeedDataset();
+    const requestedUrls: string[] = [];
+
+    const mockFetcher: FetchLike = async (input: string, init?: RequestInit): Promise<Response> => {
+      requestedUrls.push(`${init?.method ?? 'GET'} ${input}`);
+      if (input === '/api/sync/drive' && init?.method === 'POST') {
+        return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }
+      if (input.startsWith('/api/sync/delta') && init?.method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            revision: seed.revision,
+            accounts: [],
+            transactions: [],
+            notes: [],
+            rules: [],
+            drive_files: [],
+            budgets: [],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(null, { status: 404 });
+    };
+
+    const controller = createOfflineController(seed, {
+      store,
+      apiBaseUrl: '/api',
+      fetcher: mockFetcher,
+      initialOnline: true,
+    });
+
+    await controller.triggerDriveSync();
+    await controller.flushNow();
+
+    expect(requestedUrls).toContain('POST /api/sync/drive');
+    expect(requestedUrls).toContain(`GET /api/sync/delta?since=${seed.revision}`);
+    expect(requestedUrls.some((u) => u.includes('/api/api/'))).toBe(false);
+  });
 });
