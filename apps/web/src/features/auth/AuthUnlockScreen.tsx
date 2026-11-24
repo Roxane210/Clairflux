@@ -1,3 +1,4 @@
+import { CLAIRFLUX_BUILD_VERSION } from '@clairflux/shared';
 import { memo, useCallback, useId, useState, type FormEvent, type ReactElement } from 'react';
 import { submitLogin, type LoginResponse } from './authClient';
 
@@ -62,7 +63,7 @@ export const AuthUnlockScreen = memo(function AuthUnlockScreen({
           </h1>
           <p style={{ color: 'var(--text-secondary)' }}>
             Saisissez votre secret personnel pour accéder à vos comptes BoursoBank &amp; Revolut,
-            synchroniser Google Drive et consulter l’APK Android.
+            synchroniser Google Drive et consulter l’APK Android. (v{CLAIRFLUX_BUILD_VERSION})
           </p>
         </div>
 

@@ -7,6 +7,7 @@ import { serve, type ServerType } from '@hono/node-server';
 import { z } from 'zod';
 import {
   ALLOWED_DRIVE_FOLDERS,
+  CLAIRFLUX_BUILD_VERSION,
   convertToEurCents,
   getBankForDriveFolder,
   parseAccountId,
@@ -283,7 +284,7 @@ export function createIdempotentDeltaMutationRepository(
 // ============================================================================
 
 const DEFAULT_APK_PATH = '/shared-apk/clairflux-release.apk';
-const DEFAULT_APK_VERSION = '1.0.0-rc1';
+const DEFAULT_APK_VERSION = CLAIRFLUX_BUILD_VERSION;
 const APK_DOWNLOAD_FILENAME = 'clairflux-release.apk';
 
 async function computeFileSha256(filePath: string): Promise<string> {
@@ -1861,6 +1862,7 @@ export function startServer(
     fetch: app.fetch,
     port: env.PORT,
   });
+  console.info(`[api] ClairFlux API v${CLAIRFLUX_BUILD_VERSION} prête sur le port ${env.PORT}.`);
 
   let shutdownPromise: Promise<void> | null = null;
 

@@ -6,7 +6,7 @@ import '@fontsource/dm-sans/600.css';
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
-import { type TransactionId } from '@clairflux/shared';
+import { CLAIRFLUX_BUILD_VERSION, type TransactionId } from '@clairflux/shared';
 import {
   lazy,
   StrictMode,
@@ -334,7 +334,7 @@ function ClairFluxApp(): ReactElement {
           <div>
             <h1 style={{ fontSize: '1.5rem' }}>ClairFlux</h1>
             <p style={{ color: 'var(--text-secondary)' }}>
-              Suivi consolidé BoursoBank &amp; Revolut (EUR / USD)
+              Suivi consolidé BoursoBank &amp; Revolut (EUR / USD) · v{CLAIRFLUX_BUILD_VERSION}
             </p>
           </div>
           <div className="cf-header-actions">

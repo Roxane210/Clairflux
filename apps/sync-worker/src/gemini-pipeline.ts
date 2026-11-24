@@ -5,6 +5,7 @@ import { Pool, neon } from '@neondatabase/serverless';
 import {
   AccountTypeSchema,
   BankSchema,
+  CLAIRFLUX_BUILD_VERSION,
   CentsSchema,
   CheckpointErrorCodeSchema,
   CurrencySchema,
@@ -2270,7 +2271,9 @@ export async function runIngestionPipeline(
   const fileResults: SyncRunFileResult[] = [];
 
   try {
-    console.info(`[sync-worker] Démarrage découverte Google Drive (run=${runId}).`);
+    console.info(
+      `[sync-worker] v${CLAIRFLUX_BUILD_VERSION} démarrage découverte Google Drive (run=${runId}).`,
+    );
     const discovered = await deps.driveClient.discoverAllAllowedPdfs();
 
     const filesToProcess =
@@ -2786,13 +2789,15 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
     .reconcileOrphanedRuns('Synchronisation interrompue (redémarrage du service sync-worker).')
     .then((count) => {
       console.info(
-        `[sync-worker] Prêt sur le port ${env.PORT} (${count} run(s) orphelin(s) réconcilié(s)).`,
+        `[sync-worker] v${CLAIRFLUX_BUILD_VERSION} prêt sur le port ${env.PORT} (${count} run(s) orphelin(s) réconcilié(s)).`,
       );
       return count;
     })
     .catch((err: unknown) => {
       console.error('[sync-worker] Échec réconciliation des runs orphelins au démarrage:', err);
-      console.info(`[sync-worker] Prêt sur le port ${env.PORT} (réconciliation échouée).`);
+      console.info(
+        `[sync-worker] v${CLAIRFLUX_BUILD_VERSION} prêt sur le port ${env.PORT} (réconciliation échouée).`,
+      );
       return 0;
     });
 
