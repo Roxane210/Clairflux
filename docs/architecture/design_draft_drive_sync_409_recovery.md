@@ -45,3 +45,26 @@
 4. **Remontée claire des erreurs côté UI (`apps/web` + `packages/shared`)** :
    - `DriveSyncRunSummarySchema` ajoute `error_summary: z.string().nullable().optional()`.
    - `useOfflineStore.ts` lit `ApiErrorEnvelope` sur erreur HTTP et affiche le message explicite (ainsi que `last_run.error_summary` dans `SyncDrivePanel` si le dernier run a échoué).
+
+---
+
+## 3. Résolution FX BCE & Tolérance Revolut Multi-Devises (`2026-11-24`, v1.0.1-build.3)
+
+### 3.1 Diagnostic sur logs `v1.0.1-build.2` (run `fcf9e07c-e033-4f52-bfe0-663d18b746c0`)
+1. **Absence de fournisseur FX externe dans `startWorkerRuntime`** : `createFxRateService({ store })` était instancié sans `fetchReferenceRate`, faisant échouer tout relevé Revolut contenant des opérations USD sans taux en base (`2020-08-10`, `2019-02-13`, `2018-04-13`).
+2. **Types & devises hors périmètre dans les relevés annuels Revolut** :
+   - Des poches `'investissement'` provoquaient `accounts.1.account_type - Invalid enum value ... received 'investissement'`.
+   - Des poches `'GBP'` provoquaient `accounts.0.currency - Invalid enum value ... received 'GBP'`, bloquant l'ensemble du PDF 2021 (76 pages) alors que seules `EUR` et `USD` sont suivies.
+   - Les lots intermédiaires sans opération (`accounts: []`, `transactions: []`) échouaient inutilement sur `.min(1)`, déclenchant des fallbacks en cascade.
+
+### 3.2 Contrats ajoutés
+1. **`createEcbReferenceFxFetcher` (`apps/sync-worker/src/gemini-pipeline.ts`)** :
+   - Branché sur `createFxRateService({ store, fetchReferenceRate, maxLookbackDays: 14 })` dans `startWorkerRuntime`.
+   - Interroge par plage annuelle (incluant fin décembre N-1 pour les jours fériés du 1er janvier) avec cache mémoire par `(année, paire)` :
+     - Primaire : `api.frankfurter.dev/v1/{start}..{end}` (taux de référence BCE),
+     - Secondaire : `api.frankfurter.app/{start}..{end}`,
+     - Secours officiel : `data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A` (inversion exacte en `FxRateMicro`).
+2. **Normalisation Revolut & lots vides** :
+   - `normalizeAccountType` mappe `'investissement'` / `'trading'` / `'crypto'` / libellés non reconnus vers `'autre'`, et `'épargne'`/`'savings'` vers `'epargne'`, `'vault'`/`'poche'` vers `'coffre'`, etc.
+   - `normalizeGeminiStatementPayload` filtre proprement les comptes et opérations hors `'EUR' | 'USD'` (`GBP`, etc.) avec log d'avertissement.
+   - `GeminiBatchExtractionSchema` autorise `accounts: []` sur un lot multi-lots lorsque `transactions: []`, tandis que `mergeBatchExtractions` exige toujours `>= 1` compte sur le document fusionné complet (et protège le solde de clôture contre l'écrasement par un lot final vide).
