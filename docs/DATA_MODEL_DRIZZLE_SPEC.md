@@ -182,16 +182,16 @@ Verrouille en base l'exclusivité des deux dossiers Google Drive autorisés et c
   - `chk_drive_files_exclusive_folders` :
     ```sql
     CHECK (drive_folder_id IN (
-      '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus',
-      '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h'
+      '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h',
+      '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus'
     ))
     ```
   - `chk_drive_files_folder_bank_match` :
     ```sql
     CHECK (
-      (drive_folder_id = '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus' AND bank = 'boursobank')
+      (drive_folder_id = '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h' AND bank = 'boursobank')
       OR
-      (drive_folder_id = '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h' AND bank = 'revolut')
+      (drive_folder_id = '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus' AND bank = 'revolut')
     )
     ```
 - **Index** :

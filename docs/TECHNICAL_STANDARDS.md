@@ -285,8 +285,8 @@ Tout PR/merge ou fin de lot `/swarm` exige le passage vert sans contournement (`
    - Aucune variable `VITE_*` ne doit contenir de clé API, token Drive ou URL de base de données. Contrôle automatisé dans le pipeline de build APK avant `npx cap sync android`.
 2. **Exclusivité absolue des 2 dossiers Google Drive** :
    - Périmètre codé en dur et vérifié à la fois par validation applicative (`packages/shared`) et contrainte SQL `CHECK` dans Neon :
-     - **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-     - **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+     - **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+     - **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
    - Scope Google Drive limité au strict **lecture seule** (`drive.readonly`), **déclenchement manuel uniquement** via `POST /api/sync/drive` (zéro cron/polling automatique).
    - Tout autre ID de dossier est rejeté et journalisé comme violation de périmètre.
 3. **Authentification personnelle & Transport** :

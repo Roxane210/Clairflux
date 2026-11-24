@@ -10,8 +10,8 @@ Point d'entrée unique : [`src/index.ts`](./src/index.ts).
 
 - **Constantes normatives & helpers Google Drive** :
   - `ALLOWED_DRIVE_FOLDERS` : mapping verrouillé des deux seuls dossiers autorisés :
-    - `boursobank`: `'1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus'`
-    - `revolut`: `'1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h'`
+    - `boursobank`: `'1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h'`
+    - `revolut`: `'1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus'`
   - `AllowedDriveFolderIdSchema`, `isAllowedDriveFolderId(folderId)`, `getBankForDriveFolder(folderId)`
   - `EUR_FX_RATE_MICRO` (`1_000_000`), `CLAIRFLUX_DELTA_SCHEMA_VERSION` (`'1.0.0'`)
 - **Branded Types Zod & parseurs/constructeurs associés** :

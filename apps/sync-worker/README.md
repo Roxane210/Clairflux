@@ -8,14 +8,14 @@ Service isolé Node 22 LTS (Hono) dédié à l'ingestion manuelle des relevés P
 
 ### 1. Découverte Drive, extraction PDF & découpage borné ([`src/drive-pdf.ts`](./src/drive-pdf.ts))
 - **Périmètre Drive exclusif** :
-  - `ALLOWED_DRIVE_FOLDER_ENTRIES` & `assertAllowedDriveFolderId(folderId)` : verrouille strictement `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`boursobank`) et `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`revolut`), lève `InvalidDriveFolderScopeError` (`INVALID_DRIVE_FOLDER_SCOPE`) sur tout autre dossier.
+  - `ALLOWED_DRIVE_FOLDER_ENTRIES` & `assertAllowedDriveFolderId(folderId)` : verrouille strictement `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`boursobank`) et `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`revolut`), lève `InvalidDriveFolderScopeError` (`INVALID_DRIVE_FOLDER_SCOPE`) sur tout autre dossier.
   - `createGoogleDriveClient(options)` : `listFolderPdfFiles(folderId)`, `discoverAllAllowedPdfs()`, `downloadPdfFile({ driveFileId, driveFolderId })` avec timeout réseau et erreurs typées (`DriveDownloadError`).
 - **Identification automatique Banque / Type de compte / Devise** :
   - `inferAccountMetadata({ bank, fileName, textSample })` (`AccountMetadataInferenceSchema`) : infère `accountType` (`courant`, `epargne`, `carte_differee`, `multi_devises`, `coffre`) et `currency` (`EUR` | `USD`).
 - **Extraction texte & préparation par lots bornés** :
   - `extractPdfPagesWithPdfjs(pdfBytes)` : lecture page par page via `pdfjs-dist` (`PdfUnreadableError` si PDF vide ou corrompu).
   - `stripBankingBoilerplate(pages)` : élimine les mentions légales répétitives (RCS, ORIAS, FGDR, RGPD, Bank of Lithuania, IBAN/BIC de pied de page, pagination) tout en préservant 100 % des lignes d'opérations et de soldes.
-  - `splitPagesIntoBatches(pages, options)` & `prepareDrivePdfBatches(...)` : découpe les pages nettoyées en lots bornés (`maxPagesPerBatch = 4`, `maxCharsPerBatch = 16_000`) pour prévenir tout timeout Gemini `504`.
+  - `splitPagesIntoBatches(pages, options)` & `prepareDrivePdfBatches(...)` : découpe les pages nettoyées en lots bornés (`maxPagesPerBatch = 4`, `maxCharsPerBatch = 8_000`) pour prévenir tout timeout Gemini `504`.
 
 ### 2. Pipeline Gemini, FX, Checkpoints SQL & Serveur Interne ([`src/gemini-pipeline.ts`](./src/gemini-pipeline.ts))
 - **Validation d'environnement fail-fast** :
@@ -38,7 +38,7 @@ Service isolé Node 22 LTS (Hono) dédié à l'ingestion manuelle des relevés P
 ## Invariants
 
 1. **Exclusivité absolue des 2 dossiers Google Drive** :
-   - Aucune découverte ni aucun téléchargement PDF ne peut cibler un parent hors de `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`boursobank`) et `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`revolut`), vérifié à la fois dans `drive-pdf.ts`, sur `/internal/runs` et par contrainte `CHECK` SQL dans `drive_files`.
+   - Aucune découverte ni aucun téléchargement PDF ne peut cibler un parent hors de `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`boursobank`) et `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`revolut`), vérifié à la fois dans `drive-pdf.ts`, sur `/internal/runs` et par contrainte `CHECK` SQL dans `drive_files`.
 2. **Zéro flottant comptable** :
    - Les soldes et montants extraits par Gemini sont validés par `CentsSchema` (entiers signés non nuls en centimes) et les taux de change par `FxRateMicroSchema` (`1.000000 = 1_000_000`). Tout float dans la réponse JSON Gemini est rejeté par Zod.
 3. **Idempotence & reprise granulaire par lot et par fichier** :

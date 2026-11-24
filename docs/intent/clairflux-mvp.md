@@ -18,8 +18,8 @@ Disposer d'un analyseur intelligent de relevés bancaires PDF (**BoursoBank** et
 
 ## 3. Déclenchement & Périmètre Google Drive
 - **Exclusivité stricte** sur 2 dossiers Google Drive :
-  - **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-  - **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
 - **Déclenchement strictement à la demande** via le bouton « Synchroniser maintenant » (**aucun** scan automatique ou polling en arrière-plan).
 - **Conservation définitive** de l'historique et des notes même si un PDF est archivé ou supprimé ultérieurement sur Drive.
 

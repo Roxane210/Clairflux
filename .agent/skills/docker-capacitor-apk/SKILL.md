@@ -12,7 +12,7 @@ Séparer clairement les responsabilités pour permettre la montée en charge, la
 1. **Services cibles (`docker-compose.yml`)** :
    - **`web` / `frontend`** : sert le bundle statique SPA optimisé (Nginx/Caddy léger non-root, compression Brotli/Gzip, headers cache immutables sur assets hashés, `Cache-Control: no-cache` sur `index.html`, zéro `no-store` pour préserver le bfcache).
    - **`api`** : serveur HTTP/JSON (authentification, endpoints delta sync mobile `GET /sync/delta` & `POST /sync/mutations`, CRUD notes & règles de catégorisation, consultation grand livre & agrégats Recharts, `/healthz` + `/readyz`).
-   - **`sync-worker`** : processus dédié au scan périodique/à la demande des **2 dossiers Google Drive exclusifs** (`1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` BoursoBank et `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` Revolut), appel Gemini par lot avec backoff exponentiel et écriture des checkpoints SQL dans Neon.
+   - **`sync-worker`** : processus dédié au scan périodique/à la demande des **2 dossiers Google Drive exclusifs** (`1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` BoursoBank et `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` Revolut), appel Gemini par lot avec backoff exponentiel et écriture des checkpoints SQL dans Neon.
    - *(Optionnel profil `dev`)* **`postgres-local`** : instance Postgres pour tests d'intégration hors-ligne sans toucher à Neon production.
 2. **Bonnes pratiques conteneurs** :
    - Images multi-stage (`node:22-alpine` / `distroless`), exécution en utilisateur non-root (`USER node`).

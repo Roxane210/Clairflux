@@ -1,6 +1,6 @@
-# Document de Reprise de Session — ClairFlux (`v1.0.0-rc1`)
+# Document de Reprise de Session — ClairFlux (`v1.0.0-rc1+`)
 
-> **Objectif de ce document** : Fournir à la nouvelle conversation tout le contexte technique, métier, infrastructurel et de gouvernance pour reprendre immédiatement la mise en production, la correction de bugs et l'ajout de nouvelles fonctionnalités sur **ClairFlux**.
+> **Objectif de ce document** : Fournir à la nouvelle conversation tout le contexte technique, métier, infrastructurel et de gouvernance pour reprendre immédiatement la mise en production, la recette terrain, la correction de bugs et l'ajout de nouvelles fonctionnalités sur **ClairFlux**.
 
 ---
 
@@ -11,6 +11,7 @@
 - **Ingénierie & `/swarm`** :
   - Appliquer `.agent/skills/swarm-egm-engineering/SKILL.md` (documentation normative avant code, Standard Matt Pocock TypeScript strict sans `any`, Zod aux frontières, Branded Types, Standard Addy Osmani, Git Atomique + Conventional Commits).
   - Autorisation permanente d'utiliser **`/swarm`** dès que la parallélisation apporte un gain, avec **max 5 fichiers par worker**, modèle **Gemini 4 Hydrogen (High)** (bascule temporaire sur **Argon (High)** uniquement si quota Hydrogen < 5 %), et double validation obligatoire par `optimizer_agent` + `reviewer_agent`.
+- **Diagnostic de bugs** : Appliquer `.agent/skills/diagnosing-bugs` (ou skill global `diagnosing-bugs`) avec boucle de reproduction rouge-capable avant toute correction, et respect du Standard Matt Pocock.
 - **Écosystème de Skills & Audit installés dans `.agent/`** :
   - `.agent/skills/modern-web-guidance/` (26 guides officiels Baseline Chrome/Safari/Firefox + Android System WebView)
   - `.agent/skills/frontend-ui-engineering/`, `.agent/skills/mobbin/`, `.agent/skills/prototype/`
@@ -23,12 +24,12 @@
 
 - **Workspace local** : `d:/Applications/Clairflux`
 - **Dépôt GitHub** : `https://github.com/Roxane210/Clairflux.git`
-- **Branche & Tags synchronisés** : `main` sur commit `968a998` · Tags : `v0.1.0-m1`, `v0.2.0-m2`, **`v1.0.0-rc1`**.
-- **État qualité vérifié à `v1.0.0-rc1`** :
+- **Branche & Tags synchronisés** : `main` sur commit **`2a17d60`** (`fix(web): ajouter le reverse-proxy /api dans Nginx et corriger le double prefixe /api`) · Tags : `v0.1.0-m1`, `v0.2.0-m2`, `v1.0.0-rc1`.
+- **État qualité vérifié à `2a17d60`** :
   - `npm run audit` : **PASS (100 %)**
   - `npm run typecheck` : **PASS** (4 workspaces `@clairflux/shared`, `@clairflux/api`, `@clairflux/sync-worker`, `@clairflux/web` + `apps/web/capacitor.config.ts`)
-  - `npm test` : **85 / 85 tests PASS** (8 fichiers Vitest)
-  - `npm run build` : **PASS** (475 modules, zéro fuite de secret dans `apps/web/dist/`)
+  - `npm test` : **86 / 86 tests PASS** (8 fichiers Vitest, incluant les tests de non-régression `/api` et `ApkDownloadCard`)
+  - `npm run build` : **PASS** (476 modules, zéro fuite de secret dans `apps/web/dist/`)
 - **Documents normatifs de référence** :
   - `docs/intent/clairflux-mvp.md` & `docs/ideas/critical-flows.md`
   - `docs/TECHNICAL_STANDARDS.md`
@@ -42,8 +43,8 @@
 ## 3. Contrats Métier & Techniques Verrouillés (Ne Pas Casser)
 
 1. **Sources Google Drive exclusives (Déclenchement 100 % manuel)** :
-   - **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-   - **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+   - **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+   - **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
    - Zéro polling automatique en arrière-plan ; conservation définitive de l'historique même si un PDF quitte Drive.
 2. **Multi-comptes & Multi-devises (EUR / USD)** :
    - Plusieurs comptes par banque détectés et renommables (`courant`, `epargne`, `carte_differee`, `multi_devises`, `coffre`, `autre`).
@@ -61,6 +62,9 @@
    - Typographie locale offline `@fontsource/*` : `Plus Jakarta Sans`, `DM Sans`, `JetBrains Mono` (`tabular-nums`).
    - Élévation unique (zéro cartes imbriquées, zéro pills statiques), cibles tactiles `>= 44×44px`, Bottom Tab Bar fixe `< 1024px` (`64px` = `7.6 % <= 15 %` du viewport), `<dialog>` natif (`overscroll-behavior: contain`), `@container`, `:has()` borné, `:user-valid/:user-invalid`, `content-visibility: auto; contain-intrinsic-size: auto 72px`.
    - Graphiques Recharts : **Solde cumulé 6M** et **Dépenses mensuelles** (3 modes : `Sans comparaison`, `M-1`, `Moyenne 3 mois`).
+6. **Routage Reverse-Proxy Nginx & URLs API (`/api`)** :
+   - `apps/web/Dockerfile` expose le port `8080` et doit impérativement proxifier `location /api/` vers `http://api:3000` (sans slash final sur `proxy_pass`, `Host $http_host`, `proxy_read_timeout 300s`).
+   - Tous les appels API du client passent par `buildApiEndpointUrl` (`apps/web/src/offline/apiUrl.ts`) afin de supporter `VITE_API_BASE_URL=/api` (Docker) comme `https://domaine` ou `""` sans jamais générer `/api/api/...`.
 
 ---
 
@@ -75,15 +79,17 @@
 - **Portainer & Docker Compose** :
   - Ports utilisés ailleurs sur le NAS : `2222`, `3010`, `3030`, `3080`, `4000`, `8000`, `8005`, `8085`, `8086`, `8087`, `8088`, `8090`, `8110`, `8642`, `9000`, `9119`.
   - Port ClairFlux : **`CLAIRFLUX_WEB_PORT=8080`** (`CLAIRFLUX_WEB_ORIGIN=http://192.168.1.118:8080`). `api` (`3000`) et `sync-worker` (`4001`) restent internes.
-  - État du dernier déploiement Portainer (stack `depense_budget`) :
-    - `api-1` : **`healthy`**
-    - `apk-builder-1` : **`exited - code 0`** (`clairflux-release.apk` généré dans `apk-artifacts:/shared-apk`, SHA-256 : `165422ac9c2291a860e7cdeb8bf00aefb8b58a8040434a0d39ac5ac7ae3e1da8`)
-    - Action en cours côté NAS pour démarrer `sync-worker-1` et `web-1` : créer `/volume1/docker/clairflux/google_drive_credentials.json` et définir `GOOGLE_DRIVE_CREDENTIALS_HOST_PATH=/volume1/docker/clairflux/google_drive_credentials.json` dans Portainer.
+  - État connu de la stack `depense_budget` :
+    - `api-1` : **`healthy`**.
+    - `apk-builder-1` : **`exited - code 0`** (`clairflux-release.apk` généré dans `apk-artifacts:/shared-apk`, SHA-256 : `165422ac9c2291a860e7cdeb8bf00aefb8b58a8040434a0d39ac5ac7ae3e1da8`).
+    - `web-1` : tournait sur la version pré-`2a17d60` (sans proxy `/api/` dans Nginx et avec double `/api/api/` côté bundle), provoquant `HTTP 405` sur `POST /api/sync/drive` et réponse HTML sur `GET /api/apk/status`. Le correctif **`2a17d60`** est poussé sur `origin/main` ; redéploiement Portainer (`Update the stack` + rebuild de `web`) à vérifier.
+    - `sync-worker-1` : nécessite `/volume1/docker/clairflux/google_drive_credentials.json` (`GOOGLE_DRIVE_CREDENTIALS_HOST_PATH=/volume1/docker/clairflux/google_drive_credentials.json`) et un jeton/credentials Drive valides. Un nouveau PDF a été déposé par le PO dans l'un des 2 dossiers Drive pour test réel.
 
 ---
 
 ## 5. Point de Départ pour la Nouvelle Conversation
 
-1. Vérifier le bon démarrage de `web-1` et `sync-worker-1` sur `http://192.168.1.118:8080` et l'accès à `clairflux-release.apk` (`GET /api/apk/status` / `GET /api/apk/download`).
-2. Tester la première connexion avec `CLAIRFLUX_ACCESS_SECRET_HASH`, l'import réel de relevés PDF BoursoBank & Revolut (EUR/USD) depuis Google Drive, et la prise de notes hors-ligne sur Android.
-3. Traiter les éventuels retours terrain (parsing PDF réel, ergonomie, nouvelles fonctionnalités via `interview-me` + `/swarm`).
+1. Vérifier auprès du PO le résultat du redéploiement Portainer (commit `2a17d60`) sur `http://192.168.1.118:8080` : disparition des erreurs `HTTP 405` et `Réponse JSON invalide reçue depuis /api/apk/status`, et affichage des métadonnées APK.
+2. Vérifier l'état de `sync-worker-1` et déclencher la synchronisation manuelle (`POST /api/sync/drive`) pour ingérer le nouveau PDF déposé dans Google Drive (BoursoBank / Revolut).
+3. Valider la connexion (`CLAIRFLUX_ACCESS_SECRET_HASH`), la qualité du parsing PDF réel (EUR/USD) et l'installation/usage hors-ligne de `clairflux-release.apk` sur Android.
+4. Traiter les éventuels retours terrain (parsing PDF réel, ergonomie, nouvelles fonctionnalités via `interview-me` + `/swarm`).

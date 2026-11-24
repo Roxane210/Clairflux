@@ -21,8 +21,8 @@ description: Spécialisation technique ClairFlux pour PostgreSQL Serverless Neon
    - Interdiction absolue d'utiliser `real`, `doublePrecision` ou des calculs flottants JS sur les soldes.
 2. **Exclusivité des 2 dossiers Google Drive** :
    - Contrainte SQL (`CHECK`) + validation applicative stricte autorisant uniquement :
-     - `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` → Banque `boursobank`
-     - `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` → Banque `revolut`
+     - `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` → Banque `boursobank`
+     - `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` → Banque `revolut`
    - Tout autre `drive_folder_id` est rejeté à la frontière d'ingestion et journalisé comme violation de périmètre.
 3. **Colonnes obligatoires Banque & Type de compte** :
    - Table `accounts` (et dénormalisation contrôlée ou jointure indexée) portant explicitement :

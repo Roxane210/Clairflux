@@ -63,7 +63,7 @@ Backend HTTP Node 22 LTS (Hono) et couche de persistance PostgreSQL Serverless N
 ## Invariants
 
 1. **Exclusivité Drive & déclenchement manuel** :
-   - Contraintes SQL `CHECK` sur `drive_files` limitant `drive_folder_id` à `'1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus'` (`boursobank`) et `'1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h'` (`revolut`), et `drive_sync_runs.trigger_mode = 'manual'`.
+   - Contraintes SQL `CHECK` sur `drive_files` limitant `drive_folder_id` à `'1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h'` (`boursobank`) et `'1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus'` (`revolut`), et `drive_sync_runs.trigger_mode = 'manual'`.
 2. **Zéro flottant & intégrité comptable** :
    - Tous les montants, soldes et plafonds `budget_limits.limit_cents` sont des entiers en centimes (`Cents`, `bigint({ mode: 'number' })`), et les taux FX des entiers en micro-unités (`FxRateMicro`, `1_000_000` pour `EUR`).
    - Les transferts internes (`is_internal_transfer = true`) sont systématiquement exclus des dépenses mensuelles, des comparaisons `M-1 / 3M` et de la consommation des budgets.

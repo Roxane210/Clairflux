@@ -11,7 +11,7 @@ Garantir sur **ClairFlux** une ingestion PDF Gemini résiliente sur les 2 dossie
 ## 1. Flux A — Reprise sur erreur des lots PDF Gemini & Multi-Comptes / Devises
 - **Direction retenue** : **Reprise granulaire par fichier PDF avec checkpoint SQL individuel**, découpage par compte/devise et figement du taux de change historique.
 - **Fonctionnement** :
-  - Au clic sur *« Synchroniser maintenant »* (déclenchement manuel exclusif), le worker liste les PDF des 2 dossiers autorisés (`1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` BoursoBank et `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` Revolut).
+  - Au clic sur *« Synchroniser maintenant »* (déclenchement manuel exclusif), le worker liste les PDF des 2 dossiers autorisés (`1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` BoursoBank et `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` Revolut).
   - L'analyseur Gemini découpe chaque PDF en blocs par **compte distinct** (`account_ref_masked`, `account_type`, `currency: 'EUR' | 'USD'`, soldes d'ouverture/clôture) afin de créer automatiquement les comptes BoursoBank (plusieurs comptes possibles) et Revolut (EUR, USD, coffres), chacun renommable par l'utilisateur.
   - Chaque opération en USD reçoit côté serveur un `fx_rate_to_eur` de sa date d'opération (taux du relevé Revolut si présent, sinon taux historique mis en cache dans `fx_rates`) et fige `amount_eur_cents` pour stabiliser les comparatifs `M-1 / Moyenne 3M` et garantir la lecture 100 % hors-ligne sur Android.
   - Les paires de change interne Revolut `EUR ↔ USD` (même banque, date `±1 jour`, motif de change) sont liées et marquées `Transfert interne` (exclues des dépenses).

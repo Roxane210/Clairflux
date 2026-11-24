@@ -26,8 +26,8 @@ Deux risques majeurs doivent être neutralisés par conception :
 ## 2. Contraintes
 
 - **Exclusivité stricte des 2 dossiers Google Drive** :
-  - BoursoBank : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-  - Revolut : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - BoursoBank : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - Revolut : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
 - **Déclenchement 100 % manuel** : bouton *« Synchroniser maintenant »* uniquement (aucun cron, webhook ou polling en arrière-plan).
 - **Conservation historique définitive** : aucune opération ni note personnalisée n'est supprimée en base si le PDF source disparaît de Google Drive.
 - **Zéro doublon** en cas de relance après erreur, ré-import d'un relevé chevauchant ou détection multi-comptes/multi-devises.
@@ -68,7 +68,7 @@ Deux risques majeurs doivent être neutralisés par conception :
 
 1. **Verrouillage Drive & Déclenchement Manuel** :
    - Le service `sync-worker` n'interroge Drive que sur appel explicite déclenché par `POST /api/sync/drive` (`trigger_mode = 'manual'`). Aucun scheduler ni cron n'est déployé.
-   - Les requêtes Drive ciblent exclusivement les deux IDs `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`boursobank`) et `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`revolut`), doublés d'une contrainte `CHECK` PostgreSQL sur `drive_files` vérifiant à la fois l'ID du dossier et la cohérence `drive_folder_id ↔ bank`.
+   - Les requêtes Drive ciblent exclusivement les deux IDs `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`boursobank`) et `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`revolut`), doublés d'une contrainte `CHECK` PostgreSQL sur `drive_files` vérifiant à la fois l'ID du dossier et la cohérence `drive_folder_id ↔ bank`.
    - Lorsqu'un PDF déjà commité n'est plus présent dans le dossier Drive, `drive_files.is_missing_on_drive` passe à `true` ; aucune transaction ni note n'est supprimée.
 
 2. **Déduplication à 2 Niveaux** :

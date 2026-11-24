@@ -30,7 +30,7 @@ Vérifié automatiquement par `scripts/run-audit-bot.mjs` :
 - [x] `fx_rate_micro` et arithmétique en centimes entiers (`CentsSchema`, `amount_cents`, `amount_eur_cents`) vérifiés dans `packages/shared`, `apps/api/src/db/schema.ts` et `apps/sync-worker/src/gemini-pipeline.ts`.
 - [x] Standards Matt Pocock : zéro `any` explicite dans `apps/` et `packages/`, validation Zod aux frontières, `strict: true` dans `tsconfig.base.json`.
 - [x] Clé `GEMINI_API_KEY` transmise via header HTTP `x-goog-api-key` (jamais en query string URL).
-- [x] 2 dossiers Google Drive exclusifs (`1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` BoursoBank & `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` Revolut) verrouillés dans `packages/shared`, `apps/api/src/db/schema.ts` (`CHECK` SQL) et `apps/sync-worker/src/drive-pdf.ts`.
+- [x] 2 dossiers Google Drive exclusifs (`1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` BoursoBank & `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` Revolut) verrouillés dans `packages/shared`, `apps/api/src/db/schema.ts` (`CHECK` SQL) et `apps/sync-worker/src/drive-pdf.ts`.
 - [x] Polices `@fontsource/*` bundlées localement (`main.tsx`), zéro CDN externe (`fonts.googleapis.com` interdit).
 - [x] Zéro secret serveur (`DATABASE_URL`, `GEMINI_API_KEY`, `CLAIRFLUX_ACCESS_SECRET_HASH`, `CLAIRFLUX_SESSION_SECRET`, `INTERNAL_WORKER_TOKEN`, `AIzaSy`, `postgresql://`) dans `apps/web/dist/`.
 

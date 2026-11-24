@@ -13,8 +13,8 @@ Application personnelle de suivi financier multi-banques et multi-comptes (**Bou
 
 ### 1. Périmètre Google Drive exclusif, extraction PDF & reprise Gemini
 - **Lecture seule stricte (`drive.readonly`)** limitée à **deux dossiers Google Drive codés en dur** (validés dans `@clairflux/shared`, `@clairflux/api`, `@clairflux/sync-worker` et par contrainte SQL `CHECK` dans PostgreSQL Neon) :
-  - **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-  - **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
 - **Déclenchement 100 % manuel** (`POST /api/sync/drive` → `POST /internal/runs` authentifié par `INTERNAL_WORKER_TOKEN` avec `timingSafeEqual`) : aucun cron, aucun webhook, aucun polling automatique en arrière-plan.
 - **Pipeline PDF `pdfjs-dist` + Chaîne de fallback Gemini** : découpage PDF avec suppression du boilerplate bancaire en lots bornés (`drive-pdf.ts`), extraction structurée validée par Zod sur la chaîne ordonnée **`gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.1-flash-lite`** (clé transmise via en-tête HTTP `x-goog-api-key`), résolution `fx_rate_micro` et reprise granulaire par checkpoints SQL PostgreSQL Neon (`pending | skipped | extracting | parsed | committing | committed | failed`, contrôle `md5_checksum` et `dedup_hash`).
 

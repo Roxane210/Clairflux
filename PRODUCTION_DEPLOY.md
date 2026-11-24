@@ -14,8 +14,8 @@ Il s'adresse au Product Owner / exploitant de l'instance personnelle, avec des c
 - Un compte **Neon** (<https://neon.tech>) pour la base PostgreSQL Serverless.
 - Une clé API **Google Gemini** (`GEMINI_API_KEY`).
 - Un accès **Google Drive** en lecture seule (`drive.readonly`) limité aux **deux seuls dossiers autorisés** :
-  - **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-  - **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+  - **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
 - **Node.js 22 LTS** et **npm** (pour pousser le schéma SQL et exécuter les vérifications locales).
 - **Docker + Docker Compose v2** sur votre serveur/PC (ou, à défaut de Docker local pour compiler l'APK Android, un accès aux **GitHub Actions** du dépôt).
 
@@ -72,8 +72,8 @@ Il s'adresse au Product Owner / exploitant de l'instance personnelle, avec des c
        - `GOOGLE_DRIVE_CREDENTIALS_PATH=/run/secrets/google_drive_credentials.json`,
        - `GOOGLE_DRIVE_ACCESS_TOKEN=...` (jeton d'accès OAuth2 `drive.readonly`).
      - **Périmètre verrouillé** : ne partagez avec ce compte/token **que** les deux dossiers autorisés :
-       - **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-       - **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+       - **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+       - **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
        *(Tout autre dossier Drive est bloqué au niveau applicatif et par contrainte SQL `CHECK` dans Neon).*
 
 4. Renseignez la configuration Web, API et APK :

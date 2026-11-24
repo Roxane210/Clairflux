@@ -15,8 +15,8 @@
 
 1. **Usage personnel unique** : pas d'inscription publique, pas de multi-tenant, pas de gestion de rôles. Un seul espace financier privé accessible depuis Desktop Web et Android APK.
 2. **Exclusivité stricte des 2 dossiers Google Drive** :
-   - `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` → Banque `boursobank`
-   - `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` → Banque `revolut`
+   - `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` → Banque `boursobank`
+   - `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` → Banque `revolut`
    - Tout autre `drive_folder_id` est rejeté avec `403 Forbidden` (`INVALID_DRIVE_FOLDER_SCOPE`).
 3. **Déclenchement Drive strictement manuel** : aucun cron, aucun webhook, aucun polling automatique en arrière-plan. Seul l'appel explicite à `POST /api/sync/drive` (ou `POST /api/sync/drive/files/:fileId/retry`) lance une ingestion.
 4. **Android Offline-First en lecture seule / Écritures en ligne uniquement** :
@@ -544,8 +544,8 @@ Prévisualisation sans écriture en base avant confirmation utilisateur (notamme
 ## 6. Endpoints Synchronisation Google Drive Manuelle Exclusive (`/api/sync/drive/*`)
 
 > **Règle absolue** : Aucun scan automatique. Les 2 dossiers Drive autorisés sont figés côté serveur dans `api` et `sync-worker` :
-> - `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`boursobank`)
-> - `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`revolut`)
+> - `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` (`boursobank`)
+> - `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` (`revolut`)
 
 ### 6.1 `POST /api/sync/drive`
 
@@ -565,8 +565,8 @@ Lance un run manuel complet sur les 2 dossiers exclusifs.
     "status": "running",
     "trigger_mode": "manual",
     "allowed_folders": [
-      { "folder_id": "1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus", "bank": "boursobank" },
-      { "folder_id": "1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h", "bank": "revolut" }
+      { "folder_id": "1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h", "bank": "boursobank" },
+      { "folder_id": "1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus", "bank": "revolut" }
     ],
     "started_at": "2026-11-21T13:30:00.000Z"
   }
@@ -598,7 +598,7 @@ Retourne l'état détaillé du dernier run (ou d'un run ciblé via `?run_id=<uui
   "files": [
     {
       "drive_file_id": "1Bx99_bourso_2026_10",
-      "drive_folder_id": "1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus",
+      "drive_folder_id": "1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h",
       "bank": "boursobank",
       "file_name": "Releve_BoursoBank_2026_10.pdf",
       "md5_checksum": "d41d8cd98f00b204e9800998ecf8427e",
@@ -613,7 +613,7 @@ Retourne l'état détaillé du dernier run (ou d'un run ciblé via `?run_id=<uui
     },
     {
       "drive_file_id": "1Rev_2026_10_usd",
-      "drive_folder_id": "1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h",
+      "drive_folder_id": "1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus",
       "bank": "revolut",
       "file_name": "Revolut_Statement_2026_10.pdf",
       "md5_checksum": "a87ff679a2f3e71d9181a67b7542122c",
@@ -778,7 +778,7 @@ Relance l'extraction Gemini et le commit atomique **uniquement pour le fichier P
     "files": [
       {
         "drive_file_id": "1Rev_2026_10_usd",
-        "drive_folder_id": "1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h",
+        "drive_folder_id": "1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus",
         "bank": "revolut",
         "file_name": "Revolut_Statement_2026_10.pdf",
         "status": "failed",

@@ -13,8 +13,8 @@ Empêcher toute supposition silencieuse avant d'écrire une spécification ou du
 
 Avant de valider un périmètre, vérifier systématiquement les zones d'ombre sur :
 1. **Synchronisation Google Drive exclusive** :
-   - Dossier **BoursoBank** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
-   - Dossier **Revolut** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+   - Dossier **BoursoBank** : `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h`
+   - Dossier **Revolut** : `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus`
    - Questions types : fréquence de scan, gestion des sous-dossiers éventuels vs racine stricte, comportement si un PDF est déplacé/supprimé/renommé sur Drive, déclenchement manuel vs planifié.
 2. **Déduplication BoursoBank / Revolut** :
    - Relevés PDF qui se chevauchent (ex. relevé mensuel + relevé intermédiaire ou ré-export Revolut CSV/PDF).
