@@ -1,9 +1,11 @@
 import {
+  ApiErrorEnvelopeSchema,
   parseRuleId,
   toSyncRevision,
   type AccountId,
   type Bank,
   type CategorizationRule,
+  type DriveSyncRunSummary,
   type RuleId,
   type Transaction,
   type TransactionId,
@@ -204,14 +206,22 @@ export function createOfflineController(
     }
   };
 
-  const pullCompleteDelta = async (
-    baseDataset: ClairFluxDataset,
-  ): Promise<
-    | { readonly ok: true; readonly dataset: ClairFluxDataset }
-    | { readonly ok: false; readonly message: string; readonly unauthorized: boolean }
-  > => {
+  type PullCompleteResult =
+    | {
+        readonly ok: true;
+        readonly dataset: ClairFluxDataset;
+        readonly lastRun: DriveSyncRunSummary | null;
+      }
+    | {
+        readonly ok: false;
+        readonly message: string;
+        readonly unauthorized: boolean;
+      };
+
+  const pullCompleteDelta = async (baseDataset: ClairFluxDataset): Promise<PullCompleteResult> => {
     let workingDataset = baseDataset;
     let cursor = baseDataset.revision;
+    let lastRun: DriveSyncRunSummary | null = null;
     const maxPages = 20;
 
     for (let page = 0; page < maxPages; page += 1) {
@@ -234,25 +244,27 @@ export function createOfflineController(
             unauthorized: resyncResult.status === 401,
           };
         }
+        lastRun = resyncResult.data.drive_sync_status.last_run;
         workingDataset = applyDeltaToDataset(workingDataset, {
           ...resyncResult.data,
           full_resync_required: true,
         });
         if (!resyncResult.data.has_more) {
-          return { ok: true, dataset: workingDataset };
+          return { ok: true, dataset: workingDataset, lastRun };
         }
         cursor = resyncResult.data.batch_end_revision;
         continue;
       }
 
+      lastRun = delta.drive_sync_status.last_run;
       workingDataset = applyDeltaToDataset(workingDataset, delta);
-      if (!delta.has_more || delta.batch_end_revision <= cursor && !delta.full_resync_required) {
-        return { ok: true, dataset: workingDataset };
+      if (!delta.has_more || (delta.batch_end_revision <= cursor && !delta.full_resync_required)) {
+        return { ok: true, dataset: workingDataset, lastRun };
       }
       cursor = delta.batch_end_revision;
     }
 
-    return { ok: true, dataset: workingDataset };
+    return { ok: true, dataset: workingDataset, lastRun };
   };
 
   const flushNow = async (): Promise<void> => {
@@ -710,8 +722,21 @@ export function createOfflineController(
         }
 
         if (!response.ok) {
+          let detailedMessage: string | null = null;
+          try {
+            const rawError: unknown = await response.json();
+            const parsedError = ApiErrorEnvelopeSchema.safeParse(rawError);
+            if (parsedError.success) {
+              detailedMessage = parsedError.data.error.message;
+            }
+          } catch {
+            // Keep generic fallback message if body is not valid JSON
+          }
           emit({
-            syncMessage: `Synchronisation Drive/Gemini indisponible (HTTP ${response.status}).`,
+            syncMessage:
+              detailedMessage !== null
+                ? `${detailedMessage} (HTTP ${response.status}).`
+                : `Synchronisation Drive/Gemini indisponible (HTTP ${response.status}).`,
           });
           return;
         }
@@ -719,9 +744,15 @@ export function createOfflineController(
         const pullOutcome = await pullCompleteDelta(state.dataset);
         if (pullOutcome.ok) {
           await persistSnapshot(pullOutcome.dataset);
+          const failedSummary =
+            pullOutcome.lastRun?.status === 'failed' && pullOutcome.lastRun.error_summary
+              ? `Échec synchronisation Drive : ${pullOutcome.lastRun.error_summary}`
+              : null;
           emit({
             dataset: pullOutcome.dataset,
-            syncMessage: 'Synchronisation Drive/Gemini déclenchée sur les 2 dossiers autorisés.',
+            syncMessage:
+              failedSummary ??
+              'Synchronisation Drive/Gemini déclenchée sur les 2 dossiers autorisés.',
           });
         } else {
           emit({

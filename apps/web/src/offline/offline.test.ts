@@ -931,4 +931,80 @@ describe('ClairFlux Offline-First Engine & Capacitor Bridge', () => {
     expect(resyncController.getState().dataset.revision).toBe(5);
     expect(resyncController.getState().dataset.transactions).toHaveLength(0);
   });
+
+  it('affiche le message d erreur métier sur HTTP 409 / 502 au lieu d un message générique opaque', async () => {
+    const store = createMemoryOfflineStore();
+    const seed = buildSeedDataset();
+
+    const conflictController = createOfflineController(seed, {
+      store,
+      apiBaseUrl: '/api',
+      fetcher: async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'SYNC_ALREADY_RUNNING',
+              message: 'Une synchronisation Google Drive est déjà en cours.',
+              retryable: true,
+            },
+          }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } },
+        ),
+      initialOnline: true,
+    });
+
+    await conflictController.triggerDriveSync();
+    expect(conflictController.getState().syncMessage).toContain(
+      'Une synchronisation Google Drive est déjà en cours.',
+    );
+    expect(conflictController.getState().syncMessage).toContain('409');
+
+    const failedDeltaController = createOfflineController(seed, {
+      store: createMemoryOfflineStore(),
+      apiBaseUrl: '/api',
+      fetcher: async (input, init) => {
+        if (input === '/api/sync/drive' && init?.method === 'POST') {
+          return new Response(JSON.stringify({ ok: true }), { status: 202 });
+        }
+        if (input.startsWith('/api/sync/delta')) {
+          const failedDelta: DeltaSyncResponse = {
+            since_revision: toSyncRevision(seed.revision),
+            batch_end_revision: toSyncRevision(seed.revision),
+            latest_revision: toSyncRevision(seed.revision),
+            has_more: false,
+            full_resync_required: false,
+            server_time: '2026-11-24T10:00:00.000Z',
+            accounts: { upserted: [], deleted_ids: [] },
+            transactions: { upserted: [], deleted_ids: [] },
+            transaction_notes: { upserted: [], deleted_transaction_ids: [] },
+            categorization_rules: { upserted: [], deleted_ids: [] },
+            drive_sync_status: {
+              last_run: {
+                id: '8ccd913c-7656-4c85-998b-e9da02c72ddd',
+                status: 'failed',
+                trigger_mode: 'manual',
+                started_at: '2026-11-24T09:44:30.091Z',
+                finished_at: '2026-11-24T09:44:31.000Z',
+                total_files_discovered: 0,
+                files_committed: 0,
+                files_skipped_unchanged: 0,
+                files_failed: 0,
+                error_summary: 'Google Drive API a répondu HTTP 401.',
+              },
+              files: [],
+            },
+            aggregates_snapshot: null,
+          };
+          return new Response(JSON.stringify(failedDelta), { status: 200 });
+        }
+        return new Response(null, { status: 404 });
+      },
+      initialOnline: true,
+    });
+
+    await failedDeltaController.triggerDriveSync();
+    expect(failedDeltaController.getState().syncMessage).toContain(
+      'Google Drive API a répondu HTTP 401.',
+    );
+  });
 });

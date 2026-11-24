@@ -423,6 +423,200 @@ export function createInMemorySessionRepository(): SessionRepository {
   };
 }
 
+const WorkerActiveRunResponseSchema = z.object({
+  active_run_id: z.string().uuid().nullable(),
+});
+
+const WorkerConflictResponseSchema = z.object({
+  error: z
+    .object({
+      details: z
+        .object({
+          active_run_id: z.string().uuid().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+});
+
+const ORPHAN_RUN_GRACE_MS = 5_000;
+const WORKER_UNREACHABLE_STALE_MS = 300_000;
+const WORKER_CONTROL_TIMEOUT_MS = 3_000;
+
+export interface DriveSyncRunStore {
+  findActiveRunningRuns(): Promise<ReadonlyArray<{ readonly id: string; readonly startedAt: Date }>>;
+  createRunningRun(): Promise<{ readonly id: string; readonly startedAt: Date } | null>;
+  markRunFailed(runId: string, summary: string): Promise<void>;
+}
+
+export function createResilientDriveSyncService(options: {
+  readonly store: DriveSyncRunStore;
+  readonly syncWorkerUrl: string;
+  readonly internalWorkerToken: string;
+  readonly fetchFn?: typeof fetch | undefined;
+  readonly now?: (() => Date) | undefined;
+}): AppDependencies['driveSyncService'] {
+  const fetchFn = options.fetchFn ?? globalThis.fetch;
+  const getNow = options.now ?? (() => new Date());
+
+  async function probeWorkerActiveRunId(): Promise<
+    { readonly ok: true; readonly activeRunId: string | null } | { readonly ok: false }
+  > {
+    try {
+      const res = await fetchFn(`${options.syncWorkerUrl}/internal/runs/active`, {
+        method: 'GET',
+        headers: {
+          'X-Internal-Worker-Token': options.internalWorkerToken,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(WORKER_CONTROL_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        return { ok: false };
+      }
+      const parsed = WorkerActiveRunResponseSchema.safeParse(await res.json());
+      if (!parsed.success) {
+        return { ok: false };
+      }
+      return { ok: true, activeRunId: parsed.data.active_run_id };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  return {
+    async triggerManualSync() {
+      const runningRows = await options.store.findActiveRunningRuns();
+      const firstActive = runningRows[0];
+
+      if (firstActive !== undefined) {
+        const probe = await probeWorkerActiveRunId();
+        const nowMs = getNow().getTime();
+
+        if (probe.ok) {
+          if (probe.activeRunId !== null) {
+            return {
+              ok: false,
+              reason: 'already_running',
+              activeRunId: probe.activeRunId,
+            };
+          }
+
+          const stillInGrace = runningRows.find(
+            (row) => nowMs - row.startedAt.getTime() < ORPHAN_RUN_GRACE_MS,
+          );
+          if (stillInGrace !== undefined) {
+            return {
+              ok: false,
+              reason: 'already_running',
+              activeRunId: stillInGrace.id,
+            };
+          }
+
+          for (const orphan of runningRows) {
+            await options.store.markRunFailed(
+              orphan.id,
+              'Synchronisation précédente interrompue (aucun traitement actif dans sync-worker).',
+            );
+          }
+        } else if (nowMs - firstActive.startedAt.getTime() < WORKER_UNREACHABLE_STALE_MS) {
+          return {
+            ok: false,
+            reason: 'already_running',
+            activeRunId: firstActive.id,
+          };
+        } else {
+          return {
+            ok: false,
+            reason: 'upstream_error',
+            message:
+              'Le service sync-worker est injoignable pour vérifier la synchronisation précédente.',
+          };
+        }
+      }
+
+      const createdRun = await options.store.createRunningRun();
+      if (createdRun === null) {
+        return {
+          ok: false,
+          reason: 'upstream_error',
+          message: 'Impossible de créer le run de synchronisation Drive.',
+        };
+      }
+
+      const safeMarkFailed = async (summary: string): Promise<void> => {
+        try {
+          await options.store.markRunFailed(createdRun.id, summary);
+        } catch {
+          // Best-effort cleanup so failed worker dispatch does not swallow the primary error
+        }
+      };
+
+      try {
+        const response = await fetchFn(`${options.syncWorkerUrl}/internal/runs`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Worker-Token': options.internalWorkerToken,
+          },
+          body: JSON.stringify({ run_id: createdRun.id }),
+        });
+
+        if (response.status === 409) {
+          let activeRunId = createdRun.id;
+          try {
+            const parsedConflict = WorkerConflictResponseSchema.safeParse(await response.json());
+            if (parsedConflict.success && parsedConflict.data.error?.details?.active_run_id) {
+              activeRunId = parsedConflict.data.error.details.active_run_id;
+            }
+          } catch {
+            // Keep createdRun.id fallback
+          }
+          await safeMarkFailed('Synchronisation déjà active côté sync-worker (HTTP 409).');
+          return {
+            ok: false,
+            reason: 'already_running',
+            activeRunId,
+          };
+        }
+
+        if (!response.ok) {
+          const message = `Le sync-worker a répondu avec le statut HTTP ${response.status}.`;
+          await safeMarkFailed(message);
+          return {
+            ok: false,
+            reason: 'upstream_error',
+            message,
+          };
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Erreur de communication avec sync-worker.';
+        await safeMarkFailed(message);
+        return {
+          ok: false,
+          reason: 'upstream_error',
+          message,
+        };
+      }
+
+      return {
+        ok: true,
+        run: {
+          id: createdRun.id,
+          status: 'running',
+          trigger_mode: 'manual',
+          allowed_folders: [
+            { folder_id: ALLOWED_DRIVE_FOLDERS.boursobank, bank: 'boursobank' as Bank },
+            { folder_id: ALLOWED_DRIVE_FOLDERS.revolut, bank: 'revolut' as Bank },
+          ],
+          started_at: createdRun.startedAt.toISOString(),
+        },
+      };
+    },
+  };
+}
+
 export function createNeonAppDependencies(
   env: ApiEnv,
   clients: NeonClients,
@@ -1481,6 +1675,7 @@ export function createNeonAppDependencies(
                   files_committed: lastRunRow.filesCommitted,
                   files_skipped_unchanged: lastRunRow.filesSkippedUnchanged,
                   files_failed: lastRunRow.filesFailed,
+                  error_summary: lastRunRow.errorSummary,
                 }
               : null,
           files: filesStatus,
@@ -1587,107 +1782,47 @@ export function createNeonAppDependencies(
     },
   });
 
-  const driveSyncService: AppDependencies['driveSyncService'] = {
-    async triggerManualSync() {
-      const runningRows = await clients.httpDb
-        .select({ id: driveSyncRuns.id })
-        .from(driveSyncRuns)
-        .where(eq(driveSyncRuns.status, 'running'))
-        .limit(1);
-
-      const active = runningRows[0];
-      if (active !== undefined) {
-        return {
-          ok: false,
-          reason: 'already_running',
-          activeRunId: active.id,
-        };
-      }
-
-      const [createdRun] = await clients.poolDb.transaction(async (tx) => {
-        const rev = await allocateNextRevision(tx);
-        return tx
-          .insert(driveSyncRuns)
-          .values({
-            triggerMode: 'manual',
-            status: 'running',
-            revision: rev,
-          })
-          .returning();
-      });
-
-      if (createdRun === undefined) {
-        return {
-          ok: false,
-          reason: 'upstream_error',
-          message: 'Impossible de créer le run de synchronisation Drive.',
-        };
-      }
-
-      const markRunFailed = async (summary: string): Promise<void> => {
-        try {
-          await clients.poolDb.transaction(async (tx) => {
-            const failRev = await allocateNextRevision(tx);
-            await tx
-              .update(driveSyncRuns)
-              .set({
-                status: 'failed',
-                finishedAt: new Date(),
-                errorSummary: summary,
-                revision: failRev,
-              })
-              .where(eq(driveSyncRuns.id, createdRun.id));
-          });
-        } catch {
-          // Best-effort cleanup so failed worker dispatch does not swallow the primary error
-        }
-      };
-
-      try {
-        const response = await fetch(`${env.SYNC_WORKER_URL}/internal/runs`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Internal-Worker-Token': internalWorkerToken,
-          },
-          body: JSON.stringify({ run_id: createdRun.id }),
+  const driveSyncService = createResilientDriveSyncService({
+    syncWorkerUrl: env.SYNC_WORKER_URL,
+    internalWorkerToken,
+    store: {
+      async findActiveRunningRuns() {
+        return clients.httpDb
+          .select({ id: driveSyncRuns.id, startedAt: driveSyncRuns.startedAt })
+          .from(driveSyncRuns)
+          .where(eq(driveSyncRuns.status, 'running'))
+          .orderBy(desc(driveSyncRuns.startedAt));
+      },
+      async createRunningRun() {
+        const [createdRun] = await clients.poolDb.transaction(async (tx) => {
+          const rev = await allocateNextRevision(tx);
+          return tx
+            .insert(driveSyncRuns)
+            .values({
+              triggerMode: 'manual',
+              status: 'running',
+              revision: rev,
+            })
+            .returning({ id: driveSyncRuns.id, startedAt: driveSyncRuns.startedAt });
         });
-
-        if (!response.ok) {
-          const message = `Le sync-worker a répondu avec le statut HTTP ${response.status}.`;
-          await markRunFailed(message);
-          return {
-            ok: false,
-            reason: 'upstream_error',
-            message,
-          };
-        }
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'Erreur de communication avec sync-worker.';
-        await markRunFailed(message);
-        return {
-          ok: false,
-          reason: 'upstream_error',
-          message,
-        };
-      }
-
-      return {
-        ok: true,
-        run: {
-          id: createdRun.id,
-          status: 'running',
-          trigger_mode: 'manual',
-          allowed_folders: [
-            { folder_id: ALLOWED_DRIVE_FOLDERS.boursobank, bank: 'boursobank' as Bank },
-            { folder_id: ALLOWED_DRIVE_FOLDERS.revolut, bank: 'revolut' as Bank },
-          ],
-          started_at: createdRun.startedAt.toISOString(),
-        },
-      };
+        return createdRun ?? null;
+      },
+      async markRunFailed(runId: string, summary: string) {
+        await clients.poolDb.transaction(async (tx) => {
+          const failRev = await allocateNextRevision(tx);
+          await tx
+            .update(driveSyncRuns)
+            .set({
+              status: 'failed',
+              finishedAt: new Date(),
+              errorSummary: summary,
+              revision: failRev,
+            })
+            .where(eq(driveSyncRuns.id, runId));
+        });
+      },
     },
-  };
+  });
 
   return {
     sessionSecret: env.CLAIRFLUX_SESSION_SECRET,

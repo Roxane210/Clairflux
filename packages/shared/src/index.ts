@@ -278,6 +278,7 @@ export const DriveSyncRunSummarySchema = z.object({
   files_committed: z.number().int().nonnegative(),
   files_skipped_unchanged: z.number().int().nonnegative(),
   files_failed: z.number().int().nonnegative(),
+  error_summary: z.string().nullable().optional(),
 });
 export type DriveSyncRunSummary = z.infer<typeof DriveSyncRunSummarySchema>;
 

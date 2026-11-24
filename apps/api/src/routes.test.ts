@@ -53,6 +53,7 @@ import {
   computeCanonicalMutationPayloadHash,
   createFilesystemApkRepository,
   createIdempotentDeltaMutationRepository,
+  createResilientDriveSyncService,
   type AppliedClientMutationRecord,
 } from './server.js';
 
@@ -1758,6 +1759,87 @@ describe('ClairFlux API — Jalon 2 Routes Complètes & Sync Delta', () => {
       } finally {
         await rm(tmpDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('Réconciliation des runs Drive orphelins (createResilientDriveSyncService)', () => {
+    it('clôture un run orphelin en failed si sync-worker rapporte active_run_id: null puis lance le nouveau run', async () => {
+      const staleId = '8ccd913c-7656-4c85-998b-e9da02c72ddd';
+      const newRunId = '99999999-9999-4999-8999-999999999999';
+      const activeRuns: Array<{ id: string; startedAt: Date }> = [
+        { id: staleId, startedAt: new Date('2026-11-24T09:44:30.000Z') },
+      ];
+      const markedFailed: Array<{ runId: string; summary: string }> = [];
+
+      const service = createResilientDriveSyncService({
+        syncWorkerUrl: 'http://sync-worker:4001',
+        internalWorkerToken: 'internal-worker-token-32-chars-minimum',
+        now: () => new Date('2026-11-24T10:15:00.000Z'),
+        store: {
+          async findActiveRunningRuns() {
+            return activeRuns;
+          },
+          async createRunningRun() {
+            return { id: newRunId, startedAt: new Date('2026-11-24T10:15:00.000Z') };
+          },
+          async markRunFailed(runId, summary) {
+            markedFailed.push({ runId, summary });
+          },
+        },
+        fetchFn: async (input, init) => {
+          const url = String(input);
+          if (url.endsWith('/internal/runs/active') && init?.method === 'GET') {
+            return new Response(JSON.stringify({ active_run_id: null }), { status: 200 });
+          }
+          if (url.endsWith('/internal/runs') && init?.method === 'POST') {
+            return new Response(JSON.stringify({ run_id: newRunId, status: 'running' }), {
+              status: 202,
+            });
+          }
+          return new Response(null, { status: 404 });
+        },
+      });
+
+      const outcome = await service.triggerManualSync();
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.run.id).toBe(newRunId);
+      }
+      expect(markedFailed).toHaveLength(1);
+      expect(markedFailed[0]?.runId).toBe(staleId);
+    });
+
+    it('renvoie already_running (409) quand sync-worker confirme un run actif en mémoire', async () => {
+      const activeId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const service = createResilientDriveSyncService({
+        syncWorkerUrl: 'http://sync-worker:4001',
+        internalWorkerToken: 'internal-worker-token-32-chars-minimum',
+        now: () => new Date('2026-11-24T10:15:00.000Z'),
+        store: {
+          async findActiveRunningRuns() {
+            return [{ id: activeId, startedAt: new Date('2026-11-24T10:14:00.000Z') }];
+          },
+          async createRunningRun() {
+            throw new Error('Should not create new run');
+          },
+          async markRunFailed() {
+            throw new Error('Should not mark active run failed');
+          },
+        },
+        fetchFn: async (input) => {
+          if (String(input).endsWith('/internal/runs/active')) {
+            return new Response(JSON.stringify({ active_run_id: activeId }), { status: 200 });
+          }
+          return new Response(null, { status: 404 });
+        },
+      });
+
+      const outcome = await service.triggerManualSync();
+      expect(outcome).toEqual({
+        ok: false,
+        reason: 'already_running',
+        activeRunId: activeId,
+      });
     });
   });
 });
