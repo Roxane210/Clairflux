@@ -89,9 +89,9 @@ L'accès repose sur un **secret personnel unique** configuré côté serveur (`C
 ### 3.1 Double mode de transport sécurisé (Web vs APK Android)
 
 - **Web Desktop (`client_kind: "web"`)** :
-  - L'API pose un cookie `clairflux_session` avec attributs `HttpOnly`, `SameSite=Lax`, `Path=/api`, et `Secure` (en HTTPS).
-  - Contenu : jeton signé HMAC-SHA256 (`CLAIRFLUX_SESSION_SECRET`) incluant `jti` (identifiant révocable en base), `client_kind`, `iat`, `exp` (durée 14 jours, renouvellement glissant au-delà de 7 jours).
-  - Protection CSRF : toute mutation Web (`POST`, `PUT`, `PATCH`, `DELETE`) vérifie que l'en-tête `Origin` appartient à `CLAIRFLUX_WEB_ORIGIN` et exige le header custom `X-Clairflux-Client: web`.
+  - L'API pose un cookie `clairflux_session` avec attributs `HttpOnly`, `SameSite=Lax`, `Path=/api`, et `Secure` conditionné au transport HTTPS (omis en HTTP LAN local, ex. `http://192.168.1.118:8080`, afin que le navigateur transmette le cookie).
+  - Contenu : jeton signé HMAC-SHA256 (`CLAIRFLUX_SESSION_SECRET`) incluant `jti` (identifiant révocable), `client_kind`, `iat`, `exp` (durée 14 jours, renouvellement glissant au-delà de 7 jours).
+  - Protection CSRF : toute mutation Web (`POST`, `PUT`, `PATCH`, `DELETE`) vérifie que l'en-tête `Origin` appartient à `CLAIRFLUX_WEB_ORIGIN` (normalisé sans slash final) et exige le header custom `X-Clairflux-Client: web`.
 - **Android APK Capacitor (`client_kind: "android"`)** :
   - L'APK ne s'appuie pas sur les cookies tiers de la WebView ; `POST /api/auth/login` retourne dans le corps JSON un **Bearer Token** signé (`access_token`, durée 30 jours, `jti` révocable en base).
   - L'APK stocke ce token uniquement dans un stockage natif protégé par **Android Keystore** (jamais en clair dans `localStorage` ni dans `assets/`), et l'envoie via `Authorization: Bearer <token>`.
@@ -667,6 +667,7 @@ Relance l'extraction Gemini et le commit atomique **uniquement pour le fichier P
   - Le serveur lit en une transaction `REPEATABLE READ` (ou borne `<= head_revision` capturée au début de la requête) toutes les lignes dont `revision > since` et `revision <= page_max_revision`.
   - Lors d'un bootstrap initial (`since=0`), le serveur livre l'intégralité de `accounts` et `categorization_rules` dès la première page (ou avant les `transactions` paginées). Côté client Android SQLite, le commit local diffère les contraintes de clés étrangères (`PRAGMA defer_foreign_keys = ON`) jusqu'à réception complète de la séquence (`has_more === false`).
   - Si `has_more === true`, le client enchaîne avec `?since=<batch_end_revision>` jusqu'à `has_more === false`, puis met à jour `aggregates_snapshot` et persiste `latest_revision` dans `local_sync_meta`.
+  - Si `since > latest_revision` (curseur client obsolète ou issu d'un jeu de démonstration), le serveur bascule automatiquement sur un resync depuis `0` avec `full_resync_required: true` afin de rétablir la cohérence locale.
   - Le serveur ne renvoie **jamais** de PDF bruts, ni de payloads Gemini bruts, ni de secrets.
 
 ### 7.2 Paramètres & Réponse JSON Exacte

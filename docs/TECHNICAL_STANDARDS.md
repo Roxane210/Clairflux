@@ -1,8 +1,8 @@
 # Standards Techniques & Normes d'Ingénierie — ClairFlux
 
-- **Statut** : Normatif — Source de vérité Pré-Code
-- **Date** : 2026-11-21
-- **Gouvernance** : `swarm-egm-engineering` (Phase Pré-Code)
+- **Statut** : Normatif — Source de vérité (Exploitation & Évolutions `v1.0.0-rc1+`)
+- **Date** : 2026-11-24
+- **Gouvernance** : `swarm-egm-engineering` (Documentation normative continue avant toute évolution)
 - **Références liées** :
   - Énoncé d'intention : [clairflux-mvp.md](file:///d:/Applications/Clairflux/docs/intent/clairflux-mvp.md)
   - Flux critiques : [critical-flows.md](file:///d:/Applications/Clairflux/docs/ideas/critical-flows.md)
@@ -11,7 +11,7 @@
   - Contrat API & Delta Sync : [API_DELTA_SYNC_CONTRACT.md](file:///d:/Applications/Clairflux/docs/API_DELTA_SYNC_CONTRACT.md)
   - ADRs : [0001](file:///d:/Applications/Clairflux/docs/ADR/0001-drive-exclusive-sync-and-deduplication.md), [0002](file:///d:/Applications/Clairflux/docs/ADR/0002-neon-drizzle-ledger-and-checkpoints.md), [0003](file:///d:/Applications/Clairflux/docs/ADR/0003-capacitor-offline-first-delta-sync.md), [0004](file:///d:/Applications/Clairflux/docs/ADR/0004-ui-baseline-and-recharts-architecture.md)
 
-> **Règle d'Or Pré-Code (Porte bloquante)** : Aucun code applicatif (`src/`, `package.json`, composants React, routes API, migrations `.sql`, `Dockerfile`, configuration Capacitor) ne doit être écrit tant que les 4 livrables normatifs (`TECHNICAL_STANDARDS.md`, `ADR/0001..0004`, `DATA_MODEL_DRIZZLE_SPEC.md`, `API_DELTA_SYNC_CONTRACT.md`) et la validation visuelle Mock-First ne sont pas approuvés.
+> **Règle d'Or EGM (Porte bloquante)** : Toute nouvelle fonctionnalité structurelle ou modification de contrat exige d'abord le cadrage (`interview-me` / `prototype` si UI) et la mise à jour des livrables normatifs concernés (`TECHNICAL_STANDARDS.md`, `ADR/0001..0004`, `DATA_MODEL_DRIZZLE_SPEC.md`, `API_DELTA_SYNC_CONTRACT.md`) avant modification du code applicatif.
 
 ---
 
@@ -30,6 +30,7 @@ Toute déviation de cette stack exige un nouvel ADR validé avant introduction d
 | **Base de données** | PostgreSQL Serverless **Neon** | PostgreSQL 16+ (Neon) | `sslmode=require` obligatoire, calculs comptables en centimes entiers (`bigint`) |
 | **ORM & Migrations** | Drizzle ORM + `@neondatabase/serverless` | **Drizzle ORM** + `drizzle-kit` | Requêtes paramétrées, transactions atomiques, migrations versionnées |
 | **Ingestion IA & Drive** | Google Drive API v3 + Google Gemini API | SDK officiel Gemini | Lecture seule exclusive sur les 2 dossiers Drive autorisés |
+| **Auth & Hachage** | `@noble/hashes` (Argon2id pur JS) + `node:crypto` | Node 22 Alpine | Vérification `CLAIRFLUX_ACCESS_SECRET_HASH` sans addon natif C++ (`--ignore-scripts`) |
 | **Tests** | Vitest (+ Testing Library) | **Vitest 3+** | Tests unitaires (100 % logique critique), intégration API/SQL, tests UI |
 | **Qualité statique** | ESLint (flat config) + Prettier | TypeScript-ESLint strict | Zéro warning toléré sur règles de typage et accessibilité (`jsx-a11y`) |
 | **Conteneurisation** | Docker + Docker Compose | Compose v2 | 3 services isolés : `web`, `api`, `sync-worker` (+ profil `dev` optionnel) |
@@ -66,13 +67,13 @@ clairflux/
 │   │   ├── src/
 │   │   │   ├── app/                     # Shell, routeur/onglets, gestionnaire réseau & bouton Retour Android
 │   │   │   ├── features/
+│   │   │   │   ├── apk/                 # Carte de statut & téléchargement APK (`GET /api/apk/status`, `/download`)
 │   │   │   │   ├── dashboard/           # Synthèse, KPIs, graphiques Recharts 6M & M-1/3M
-│   │   │   │   ├── ledger/              # Grand livre, filtres, tiroir <dialog> note/catégorie
-│   │   │   │   ├── rules/               # Onglet Règles de catégorisation & aperçu rétroactif
-│   │   │   │   └── sync/                # Onglet Synchro Drive manuelle (2 dossiers) & statuts PDF
-│   │   │   ├── offline/                 # Cache local lecture seule (IndexedDB/SQLite) & client delta pull
-│   │   │   ├── ui/                      # Primitives accessibles (<Dialog>, <Popover>, <Surface>, <Amount>)
+│   │   │   │   └── ledger/              # Grand livre, filtres, tiroir `<dialog>` note/catégorie, onglet Règles
+│   │   │   ├── offline/                 # Cache local (IndexedDB `clairflux_offline_v1`), outbox, delta sync & `apiUrl.ts`
+│   │   │   ├── ui/                      # Primitives accessibles (`<Dialog>`, `<Popover>`, `<Surface>`, `<Amount>`)
 │   │   │   └── workers/                 # Web Worker filtrage/tri/agrégats (> 500 opérations)
+│   │   ├── Dockerfile                   # Build Vite + Nginx unprivileged (port 8080, reverse-proxy `/api/` -> `api:3000`)
 │   │   └── capacitor.config.ts          # Pointe webDir: "dist" vers le projet natif racine android/
 │   ├── api/                             # Serveur HTTP Node 22 (Auth, lecture, écritures en ligne, delta pull)
 │   │   └── src/
@@ -88,12 +89,12 @@ clairflux/
 │           ├── pipeline/                # Checkpoints SQL, déduplication, appariement transferts/FX EUR↔USD
 │           └── fx/                      # Résolution & mise en cache taux historiques EUR/USD (`fx_rates`)
 ├── android/                             # Projet Android Capacitor + Gradle (synchronisé depuis apps/web/dist)
-├── docker/                              # Dockerfiles multi-stage non-root & conf Nginx/Caddy
-├── docker-compose.yml                   # Orchestration web + api + sync-worker
-└── package.json                         # Scripts racine CI (test, lint, build, typecheck)
+├── Dockerfile.apk-builder               # Build Gradle Android reproductible vers volume partagé `apk-artifacts`
+├── docker-compose.yml                   # Orchestration web + api + sync-worker + apk-builder
+└── package.json                         # Scripts racine CI (typecheck, test, lint, build, audit)
 ```
 
-> **Note d'alignement** : Les dossiers `apps/*`, `packages/*`, `android/`, `docker/` et `package.json` ci-dessus décrivent la **cible post-validation** et ne doivent **pas** être créés durant la phase Pré-Code.
+> **Note d'alignement** : La structure ci-dessus reflète le dépôt actif (`v1.0.0-rc1+`, commit `2a17d60`) ; les Dockerfiles de service résident dans `apps/web/Dockerfile`, `apps/api/Dockerfile`, `apps/sync-worker/Dockerfile` et `Dockerfile.apk-builder`.
 
 ---
 
@@ -217,17 +218,20 @@ Références normatives : [frontend-ui-engineering/SKILL.md](file:///d:/Applicat
    - Sur Android hors-ligne, 100 % des vues de consultation (graphiques, grand livre, notes existantes, règles, dernier état Drive) restent accessibles depuis le cache local.
    - Aucune file d'écriture hors-ligne : les contrôles de mutation (ajout/édition de note, règle, catégorie manuelle, renommage compte, bouton *« Synchroniser maintenant »*) passent à l'état désactivé avec mention explicite *« Connexion requise pour modifier »* et un bandeau discret non bloquant informe du mode hors-ligne.
 
-### 5.3 Graphiques Recharts & Mode Multi-Devises
+### 5.3 Graphiques Recharts, Bandeau Commun de Filtres & Mode Multi-Devises
 
-1. **Solde cumulé 6M (`CumulativeBalanceChart`)** :
-   - Courbe/aire des 6 derniers mois glissants, tooltip accessible clavier/tactile en `JetBrains Mono tabular-nums`.
-2. **Dépenses M-1 / Moyenne 3M (`ExpensesComparisonChart`)** :
-   - Barres comparatives par catégorie des dépenses du mois précédent (**M-1**) face à la **moyenne des 3 mois (3M)** avec écart chiffré (`+XX %` / `-XX %`).
+1. **Bandeau commun de filtres (`GlobalFilterBar`) sur *Synthèse* et *Transactions*** :
+   - Regroupe en une surface unique non-sticky sur mobile : le périmètre bancaire (`Tous les comptes`, `BoursoBank`, `Revolut`), le mode de devise (`EUR consolidé`, `USD seul`), le sélecteur de période (`1 semaine`, `1 mois` par défaut, `3 mois`, `6 mois`, `1 an`, `Tout`, `Personnalisé` début/fin) et un bouton manuel **« Synchroniser »** (`POST /api/sync/drive`, désactivé hors-ligne).
+   - **Granularité adaptative** : les deux graphiques Recharts s'adaptent automatiquement à la plage sélectionnée — affichage **jour par jour** lorsque la période couvre `<= 45` jours calendaires, et **mois par mois** au-delà (`> 45` jours).
+2. **Solde cumulé (`CumulativeBalanceChart`)** :
+   - Courbe/aire sur la période sélectionnée (par défaut 1 mois en vue journalière, ou 6M/mensuelle selon le filtre), tooltip accessible clavier/tactile en `JetBrains Mono tabular-nums`.
+3. **Dépenses (`ExpensesComparisonChart`)** :
+   - Comparaison des dépenses (mode `Sans comparaison`, `Mois/Période précédente`, `Moyenne 3 mois`) à la granularité de la période active.
    - Les opérations marquées `Transfert interne` (y compris les conversions Revolut `EUR ↔ USD`) sont **strictement exclues** des totaux de dépenses.
-3. **Modes de devise** :
+4. **Modes de devise** :
    - **Mode par défaut (`EUR consolidé`)** : toutes les opérations USD sont converties en `EUR (€)` via `amount_eur_cents` / `fx_rate_micro` figés à la date d'opération ; chaque ligne USD affiche son montant natif (`$`) et son équivalent discret (`≈ €`).
    - **Mode filtre (`Vue USD seul`)** : bascule les KPIs et les 2 graphiques Recharts en `$ USD` natif sans conversion EUR.
-4. **Accessibilité & Rendu Recharts** :
+5. **Accessibilité & Rendu Recharts** :
    - Conteneur avec hauteur explicite (`aspect-ratio` / `min-block-size`) pour éviter `CLS` et boucle `ResizeObserver` dans Android WebView.
    - Désactiver les animations Recharts sous préférence système : `isAnimationActive={!prefersReducedMotion}`.
 
@@ -267,9 +271,10 @@ Références normatives : [frontend-ui-engineering/SKILL.md](file:///d:/Applicat
 
 Tout PR/merge ou fin de lot `/swarm` exige le passage vert sans contournement (`--no-verify` interdit, zéro `@ts-ignore` / `eslint-disable` non justifié) des commandes racine :
 
-1. `npm run lint` (ESLint strict + accessibilité `jsx-a11y`, 0 erreur, 0 warning)
+1. `npm run typecheck` (et `npm run lint`, vérification TypeScript stricte sur les 4 workspaces)
 2. `npm test` (tous tests unitaires et d'intégration verts, 0 test skippé)
-3. `npm run build` (vérification `tsc --noEmit` strict + build Vite `apps/web` + build TypeScript `apps/api` et `apps/sync-worker`)
+3. `npm run build` (build Vite `apps/web`, zéro fuite de secret client)
+4. `npm run audit` (`scripts/run-audit-bot.mjs`, conformité EGM / Baseline / Mobbin / YAML PASS 100 %)
 
 ---
 
@@ -291,3 +296,6 @@ Tout PR/merge ou fin de lot `/swarm` exige le passage vert sans contournement (`
    - Requêtes Drizzle paramétrées uniquement (zéro concaténation SQL).
    - Traitement des libellés bruts PDF et notes personnalisées comme texte brut échappé par React (interdiction stricte de `dangerouslySetInnerHTML` ou injection HTML).
    - Aucun PDF bancaire brut n'est envoyé dans le payload `GET /api/sync/delta` ni stocké sur le terminal Android.
+5. **Routage Reverse-Proxy Nginx & Convention `VITE_API_BASE_URL`** :
+   - Dans `apps/web/Dockerfile`, le serveur Nginx (port `8080`) doit impérativement proxifier `location /api/` vers `http://api:3000` (sans slash final sur `proxy_pass`, afin de préserver le préfixe `/api/...`), transmettre `Host $http_host` et fixer `proxy_read_timeout 300s` / `proxy_send_timeout 300s` pour absorber les synchronisations Drive/Gemini.
+   - Côté client (`apps/web`), toute construction d'URL API (`useOfflineStore.ts`, `deltaSyncEngine.ts`, `ApkDownloadCard.tsx`) doit passer par `buildApiEndpointUrl` (`apps/web/src/offline/apiUrl.ts`) afin de valider le schéma (`http:`/`https:` ou chemin relatif sûr) et supprimer tout `/api` final éventuel sur `VITE_API_BASE_URL` (évitant la duplication `/api/api/...`).
