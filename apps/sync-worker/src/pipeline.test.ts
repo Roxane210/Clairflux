@@ -165,6 +165,28 @@ class InMemoryNeonCheckpointStore implements CheckpointStore {
     });
   }
 
+  public async reconcileOrphanedRuns(reason: string): Promise<number> {
+    let reconciled = 0;
+    for (const [id, run] of this.runs.entries()) {
+      if (run.status === 'running') {
+        this.runs.set(id, {
+          ...run,
+          status: 'failed',
+          errorSummary: reason,
+        });
+        reconciled += 1;
+      }
+    }
+    for (const cp of this.checkpointsById.values()) {
+      if (cp.status === 'extracting' || cp.status === 'committing') {
+        cp.status = 'failed';
+        cp.errorCode = null;
+        cp.errorMessage = reason;
+      }
+    }
+    return reconciled;
+  }
+
   public async getExactRate(
     rateDate: string,
     baseCurrency: Currency,
@@ -1419,7 +1441,7 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
       listFolderPdfFiles: vi.fn(async () => []),
       discoverAllAllowedPdfs: vi.fn(async () => {
         throw new DriveDownloadError(
-          'Google Drive API a répondu HTTP 401 lors du scan du dossier 1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus.',
+          'Google Drive API a répondu HTTP 401 lors du scan du dossier 1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h.',
           401,
         );
       }),
@@ -1544,5 +1566,115 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
         JSON.stringify({ installed: { client_id: 'cid', client_secret: 'csec' } }),
     });
     await expect(incompleteClientProvider()).rejects.toThrowError(DriveDownloadError);
+  });
+
+  it('associe physiquement BoursoBank à 1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h et Revolut à 1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus', () => {
+    expect(ALLOWED_DRIVE_FOLDERS.boursobank).toBe('1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h');
+    expect(ALLOWED_DRIVE_FOLDERS.revolut).toBe('1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus');
+  });
+
+  it('remonte le message détaillé du corps HTTP Gemini en cas d erreur API et tolère les blocs JSON markdown', async () => {
+    const errorClient = createHttpGeminiClient({
+      apiKey: 'secret-gemini-api-key',
+      fetchFn: async () =>
+        new Response(
+          JSON.stringify({
+            error: { code: 400, message: 'API key not valid. Please pass a valid API key.' },
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } },
+        ),
+    });
+
+    const errRes = await errorClient.generateStructuredStatement({
+      model: 'gemini-4-hydrogen',
+      prompt: 'test',
+      timeoutMs: 5000,
+    });
+    expect(errRes.ok).toBe(false);
+    if (!errRes.ok) {
+      expect(errRes.message).toContain('API key not valid');
+      expect(errRes.message).not.toContain('secret-gemini-api-key');
+    }
+
+    const markdownClient: GeminiModelClient = {
+      generateStructuredStatement: vi.fn(async () => ({
+        ok: true as const,
+        rawJsonText: [
+          '```json',
+          JSON.stringify({
+            statement_period_start: '2026-10-01',
+            statement_period_end: '2026-10-31',
+            accounts: [
+              {
+                detected_name: 'Revolut EUR',
+                external_ref_masked: 'REV-****1234',
+                account_type: 'multi_devises',
+                currency: 'EUR',
+                opening_balance_cents: 10000,
+                closing_balance_cents: 9000,
+              },
+            ],
+            transactions: [
+              {
+                account_ref_masked: 'REV-****1234',
+                currency: 'EUR',
+                booking_date: '2026-10-05',
+                value_date: '2026-10-05',
+                raw_label: 'CARREFOUR',
+                clean_label: 'Carrefour',
+                amount_cents: -1000,
+                statement_fx_rate_micro: null,
+              },
+            ],
+          }),
+          '```',
+        ].join('\n'),
+      })),
+    };
+
+    const extracted = await extractBatchWithFallback({
+      client: markdownClient,
+      bank: 'revolut',
+      fileName: 'account-statement.pdf',
+      inferredAccountType: 'multi_devises',
+      inferredCurrency: 'EUR',
+      batch: {
+        batchIndex: 0,
+        totalBatches: 1,
+        pageStart: 1,
+        pageEnd: 1,
+        text: '05/10/2026 CARREFOUR -10.00 EUR',
+        charCount: 31,
+      },
+    });
+    expect(extracted.extraction.transactions).toHaveLength(1);
+  });
+
+  it('reconcileOrphanedRuns débloque aussi les checkpoints bloqués en extracting / committing', async () => {
+    const store = new InMemoryNeonCheckpointStore();
+    const runId = '55555555-5555-4555-8555-555555555555';
+    await store.ensureRun(runId);
+
+    const cp = await store.upsertDriveFileAndLoadCheckpoint({
+      runId,
+      file: {
+        driveFileId: parseDriveFileId('1V1tPjIT2Fw6dSTXVfdg59hP4kMiaJUK8'),
+        driveFolderId: ALLOWED_DRIVE_FOLDERS.revolut,
+        bank: 'revolut',
+        fileName: 'account-statement_2021-01-01_2021-12-31_fr-fr_2a7eb1.pdf',
+        md5Checksum: 'cd73286388abe47eb280669dfbfc0568',
+        fileSizeBytes: 597266,
+        driveModifiedTime: new Date('2026-11-19T11:55:26.583Z'),
+      },
+    });
+    await store.markFileExtracting({ checkpointId: cp.checkpointId, runId });
+
+    const reconciled = await store.reconcileOrphanedRuns(
+      'Synchronisation interrompue (redémarrage du service sync-worker).',
+    );
+    expect(reconciled).toBe(1);
+    expect(store.runs.get(runId)?.status).toBe('failed');
+    expect(store.checkpointsById.get(cp.checkpointId)?.status).toBe('failed');
+    expect(store.checkpointsById.get(cp.checkpointId)?.errorMessage).toContain('redémarrage');
   });
 });

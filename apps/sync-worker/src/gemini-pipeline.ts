@@ -30,7 +30,7 @@ import {
   type RuleMatchMode,
   type SyncRunStatus,
 } from '@clairflux/shared';
-import { and, asc, desc, eq, isNull, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lte, sql } from 'drizzle-orm';
 import { drizzle as drizzleHttp, type NeonHttpDatabase } from 'drizzle-orm/neon-http';
 import { drizzle as drizzleServerless, type NeonDatabase } from 'drizzle-orm/neon-serverless';
 import {
@@ -76,7 +76,7 @@ export const GEMINI_FALLBACK_MODELS = [
 
 export type GeminiModelName = (typeof GEMINI_FALLBACK_MODELS)[number];
 
-const DEFAULT_GEMINI_TIMEOUT_MS = 45_000;
+const DEFAULT_GEMINI_TIMEOUT_MS = 90_000;
 const MS_PER_DAY = 86_400_000;
 const SAME_CURRENCY_TRANSFER_MAX_DAYS = 3;
 const REVOLUT_FX_TRANSFER_MAX_DAYS = 1;
@@ -329,6 +329,42 @@ const GeminiRestApiResponseSchema = z.object({
     .optional(),
 });
 
+const GeminiHttpErrorBodySchema = z.object({
+  error: z
+    .object({
+      message: z.string().optional(),
+      status: z.string().optional(),
+    })
+    .optional(),
+});
+
+async function extractGeminiHttpErrorDetail(response: Response): Promise<string> {
+  try {
+    const rawText = (await response.text()).trim();
+    if (rawText.length === 0) {
+      return '';
+    }
+    try {
+      const parsed = GeminiHttpErrorBodySchema.safeParse(JSON.parse(rawText));
+      const apiMsg = parsed.success ? parsed.data.error?.message?.trim() : undefined;
+      if (apiMsg !== undefined && apiMsg.length > 0) {
+        return apiMsg.slice(0, 240);
+      }
+    } catch {
+      // Not JSON; fall through to raw text snippet
+    }
+    return rawText.slice(0, 240);
+  } catch {
+    return '';
+  }
+}
+
+function stripMarkdownJsonFence(rawText: string): string {
+  const trimmed = rawText.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(trimmed);
+  return fenced?.[1] !== undefined ? fenced[1].trim() : trimmed;
+}
+
 export function createHttpGeminiClient(options: {
   readonly apiKey: string;
   readonly fetchFn?: FetchLike | undefined;
@@ -394,10 +430,12 @@ export function createHttpGeminiClient(options: {
       }
 
       if (!response.ok) {
+        const detail = await extractGeminiHttpErrorDetail(response);
+        const suffix = detail.length > 0 ? ` — ${detail}` : '';
         return {
           ok: false,
           errorCode: 'GEMINI_SCHEMA_INVALID',
-          message: `Erreur HTTP Gemini ${response.status} sur ${request.model}.`,
+          message: `Erreur HTTP Gemini ${response.status} sur ${request.model}${suffix}.`,
         };
       }
 
@@ -496,6 +534,9 @@ export async function extractBatchWithFallback(input: {
     });
 
     if (!response.ok) {
+      console.warn(
+        `[sync-worker] Gemini ${model} lot ${input.batch.batchIndex + 1}/${input.batch.totalBatches} (${input.fileName}) en échec: ${response.errorCode} — ${response.message}`,
+      );
       attempts.push({
         model,
         errorCode: response.errorCode,
@@ -506,8 +547,11 @@ export async function extractBatchWithFallback(input: {
 
     let parsedJson: unknown;
     try {
-      parsedJson = JSON.parse(response.rawJsonText);
+      parsedJson = JSON.parse(stripMarkdownJsonFence(response.rawJsonText));
     } catch {
+      console.warn(
+        `[sync-worker] Gemini ${model} lot ${input.batch.batchIndex + 1}/${input.batch.totalBatches} (${input.fileName}): JSON invalide`,
+      );
       attempts.push({
         model,
         errorCode: 'GEMINI_SCHEMA_INVALID',
@@ -1494,17 +1538,29 @@ export class NeonCheckpointStore implements CheckpointStore {
   }
 
   public async reconcileOrphanedRuns(reason: string): Promise<number> {
-    const updated = await this.httpDb
+    const now = new Date();
+    const updatedRuns = await this.httpDb
       .update(driveSyncRunsTable)
       .set({
         status: 'failed',
-        finishedAt: new Date(),
+        finishedAt: now,
         errorSummary: reason,
         revision: sql`nextval('sync_revision_seq')`,
       })
       .where(eq(driveSyncRunsTable.status, 'running'))
       .returning({ id: driveSyncRunsTable.id });
-    return updated.length;
+
+    await this.httpDb
+      .update(pdfIngestionCheckpointsTable)
+      .set({
+        status: 'failed',
+        errorCode: null,
+        errorMessage: reason,
+        updatedAt: now,
+      })
+      .where(inArray(pdfIngestionCheckpointsTable.status, ['extracting', 'committing']));
+
+    return updatedRuns.length;
   }
 
   public async getExactRate(
@@ -2156,6 +2212,7 @@ export async function runIngestionPipeline(
   const fileResults: SyncRunFileResult[] = [];
 
   try {
+    console.info(`[sync-worker] Démarrage découverte Google Drive (run=${runId}).`);
     const discovered = await deps.driveClient.discoverAllAllowedPdfs();
 
     const filesToProcess =
@@ -2163,6 +2220,9 @@ export async function runIngestionPipeline(
         ? discovered.filter((f) => f.driveFileId === options.targetDriveFileId)
         : discovered;
     totalFilesDiscovered = filesToProcess.length;
+    console.info(
+      `[sync-worker] Run ${runId}: ${totalFilesDiscovered} PDF(s) à traiter sur les 2 dossiers autorisés.`,
+    );
 
     for (const file of filesToProcess) {
       assertAllowedDriveFolderId(file.driveFolderId);
@@ -2179,6 +2239,7 @@ export async function runIngestionPipeline(
           runId,
         });
         filesSkippedUnchanged += 1;
+        console.info(`[sync-worker] Fichier inchangé ignoré: [${file.bank}] ${file.fileName}`);
         fileResults.push({
           driveFileId: file.driveFileId,
           fileName: file.fileName,
@@ -2196,6 +2257,9 @@ export async function runIngestionPipeline(
 
         // Exact resume from already-parsed statement (e.g., DB failure during Phase 2 commit)
         if (checkpoint.parsedPayload?.kind === 'complete_statement') {
+          console.info(
+            `[sync-worker] Reprise SQL directe (déjà parsé): [${file.bank}] ${file.fileName}`,
+          );
           statementToCommit = checkpoint.parsedPayload.statement;
         } else {
           await deps.checkpointStore.markFileExtracting({
@@ -2203,6 +2267,9 @@ export async function runIngestionPipeline(
             runId,
           });
 
+          console.info(
+            `[sync-worker] Téléchargement PDF: [${file.bank}] ${file.fileName} (${file.fileSizeBytes} o)...`,
+          );
           const pdfBytes = await deps.driveClient.downloadPdfFile({
             driveFileId: file.driveFileId,
             driveFolderId: file.driveFolderId,
@@ -2213,6 +2280,9 @@ export async function runIngestionPipeline(
             pdfBytes,
             extractPdfPages: deps.extractPdfPages,
           });
+          console.info(
+            `[sync-worker] PDF extrait (${file.fileName}): ${prepared.totalPages} page(s), ${prepared.batches.length} lot(s).`,
+          );
 
           const existingCompletedBatches =
             checkpoint.parsedPayload?.kind === 'partial_batches' &&
@@ -2230,6 +2300,9 @@ export async function runIngestionPipeline(
               continue;
             }
 
+            console.info(
+              `[sync-worker] Extraction Gemini lot ${batch.batchIndex + 1}/${prepared.batches.length} (${file.fileName}, pages ${batch.pageStart}-${batch.pageEnd})...`,
+            );
             const batchExtraction = await extractBatchWithFallback({
               client: deps.geminiClient,
               bank: file.bank,
@@ -2239,6 +2312,9 @@ export async function runIngestionPipeline(
               batch,
               timeoutMs: deps.geminiTimeoutMs,
             });
+            console.info(
+              `[sync-worker] Lot ${batch.batchIndex + 1}/${prepared.batches.length} extrait via ${batchExtraction.modelUsed} (${batchExtraction.extraction.transactions.length} op.).`,
+            );
 
             const batchRecord: CheckpointBatchRecord = {
               batchIndex: batch.batchIndex,
@@ -2281,6 +2357,9 @@ export async function runIngestionPipeline(
         });
 
         filesCommitted += 1;
+        console.info(
+          `[sync-worker] Fichier importé (${file.fileName}): ${commitOutcome.insertedTxCount} ajoutée(s), ${commitOutcome.dedupSkippedTxCount} doublon(s) ignoré(s).`,
+        );
         fileResults.push({
           driveFileId: file.driveFileId,
           fileName: file.fileName,
@@ -2292,6 +2371,9 @@ export async function runIngestionPipeline(
         });
       } catch (err) {
         const mapped = mapUnknownToCheckpointError(err);
+        console.error(
+          `[sync-worker] Échec fichier ${file.fileName} (${mapped.code}): ${mapped.message}`,
+        );
         await deps.checkpointStore.markFileFailed({
           checkpointId: checkpoint.checkpointId,
           runId,
@@ -2334,6 +2416,9 @@ export async function runIngestionPipeline(
       filesFailed,
       errorSummary,
     });
+    console.info(
+      `[sync-worker] Run ${runId} terminé (${runStatus}): ${filesCommitted} importé(s), ${filesSkippedUnchanged} inchangé(s), ${filesFailed} en échec.`,
+    );
 
     return {
       runId,
@@ -2347,6 +2432,7 @@ export async function runIngestionPipeline(
   } catch (err) {
     const rawMessage = err instanceof Error ? err.message : String(err);
     const errorSummary = rawMessage.trim().slice(0, 500) || 'Erreur interne lors de la synchronisation Drive/Gemini.';
+    console.error(`[sync-worker] Run ${runId} en échec global: ${errorSummary}`);
     try {
       await deps.checkpointStore.finalizeRun({
         runId,
@@ -2622,6 +2708,12 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
 
   const startupReconcilePromise = store
     .reconcileOrphanedRuns('Synchronisation interrompue (redémarrage du service sync-worker).')
+    .then((count) => {
+      console.info(
+        `[sync-worker] Prêt sur le port ${env.PORT} (${count} run(s) orphelin(s) réconcilié(s)).`,
+      );
+      return count;
+    })
     .catch((err: unknown) => {
       console.error('[sync-worker] Échec réconciliation des runs orphelins au démarrage:', err);
       return 0;

@@ -22,7 +22,7 @@ import { z } from 'zod';
 const GOOGLE_DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
 const DEFAULT_DRIVE_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_PAGES_PER_BATCH = 4;
-const DEFAULT_MAX_CHARS_PER_BATCH = 16_000;
+const DEFAULT_MAX_CHARS_PER_BATCH = 8_000;
 const MAX_DRIVE_PAGES = 50;
 
 export const ALLOWED_DRIVE_FOLDER_ENTRIES: ReadonlyArray<{
@@ -713,6 +713,7 @@ export async function extractPdfPagesWithPdfjs(
     const loadingTask = pdfjs.getDocument({
       data: pdfBytes,
       useSystemFonts: true,
+      disableFontFace: true,
       isEvalSupported: false,
       verbosity: 0,
     });
