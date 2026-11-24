@@ -27,7 +27,10 @@ import {
   type SyncDeltaRepository,
   type TriggerDriveSyncResult,
 } from './app.js';
+import { hashAccessSecretArgon2id } from './auth/password.js';
+import { createLoginRateLimiter } from './auth/rate-limit.js';
 import { EnvValidationError, parseApiEnv } from './config/env.js';
+import { createInMemorySessionRepository } from './server.js';
 
 const TEST_SESSION_SECRET = 'clairflux-test-session-secret-minimum-32-chars';
 const FIXED_NOW = new Date('2026-11-21T14:00:00.000Z');
@@ -562,6 +565,200 @@ describe('ClairFlux API (@clairflux/api)', () => {
           NODE_ENV: 'production',
         }),
       ).toThrow(EnvValidationError);
+    });
+  });
+
+  describe('Flux complet /api/auth/login, session, logout & non-régression HTTP 401', () => {
+    it('authentifie Web (cookie sans Secure en HTTP LAN) puis débloque /api/apk/status et /api/sync/drive', async () => {
+      const secretHash = hashAccessSecretArgon2id('secret-clairflux-nas', {
+        m: 4096,
+        t: 2,
+        p: 1,
+      });
+      const base = createTestDeps();
+      const sessionRepo = createInMemorySessionRepository();
+
+      const app = createApp({
+        ...base,
+        allowedWebOrigin: 'http://192.168.1.118:8080/',
+        accessSecretHash: secretHash,
+        sessionRepository: sessionRepo,
+        getLatestRevision: async () => toSyncRevision(42),
+      });
+
+      // 1. Login Web sur LAN HTTP
+      const loginRes = await app.request('/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'http://192.168.1.118:8080',
+          'X-Forwarded-Proto': 'http',
+          'X-Clairflux-Client': 'web',
+        },
+        body: JSON.stringify({
+          secret: 'secret-clairflux-nas',
+          client_kind: 'web',
+        }),
+      });
+      expect(loginRes.status).toBe(200);
+      expect(await loginRes.json()).toMatchObject({
+        authenticated: true,
+        client_kind: 'web',
+      });
+
+      const setCookieHeader = loginRes.headers.get('Set-Cookie') ?? '';
+      expect(setCookieHeader).toContain('clairflux_session=cfx_v1.');
+      expect(setCookieHeader).toContain('HttpOnly');
+      expect(setCookieHeader).toContain('Path=/api');
+      expect(setCookieHeader).not.toContain('; Secure');
+
+      const cookiePair = setCookieHeader.split(';')[0] ?? '';
+      expect(cookiePair.startsWith('clairflux_session=')).toBe(true);
+
+      // 2. GET /api/auth/session avec le cookie
+      const sessionRes = await app.request('/api/auth/session', {
+        headers: { Cookie: cookiePair },
+      });
+      expect(sessionRes.status).toBe(200);
+      expect(await sessionRes.json()).toMatchObject({
+        authenticated: true,
+        client_kind: 'web',
+        latest_revision: 42,
+      });
+
+      // 3. GET /api/apk/status et POST /api/sync/drive avec le cookie (plus de 401 !)
+      const apkRes = await app.request('/api/apk/status', {
+        headers: { Cookie: cookiePair },
+      });
+      expect(apkRes.status).toBe(200);
+
+      const driveRes = await app.request('/api/sync/drive', {
+        method: 'POST',
+        headers: {
+          Cookie: cookiePair,
+          Origin: 'http://192.168.1.118:8080',
+          'X-Clairflux-Client': 'web',
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      });
+      expect(driveRes.status).toBe(202);
+
+      // 4. Logout révoque la session
+      const logoutRes = await app.request('/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          Cookie: cookiePair,
+          Origin: 'http://192.168.1.118:8080',
+          'X-Clairflux-Client': 'web',
+        },
+        body: '{}',
+      });
+      expect(logoutRes.status).toBe(200);
+
+      const afterLogoutRes = await app.request('/api/apk/status', {
+        headers: { Cookie: cookiePair },
+      });
+      expect(afterLogoutRes.status).toBe(401);
+    });
+
+    it('retourne Bearer token pour Android, active Secure sur HTTPS, et bloque brute-force 429', async () => {
+      const secretHash = hashAccessSecretArgon2id('secret-android', {
+        m: 4096,
+        t: 2,
+        p: 1,
+      });
+      let nowMs = FIXED_NOW.getTime();
+      const base = createTestDeps();
+      const sessionRepo = createInMemorySessionRepository();
+
+      const app = createApp({
+        ...base,
+        allowedWebOrigin: 'https://clairflux.example.com',
+        accessSecretHash: secretHash,
+        sessionRepository: sessionRepo,
+        loginRateLimiter: createLoginRateLimiter({
+          maxAttempts: 5,
+          windowMs: 15 * 60_000,
+          now: () => nowMs,
+        }),
+        now: () => new Date(nowMs),
+      });
+
+      // HTTPS Web cookie gets Secure attribute
+      const httpsWebLogin = await app.request('/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-Proto': 'https',
+        },
+        body: JSON.stringify({ secret: 'secret-android', client_kind: 'web' }),
+      });
+      expect(httpsWebLogin.status).toBe(200);
+      expect(httpsWebLogin.headers.get('Set-Cookie')).toContain('Secure');
+
+      // Android login returns Bearer token
+      const androidLogin = await app.request('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret: 'secret-android', client_kind: 'android' }),
+      });
+      expect(androidLogin.status).toBe(200);
+      const androidBody = (await androidLogin.json()) as {
+        readonly access_token: string;
+        readonly token_type: string;
+      };
+      expect(androidBody.token_type).toBe('Bearer');
+
+      const apkRes = await app.request('/api/apk/status', {
+        headers: { Authorization: `Bearer ${androidBody.access_token}` },
+      });
+      expect(apkRes.status).toBe(200);
+
+      // revoke_all invalidates issued token
+      nowMs += 1000;
+      const revokeAllRes = await app.request('/api/auth/logout', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${androidBody.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ revoke_all: true }),
+      });
+      expect(revokeAllRes.status).toBe(200);
+
+      const postRevokeRes = await app.request('/api/apk/status', {
+        headers: { Authorization: `Bearer ${androidBody.access_token}` },
+      });
+      expect(postRevokeRes.status).toBe(401);
+
+      // 5 failed logins trigger 429 RATE_LIMITED with Retry-After
+      for (let i = 0; i < 5; i += 1) {
+        const failRes = await app.request('/api/auth/login', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Forwarded-For': '192.168.1.50',
+          },
+          body: JSON.stringify({ secret: 'wrong-secret', client_kind: 'web' }),
+        });
+        expect(failRes.status).toBe(401);
+        const errBody = ApiErrorEnvelopeSchema.parse(await failRes.json());
+        expect(errBody.error.code).toBe('INVALID_CREDENTIALS');
+      }
+
+      const blockedRes = await app.request('/api/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Forwarded-For': '192.168.1.50',
+        },
+        body: JSON.stringify({ secret: 'secret-android', client_kind: 'web' }),
+      });
+      expect(blockedRes.status).toBe(429);
+      expect(blockedRes.headers.get('Retry-After')).toBeTruthy();
+      const blockedBody = ApiErrorEnvelopeSchema.parse(await blockedRes.json());
+      expect(blockedBody.error.code).toBe('RATE_LIMITED');
     });
   });
 });

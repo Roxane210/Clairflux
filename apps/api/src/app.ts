@@ -2,6 +2,14 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { getCookie } from 'hono/cookie';
+import { cors } from 'hono/cors';
+import type { SyncRevision } from '@clairflux/shared';
+import type { LoginRateLimiter } from './auth/rate-limit.js';
+import {
+  SESSION_COOKIE_NAME,
+  normalizeOrigin,
+  registerAuthRoutes,
+} from './routes/auth-routes.js';
 import {
   AccountsQuerySchema,
   ClientKindSchema,
@@ -204,6 +212,9 @@ export function verifySessionToken(
 export interface AppDependencies {
   readonly sessionSecret: string;
   readonly allowedWebOrigin?: string | undefined;
+  readonly accessSecretHash?: string | undefined;
+  readonly getLatestRevision?: (() => Promise<SyncRevision>) | undefined;
+  readonly loginRateLimiter?: LoginRateLimiter | undefined;
   readonly now?: (() => Date) | undefined;
   readonly healthRepository: HealthRepository;
   readonly sessionRepository?: SessionRepository | undefined;
@@ -242,12 +253,27 @@ function extractCredential(c: Context<AppEnv>): ExtractedCredential {
     return { kind: 'token', token, transport: 'bearer' };
   }
 
-  const cookieToken = getCookie(c, 'clairflux_session');
+  const cookieToken = getCookie(c, SESSION_COOKIE_NAME);
   if (cookieToken !== undefined && cookieToken.trim().length > 0) {
     return { kind: 'token', token: cookieToken.trim(), transport: 'cookie' };
   }
 
   return { kind: 'none' };
+}
+
+function buildAllowedCorsOrigins(allowedWebOrigin: string | undefined): ReadonlySet<string> {
+  const origins = new Set<string>(['capacitor://localhost', 'https://localhost']);
+  const normalizedWebOrigin = normalizeOrigin(allowedWebOrigin);
+  if (normalizedWebOrigin !== undefined) {
+    origins.add(normalizedWebOrigin);
+  }
+  if (process.env['NODE_ENV'] !== 'production') {
+    origins.add('http://localhost');
+    origins.add('http://localhost:5173');
+    origins.add('http://127.0.0.1:5173');
+    origins.add('http://localhost:8080');
+  }
+  return origins;
 }
 
 export function createApp(deps: AppDependencies): Hono<AppEnv> {
@@ -284,9 +310,31 @@ export function createApp(deps: AppDependencies): Hono<AppEnv> {
   app.get('/readyz', handleReadyz);
   app.get('/api/readyz', handleReadyz);
 
-  // Personal single-user authentication middleware for all /api/* routes (except public probes)
+  const allowedCorsOrigins = buildAllowedCorsOrigins(deps.allowedWebOrigin);
+  app.use(
+    '/api/*',
+    cors({
+      origin: (origin) => (allowedCorsOrigins.has(origin) ? origin : null),
+      credentials: true,
+      allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Clairflux-Client',
+        'X-Request-Id',
+        'X-Client-Platform',
+        'X-Client-Version',
+      ],
+    }),
+  );
+
+  // Personal single-user authentication middleware for all /api/* routes (except public probes and login)
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/healthz' || c.req.path === '/api/readyz') {
+    if (
+      c.req.path === '/api/healthz' ||
+      c.req.path === '/api/readyz' ||
+      (c.req.path === '/api/auth/login' && c.req.method === 'POST')
+    ) {
       await next();
       return;
     }
@@ -319,6 +367,7 @@ export function createApp(deps: AppDependencies): Hono<AppEnv> {
     if (deps.sessionRepository !== undefined) {
       const revoked = await deps.sessionRepository.isSessionRevoked(
         verification.payload.jti,
+        verification.payload.iat,
       );
       if (revoked) {
         return errorResponse(
@@ -334,12 +383,11 @@ export function createApp(deps: AppDependencies): Hono<AppEnv> {
       credential.transport === 'cookie' &&
       MUTATING_METHODS.has(c.req.method)
     ) {
-      const origin = c.req.header('Origin');
+      const origin = normalizeOrigin(c.req.header('Origin'));
       const clientHeader = c.req.header('X-Clairflux-Client');
-      const allowedOrigin = deps.allowedWebOrigin;
+      const allowedOrigin = normalizeOrigin(deps.allowedWebOrigin);
       if (
         allowedOrigin === undefined ||
-        allowedOrigin.trim().length === 0 ||
         clientHeader !== 'web' ||
         origin !== allowedOrigin
       ) {
@@ -359,6 +407,21 @@ export function createApp(deps: AppDependencies): Hono<AppEnv> {
 
     await next();
   });
+
+  // Register authentication routes (/api/auth/login, /api/auth/session, /api/auth/logout)
+  registerAuthRoutes(
+    app,
+    {
+      sessionSecret: deps.sessionSecret,
+      allowedWebOrigin: deps.allowedWebOrigin,
+      accessSecretHash: deps.accessSecretHash,
+      sessionRepository: deps.sessionRepository,
+      getLatestRevision: deps.getLatestRevision,
+      loginRateLimiter: deps.loginRateLimiter,
+      signToken: signSessionToken,
+    },
+    getNow,
+  );
 
   // Register all validated business & delta sync routes
   registerDomainRoutes(app, deps, getNow);

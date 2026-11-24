@@ -50,6 +50,22 @@ import { isEligibleForRuleRecalc, normalizeLabel } from '../db/dedup.js';
 export const ClientKindSchema = z.enum(['web', 'android']);
 export type ClientKind = z.infer<typeof ClientKindSchema>;
 
+export const LoginBodySchema = z
+  .object({
+    secret: z.string().min(1, 'Le secret personnel est requis.').max(256),
+    client_kind: ClientKindSchema.default('web'),
+    device_label: z.string().trim().min(1).max(64).optional(),
+  })
+  .strict();
+export type LoginBody = z.infer<typeof LoginBodySchema>;
+
+export const LogoutBodySchema = z
+  .object({
+    revoke_all: z.boolean().default(false),
+  })
+  .strict();
+export type LogoutBody = z.infer<typeof LogoutBodySchema>;
+
 export const SessionTokenPayloadSchema = z.object({
   jti: z.string().uuid(),
   client_kind: ClientKindSchema,
@@ -193,7 +209,9 @@ export interface HealthRepository {
 }
 
 export interface SessionRepository {
-  isSessionRevoked(jti: string): Promise<boolean>;
+  isSessionRevoked(jti: string, iat?: number): Promise<boolean>;
+  revokeSession?(jti: string): Promise<void>;
+  revokeAllSessions?(revokedBeforeEpochSeconds: number): Promise<void>;
 }
 
 export interface AccountsFilter {

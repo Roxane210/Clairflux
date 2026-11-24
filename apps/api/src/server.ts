@@ -74,6 +74,7 @@ import {
   type RuleEvalRule,
   type RuleEvalTransaction,
   type RuleView,
+  type SessionRepository,
   type TransactionDetail,
   type TransactionPatchInput,
 } from './routes/contracts.js';
@@ -390,6 +391,36 @@ class ConcurrentMutationConflictError extends Error {
     super('Concurrent client_mutation_id conflict');
     this.name = 'ConcurrentMutationConflictError';
   }
+}
+
+export function createInMemorySessionRepository(): SessionRepository {
+  const revokedJtis = new Set<string>();
+  let revokedBeforeEpochSeconds: number | null = null;
+
+  return {
+    async isSessionRevoked(jti: string, iat?: number): Promise<boolean> {
+      if (revokedJtis.has(jti)) {
+        return true;
+      }
+      if (
+        revokedBeforeEpochSeconds !== null &&
+        iat !== undefined &&
+        iat <= revokedBeforeEpochSeconds
+      ) {
+        return true;
+      }
+      return false;
+    },
+    async revokeSession(jti: string): Promise<void> {
+      revokedJtis.add(jti);
+    },
+    async revokeAllSessions(beforeEpochSeconds: number): Promise<void> {
+      revokedBeforeEpochSeconds =
+        revokedBeforeEpochSeconds === null
+          ? beforeEpochSeconds
+          : Math.max(revokedBeforeEpochSeconds, beforeEpochSeconds);
+    },
+  };
 }
 
 export function createNeonAppDependencies(
@@ -1244,33 +1275,37 @@ export function createNeonAppDependencies(
 
   const syncDeltaRepository: AppDependencies['syncDeltaRepository'] = {
     async getDelta(query): Promise<DeltaSyncResponse> {
-      const sinceDate =
-        query.since_timestamp !== undefined ? new Date(query.since_timestamp) : null;
       const latestRevision = await fetchLatestSyncRevision(clients);
+      const fullResyncRequired = query.since > latestRevision;
+      const effectiveSince = fullResyncRequired ? 0 : query.since;
+      const sinceDate =
+        !fullResyncRequired && query.since_timestamp !== undefined
+          ? new Date(query.since_timestamp)
+          : null;
       const usdRateMicro = await fetchLatestUsdToEurMicro(clients);
 
       const accountFilter =
         sinceDate !== null
-          ? or(gt(accounts.revision, query.since), gt(accounts.updatedAt, sinceDate))
-          : gt(accounts.revision, query.since);
+          ? or(gt(accounts.revision, effectiveSince), gt(accounts.updatedAt, sinceDate))
+          : gt(accounts.revision, effectiveSince);
 
       const txFilter =
         sinceDate !== null
-          ? or(gt(transactions.revision, query.since), gt(transactions.updatedAt, sinceDate))
-          : gt(transactions.revision, query.since);
+          ? or(gt(transactions.revision, effectiveSince), gt(transactions.updatedAt, sinceDate))
+          : gt(transactions.revision, effectiveSince);
 
       const noteFilter =
         sinceDate !== null
-          ? or(gt(transactionNotes.revision, query.since), gt(transactionNotes.updatedAt, sinceDate))
-          : gt(transactionNotes.revision, query.since);
+          ? or(gt(transactionNotes.revision, effectiveSince), gt(transactionNotes.updatedAt, sinceDate))
+          : gt(transactionNotes.revision, effectiveSince);
 
       const ruleFilter =
         sinceDate !== null
           ? or(
-              gt(categorizationRules.revision, query.since),
+              gt(categorizationRules.revision, effectiveSince),
               gt(categorizationRules.updatedAt, sinceDate),
             )
-          : gt(categorizationRules.revision, query.since);
+          : gt(categorizationRules.revision, effectiveSince);
 
       const [accRows, txRows, noteRows, ruleRows, latestRunRows, fileRows] = await Promise.all([
         clients.httpDb.select().from(accounts).where(accountFilter),
@@ -1295,7 +1330,7 @@ export function createNeonAppDependencies(
             pdfIngestionCheckpoints,
             eq(pdfIngestionCheckpoints.driveFileRecordId, driveFiles.id),
           )
-          .where(gt(driveFiles.revision, query.since)),
+          .where(gt(driveFiles.revision, effectiveSince)),
       ]);
 
       const hasMore = txRows.length > query.limit;
@@ -1313,7 +1348,7 @@ export function createNeonAppDependencies(
 
       const upsertedTxs: DeltaSyncResponse['transactions']['upserted'] = [];
       const deletedTxIds: TransactionId[] = [];
-      let maxPageRev: number = query.since;
+      let maxPageRev: number = effectiveSince;
 
       for (const { tx, account } of pageTxRows) {
         maxPageRev = Math.max(maxPageRev, tx.revision);
@@ -1423,7 +1458,7 @@ export function createNeonAppDependencies(
         batch_end_revision: batchEndRevision,
         latest_revision: latestRevision,
         has_more: hasMore,
-        full_resync_required: false,
+        full_resync_required: fullResyncRequired,
         server_time: new Date().toISOString(),
         accounts: { upserted: upsertedAccounts, deleted_ids: deletedAccountIds },
         transactions: { upserted: upsertedTxs, deleted_ids: deletedTxIds },
@@ -1657,6 +1692,9 @@ export function createNeonAppDependencies(
   return {
     sessionSecret: env.CLAIRFLUX_SESSION_SECRET,
     allowedWebOrigin: env.CLAIRFLUX_WEB_ORIGIN,
+    accessSecretHash: env.CLAIRFLUX_ACCESS_SECRET_HASH,
+    sessionRepository: createInMemorySessionRepository(),
+    getLatestRevision: () => fetchLatestSyncRevision(clients),
     healthRepository,
     accountsRepository,
     syncDeltaRepository,
