@@ -74,6 +74,9 @@ export function createNeonClients(databaseUrl: string): NeonClients {
   const httpDb = drizzleHttp(sqlClient, { schema });
 
   const pool = new Pool({ connectionString: validatedUrl });
+  pool.on('error', (err: unknown) => {
+    console.error('[api] Erreur Neon Pool (non bloquante):', err);
+  });
   const poolDb = drizzleServerless(pool, { schema });
 
   return {

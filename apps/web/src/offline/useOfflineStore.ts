@@ -347,12 +347,17 @@ export function createOfflineController(
     }
 
     await persistSnapshot(pullOutcome.dataset);
+    const failedRunMessage =
+      pullOutcome.lastRun?.status === 'failed' && pullOutcome.lastRun.error_summary
+        ? `Échec synchronisation Drive : ${pullOutcome.lastRun.error_summary}`
+        : null;
     emit({
       dataset: pullOutcome.dataset,
       syncMessage:
-        pullOutcome.dataset.revision > 0
+        failedRunMessage ??
+        (pullOutcome.dataset.revision > 0
           ? `Données synchronisées (révision #${pullOutcome.dataset.revision}).`
-          : null,
+          : null),
     });
   };
 
