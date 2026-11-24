@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import {
   ALLOWED_DRIVE_FOLDERS,
   EUR_FX_RATE_MICRO,
@@ -15,14 +15,17 @@ import {
 } from '@clairflux/shared';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  DriveDownloadError,
   InvalidDriveFolderScopeError,
   assertAllowedDriveFolderId,
+  createDriveAccessTokenProvider,
   createGoogleDriveClient,
   extractPdfPagesWithPdfjs,
   inferAccountMetadata,
   splitPagesIntoBatches,
   stripBankingBoilerplate,
   type DiscoveredDrivePdf,
+  type GoogleDriveClient,
   type PdfPageText,
 } from './drive-pdf.js';
 import {
@@ -1405,5 +1408,141 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
       body: JSON.stringify({}),
     });
     expect(conflictRes.status).toBe(409);
+  });
+
+  it('finalise le run en statut failed quand discoverAllAllowedPdfs échoue (évite le verrou HTTP 409 permanent)', async () => {
+    const store = new InMemoryNeonCheckpointStore();
+    const fxRateService = createFxRateService({ store });
+    const runId = '33333333-3333-4333-8333-333333333333';
+
+    const failingDriveClient: GoogleDriveClient = {
+      listFolderPdfFiles: vi.fn(async () => []),
+      discoverAllAllowedPdfs: vi.fn(async () => {
+        throw new DriveDownloadError(
+          'Google Drive API a répondu HTTP 401 lors du scan du dossier 1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus.',
+          401,
+        );
+      }),
+      downloadPdfFile: vi.fn(async () => new Uint8Array()),
+    };
+
+    const geminiClient: GeminiModelClient = {
+      generateStructuredStatement: vi.fn(async () => ({
+        ok: true as const,
+        rawJsonText: '{}',
+      })),
+    };
+
+    const result = await runIngestionPipeline(
+      {
+        driveClient: failingDriveClient,
+        geminiClient,
+        checkpointStore: store,
+        fxRateService,
+      },
+      { runId },
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.totalFilesDiscovered).toBe(0);
+    const storedRun = store.runs.get(runId);
+    expect(storedRun?.status).toBe('failed');
+    expect(storedRun?.errorSummary).toContain('HTTP 401');
+  });
+
+  it('expose GET /internal/runs/active protégé par token et valide WorkerEnvSchema avec GOOGLE_DRIVE_CREDENTIALS_PATH', async () => {
+    const app = createWorkerApp({
+      internalWorkerToken: VALID_WORKER_TOKEN,
+      getActiveRunId: () => '44444444-4444-4444-8444-444444444444',
+      triggerSync: vi.fn(async () => ({
+        ok: true as const,
+        runId: '44444444-4444-4444-8444-444444444444',
+        acceptedAt: '2026-11-24T10:00:00.000Z',
+      })),
+    });
+
+    const unauthActive = await app.request('/internal/runs/active');
+    expect(unauthActive.status).toBe(401);
+
+    const authActive = await app.request('/internal/runs/active', {
+      headers: { 'X-Internal-Worker-Token': VALID_WORKER_TOKEN },
+    });
+    expect(authActive.status).toBe(200);
+    expect(await authActive.json()).toEqual({
+      active_run_id: '44444444-4444-4444-8444-444444444444',
+    });
+
+    const envFromCredsPath = parseWorkerEnv({
+      DATABASE_URL: 'postgresql://user:pass@ep.neon.tech/clairflux?sslmode=require',
+      GEMINI_API_KEY: 'gem-key',
+      GOOGLE_DRIVE_CREDENTIALS_PATH: '/run/secrets/google_drive_credentials.json',
+      INTERNAL_WORKER_TOKEN: VALID_WORKER_TOKEN,
+    });
+    expect(envFromCredsPath.GOOGLE_DRIVE_CREDENTIALS_PATH).toBe(
+      '/run/secrets/google_drive_credentials.json',
+    );
+
+    expect(() =>
+      parseWorkerEnv({
+        DATABASE_URL: 'postgresql://user:pass@ep.neon.tech/clairflux?sslmode=require',
+        GEMINI_API_KEY: 'gem-key',
+        INTERNAL_WORKER_TOKEN: VALID_WORKER_TOKEN,
+      }),
+    ).toThrowError(WorkerEnvValidationError);
+  });
+
+  it('génère et met en cache les jetons Google Drive depuis un Service Account JSON ou OAuth2 refresh_token', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+
+    let tokenCalls = 0;
+    const saProvider = createDriveAccessTokenProvider({
+      credentialsPath: '/run/secrets/google_drive_credentials.json',
+      staticAccessToken: 'CHANGE_ME_PLACEHOLDER',
+      readCredentialsFile: async () =>
+        JSON.stringify({
+          type: 'service_account',
+          client_email: 'clairflux@example.iam.gserviceaccount.com',
+          private_key: privateKeyPem,
+        }),
+      fetchFn: async (input, init) => {
+        tokenCalls += 1;
+        expect(String(input)).toBe('https://oauth2.googleapis.com/token');
+        expect(String(init?.body)).toContain('grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer');
+        return new Response(JSON.stringify({ access_token: 'sa-access-token', expires_in: 3600 }), {
+          status: 200,
+        });
+      },
+    });
+
+    expect(await saProvider()).toBe('sa-access-token');
+    expect(await saProvider()).toBe('sa-access-token');
+    expect(tokenCalls).toBe(1);
+
+    const refreshProvider = createDriveAccessTokenProvider({
+      credentialsPath: '/run/secrets/oauth.json',
+      readCredentialsFile: async () =>
+        JSON.stringify({
+          type: 'authorized_user',
+          client_id: 'cid',
+          client_secret: 'csec',
+          refresh_token: 'rtok',
+        }),
+      fetchFn: async (_input, init) => {
+        expect(String(init?.body)).toContain('grant_type=refresh_token');
+        return new Response(JSON.stringify({ access_token: 'oauth-refreshed-token' }), {
+          status: 200,
+        });
+      },
+    });
+    expect(await refreshProvider()).toBe('oauth-refreshed-token');
+
+    const incompleteClientProvider = createDriveAccessTokenProvider({
+      credentialsPath: '/run/secrets/installed.json',
+      staticAccessToken: 'CHANGE_ME_GOOGLE_DRIVE_READONLY_TOKEN',
+      readCredentialsFile: async () =>
+        JSON.stringify({ installed: { client_id: 'cid', client_secret: 'csec' } }),
+    });
+    await expect(incompleteClientProvider()).rejects.toThrowError(DriveDownloadError);
   });
 });

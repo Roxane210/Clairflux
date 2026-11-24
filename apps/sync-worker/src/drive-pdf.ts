@@ -1,3 +1,5 @@
+import { createSign } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import {
   ALLOWED_DRIVE_FOLDERS,
   AccountTypeSchema,
@@ -136,6 +138,228 @@ export interface GoogleDriveClient {
     readonly driveFileId: string;
     readonly driveFolderId: string;
   }): Promise<Uint8Array>;
+}
+
+const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const TOKEN_REFRESH_MARGIN_MS = 60_000;
+
+const ServiceAccountCredentialsSchema = z.object({
+  type: z.literal('service_account'),
+  client_email: z.string().trim().min(1),
+  private_key: z.string().trim().min(1),
+  token_uri: z.string().url().optional(),
+});
+
+const OAuthRefreshCredentialsSchema = z.object({
+  client_id: z.string().trim().min(1),
+  client_secret: z.string().trim().min(1),
+  refresh_token: z.string().trim().min(1),
+  token_uri: z.string().url().optional(),
+});
+
+const OAuthTokenResponseSchema = z.object({
+  access_token: z.string().trim().min(1),
+  expires_in: z.number().int().positive().optional(),
+});
+
+export interface DriveAccessTokenProviderOptions {
+  readonly credentialsPath?: string | undefined;
+  readonly staticAccessToken?: string | undefined;
+  readonly fetchFn?: FetchLike | undefined;
+  readonly readCredentialsFile?: ((filePath: string) => Promise<string>) | undefined;
+  readonly nowMs?: (() => number) | undefined;
+  readonly timeoutMs?: number | undefined;
+}
+
+function encodeBase64UrlJson(payload: Readonly<Record<string, unknown>>): string {
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
+function signServiceAccountJwt(input: {
+  readonly clientEmail: string;
+  readonly privateKey: string;
+  readonly tokenUri: string;
+  readonly issuedAtSec: number;
+}): string {
+  const headerB64 = encodeBase64UrlJson({ alg: 'RS256', typ: 'JWT' });
+  const claimB64 = encodeBase64UrlJson({
+    iss: input.clientEmail,
+    scope: GOOGLE_DRIVE_READONLY_SCOPE,
+    aud: input.tokenUri,
+    iat: input.issuedAtSec,
+    exp: input.issuedAtSec + 3600,
+  });
+  const signingInput = `${headerB64}.${claimB64}`;
+  const normalizedKey = input.privateKey.replace(/\\n/g, '\n');
+  const signer = createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const signatureB64 = signer.sign(normalizedKey, 'base64url');
+  return `${signingInput}.${signatureB64}`;
+}
+
+function isUsableStaticToken(token: string | undefined): token is string {
+  if (token === undefined) {
+    return false;
+  }
+  const trimmed = token.trim();
+  return trimmed.length > 0 && !trimmed.startsWith('CHANGE_ME');
+}
+
+export function createDriveAccessTokenProvider(
+  options: DriveAccessTokenProviderOptions,
+): () => Promise<string> {
+  const fetchFn: FetchLike = options.fetchFn ?? globalThis.fetch;
+  const readCredentials =
+    options.readCredentialsFile ?? ((filePath: string) => readFile(filePath, 'utf8'));
+  const getNowMs = options.nowMs ?? (() => Date.now());
+  const timeoutMs = options.timeoutMs ?? DEFAULT_DRIVE_TIMEOUT_MS;
+
+  let cachedToken: { readonly token: string; readonly expiresAtMs: number } | null = null;
+
+  async function exchangeToken(
+    tokenUri: string,
+    formParams: Readonly<Record<string, string>>,
+  ): Promise<string> {
+    const body = new URLSearchParams(formParams);
+    let response: Response;
+    try {
+      response = await fetchFn(tokenUri, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
+        body: body.toString(),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new DriveDownloadError(
+        `Erreur réseau lors de l'obtention du jeton OAuth Google Drive : ${message}`,
+      );
+    }
+
+    if (!response.ok) {
+      throw new DriveDownloadError(
+        `Échec d'authentification Google Drive OAuth (HTTP ${response.status}).`,
+        response.status,
+      );
+    }
+
+    let rawJson: unknown;
+    try {
+      rawJson = await response.json();
+    } catch {
+      throw new DriveDownloadError(
+        'Réponse JSON OAuth Google Drive invalide.',
+        response.status,
+      );
+    }
+
+    const parsed = OAuthTokenResponseSchema.safeParse(rawJson);
+    if (!parsed.success) {
+      throw new DriveDownloadError(
+        'Réponse OAuth Google Drive sans access_token valide.',
+        response.status,
+      );
+    }
+
+    const expiresInSec = parsed.data.expires_in ?? 3600;
+    cachedToken = {
+      token: parsed.data.access_token,
+      expiresAtMs: getNowMs() + expiresInSec * 1000,
+    };
+    return parsed.data.access_token;
+  }
+
+  return async (): Promise<string> => {
+    const nowMs = getNowMs();
+    if (
+      cachedToken !== null &&
+      nowMs < cachedToken.expiresAtMs - TOKEN_REFRESH_MARGIN_MS
+    ) {
+      return cachedToken.token;
+    }
+
+    const credentialsPath = options.credentialsPath?.trim();
+    if (credentialsPath !== undefined && credentialsPath.length > 0) {
+      let rawText: string | null = null;
+      try {
+        rawText = await readCredentials(credentialsPath);
+      } catch (err) {
+        const isNotFound =
+          typeof err === 'object' &&
+          err !== null &&
+          'code' in err &&
+          err.code === 'ENOENT';
+        if (!isNotFound) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new DriveDownloadError(
+            `Impossible de lire le fichier credentials Google Drive (${credentialsPath}) : ${message}`,
+            401,
+          );
+        }
+      }
+
+      if (rawText !== null) {
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(rawText);
+        } catch {
+          throw new DriveDownloadError(
+            `Fichier credentials Google Drive JSON invalide (${credentialsPath}).`,
+            401,
+          );
+        }
+
+        const serviceAccount = ServiceAccountCredentialsSchema.safeParse(parsedJson);
+        if (serviceAccount.success) {
+          const tokenUri = serviceAccount.data.token_uri ?? GOOGLE_OAUTH_TOKEN_URL;
+          const assertion = signServiceAccountJwt({
+            clientEmail: serviceAccount.data.client_email,
+            privateKey: serviceAccount.data.private_key,
+            tokenUri,
+            issuedAtSec: Math.floor(nowMs / 1000),
+          });
+          return exchangeToken(tokenUri, {
+            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            assertion,
+          });
+        }
+
+        const oauthRefresh = OAuthRefreshCredentialsSchema.safeParse(parsedJson);
+        if (oauthRefresh.success) {
+          const tokenUri = oauthRefresh.data.token_uri ?? GOOGLE_OAUTH_TOKEN_URL;
+          return exchangeToken(tokenUri, {
+            grant_type: 'refresh_token',
+            client_id: oauthRefresh.data.client_id,
+            client_secret: oauthRefresh.data.client_secret,
+            refresh_token: oauthRefresh.data.refresh_token,
+          });
+        }
+
+        if (isUsableStaticToken(options.staticAccessToken)) {
+          return options.staticAccessToken.trim();
+        }
+
+        throw new DriveDownloadError(
+          `Le fichier credentials Google Drive (${credentialsPath}) ne contient ni clé privée 'service_account' ni 'refresh_token' OAuth2.`,
+          401,
+        );
+      }
+    }
+
+    if (isUsableStaticToken(options.staticAccessToken)) {
+      return options.staticAccessToken.trim();
+    }
+
+    throw new DriveDownloadError(
+      'Aucun jeton Google Drive valide (GOOGLE_DRIVE_CREDENTIALS_PATH ou GOOGLE_DRIVE_ACCESS_TOKEN requis).',
+      401,
+    );
+  };
 }
 
 function parseFileSizeBytes(rawSize: string | number | undefined): number {

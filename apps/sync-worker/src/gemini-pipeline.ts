@@ -54,6 +54,7 @@ import {
   InvalidDriveFolderScopeError,
   PdfUnreadableError,
   assertAllowedDriveFolderId,
+  createDriveAccessTokenProvider,
   createGoogleDriveClient,
   prepareDrivePdfBatches,
   type DiscoveredDrivePdf,
@@ -147,28 +148,46 @@ const NeonDatabaseUrlSchema = z
     },
   );
 
-export const WorkerEnvSchema = z.object({
-  DATABASE_URL: NeonDatabaseUrlSchema,
-  GEMINI_API_KEY: z
-    .string({ required_error: 'GEMINI_API_KEY est requis.' })
-    .trim()
-    .min(1, 'GEMINI_API_KEY ne peut pas être vide.'),
-  GOOGLE_DRIVE_ACCESS_TOKEN: z
-    .string({ required_error: 'GOOGLE_DRIVE_ACCESS_TOKEN est requis.' })
-    .trim()
-    .min(1, 'GOOGLE_DRIVE_ACCESS_TOKEN ne peut pas être vide.'),
-  INTERNAL_WORKER_TOKEN: z
-    .string({ required_error: 'INTERNAL_WORKER_TOKEN est requis.' })
-    .min(16, 'INTERNAL_WORKER_TOKEN doit contenir au moins 16 caractères.'),
-  PORT: z.preprocess(
-    emptyStringToUndefined,
-    z.coerce.number().int().min(1).max(65535).default(4001),
-  ),
-  NODE_ENV: z.preprocess(
-    emptyStringToUndefined,
-    z.enum(['development', 'test', 'production']).default('development'),
-  ),
-});
+export const WorkerEnvSchema = z
+  .object({
+    DATABASE_URL: NeonDatabaseUrlSchema,
+    GEMINI_API_KEY: z
+      .string({ required_error: 'GEMINI_API_KEY est requis.' })
+      .trim()
+      .min(1, 'GEMINI_API_KEY ne peut pas être vide.'),
+    GOOGLE_DRIVE_ACCESS_TOKEN: z.preprocess(
+      emptyStringToUndefined,
+      z.string().trim().min(1).optional(),
+    ),
+    GOOGLE_DRIVE_CREDENTIALS_PATH: z.preprocess(
+      emptyStringToUndefined,
+      z.string().trim().min(1).optional(),
+    ),
+    INTERNAL_WORKER_TOKEN: z
+      .string({ required_error: 'INTERNAL_WORKER_TOKEN est requis.' })
+      .min(16, 'INTERNAL_WORKER_TOKEN doit contenir au moins 16 caractères.'),
+    PORT: z.preprocess(
+      emptyStringToUndefined,
+      z.coerce.number().int().min(1).max(65535).default(4001),
+    ),
+    NODE_ENV: z.preprocess(
+      emptyStringToUndefined,
+      z.enum(['development', 'test', 'production']).default('development'),
+    ),
+  })
+  .superRefine((env, ctx) => {
+    if (
+      env.GOOGLE_DRIVE_ACCESS_TOKEN === undefined &&
+      env.GOOGLE_DRIVE_CREDENTIALS_PATH === undefined
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['GOOGLE_DRIVE_ACCESS_TOKEN'],
+        message:
+          'GOOGLE_DRIVE_ACCESS_TOKEN ou GOOGLE_DRIVE_CREDENTIALS_PATH est requis.',
+      });
+    }
+  });
 
 export type WorkerEnv = Readonly<z.infer<typeof WorkerEnvSchema>>;
 
@@ -1333,6 +1352,7 @@ export interface ResolvedTransactionFx {
 
 export interface CheckpointStore extends FxRateStore {
   ensureRun(runId?: string): Promise<{ readonly runId: string }>;
+  reconcileOrphanedRuns?(reason: string): Promise<number>;
   finalizeRun(input: {
     readonly runId: string;
     readonly status: Exclude<SyncRunStatus, 'running'>;
@@ -1471,6 +1491,20 @@ export class NeonCheckpointStore implements CheckpointStore {
         revision: sql`nextval('sync_revision_seq')`,
       })
       .where(eq(driveSyncRunsTable.id, input.runId));
+  }
+
+  public async reconcileOrphanedRuns(reason: string): Promise<number> {
+    const updated = await this.httpDb
+      .update(driveSyncRunsTable)
+      .set({
+        status: 'failed',
+        finishedAt: new Date(),
+        errorSummary: reason,
+        revision: sql`nextval('sync_revision_seq')`,
+      })
+      .where(eq(driveSyncRunsTable.status, 'running'))
+      .returning({ id: driveSyncRunsTable.id });
+    return updated.length;
   }
 
   public async getExactRate(
@@ -2114,198 +2148,229 @@ export async function runIngestionPipeline(
   },
 ): Promise<SyncRunResult> {
   const { runId } = await deps.checkpointStore.ensureRun(options?.runId);
-  const discovered = await deps.driveClient.discoverAllAllowedPdfs();
 
-  const filesToProcess =
-    options?.targetDriveFileId !== undefined
-      ? discovered.filter((f) => f.driveFileId === options.targetDriveFileId)
-      : discovered;
-
+  let totalFilesDiscovered = 0;
   let filesSkippedUnchanged = 0;
   let filesCommitted = 0;
   let filesFailed = 0;
   const fileResults: SyncRunFileResult[] = [];
 
-  for (const file of filesToProcess) {
-    assertAllowedDriveFolderId(file.driveFolderId);
+  try {
+    const discovered = await deps.driveClient.discoverAllAllowedPdfs();
 
-    const checkpoint =
-      await deps.checkpointStore.upsertDriveFileAndLoadCheckpoint({
-        runId,
-        file,
-      });
+    const filesToProcess =
+      options?.targetDriveFileId !== undefined
+        ? discovered.filter((f) => f.driveFileId === options.targetDriveFileId)
+        : discovered;
+    totalFilesDiscovered = filesToProcess.length;
 
-    if (checkpoint.status === 'committed') {
-      await deps.checkpointStore.markFileSkipped({
-        checkpointId: checkpoint.checkpointId,
-        runId,
-      });
-      filesSkippedUnchanged += 1;
-      fileResults.push({
-        driveFileId: file.driveFileId,
-        fileName: file.fileName,
-        status: 'skipped',
-        insertedTxCount: 0,
-        dedupSkippedTxCount: 0,
-        errorCode: null,
-        errorMessage: null,
-      });
-      continue;
-    }
+    for (const file of filesToProcess) {
+      assertAllowedDriveFolderId(file.driveFolderId);
 
-    try {
-      let statementToCommit: GeminiStatementExtraction;
+      const checkpoint =
+        await deps.checkpointStore.upsertDriveFileAndLoadCheckpoint({
+          runId,
+          file,
+        });
 
-      // Exact resume from already-parsed statement (e.g., DB failure during Phase 2 commit)
-      if (checkpoint.parsedPayload?.kind === 'complete_statement') {
-        statementToCommit = checkpoint.parsedPayload.statement;
-      } else {
-        await deps.checkpointStore.markFileExtracting({
+      if (checkpoint.status === 'committed') {
+        await deps.checkpointStore.markFileSkipped({
           checkpointId: checkpoint.checkpointId,
           runId,
         });
-
-        const pdfBytes = await deps.driveClient.downloadPdfFile({
+        filesSkippedUnchanged += 1;
+        fileResults.push({
           driveFileId: file.driveFileId,
-          driveFolderId: file.driveFolderId,
+          fileName: file.fileName,
+          status: 'skipped',
+          insertedTxCount: 0,
+          dedupSkippedTxCount: 0,
+          errorCode: null,
+          errorMessage: null,
         });
-
-        const prepared = await prepareDrivePdfBatches({
-          file,
-          pdfBytes,
-          extractPdfPages: deps.extractPdfPages,
-        });
-
-        const existingCompletedBatches =
-          checkpoint.parsedPayload?.kind === 'partial_batches' &&
-          checkpoint.parsedPayload.totalBatches === prepared.batches.length
-            ? checkpoint.parsedPayload.completedBatches
-            : [];
-
-        const batchMap = new Map<number, CheckpointBatchRecord>();
-        for (const prior of existingCompletedBatches) {
-          batchMap.set(prior.batchIndex, prior);
-        }
-
-        for (const batch of prepared.batches) {
-          if (batchMap.has(batch.batchIndex)) {
-            continue;
-          }
-
-          const batchExtraction = await extractBatchWithFallback({
-            client: deps.geminiClient,
-            bank: file.bank,
-            fileName: file.fileName,
-            inferredAccountType: prepared.metadata.accountType,
-            inferredCurrency: prepared.metadata.currency,
-            batch,
-            timeoutMs: deps.geminiTimeoutMs,
-          });
-
-          const batchRecord: CheckpointBatchRecord = {
-            batchIndex: batch.batchIndex,
-            pageStart: batch.pageStart,
-            pageEnd: batch.pageEnd,
-            extraction: batchExtraction.extraction,
-          };
-
-          batchMap.set(batch.batchIndex, batchRecord);
-          await deps.checkpointStore.savePartialBatch({
-            checkpointId: checkpoint.checkpointId,
-            totalPages: prepared.totalPages,
-            totalBatches: prepared.batches.length,
-            batchRecord,
-          });
-        }
-
-        statementToCommit = mergeBatchExtractions([...batchMap.values()]);
-        const payloadHash = computeStatementPayloadHash(statementToCommit);
-
-        await deps.checkpointStore.markFileParsed({
-          checkpointId: checkpoint.checkpointId,
-          totalPages: prepared.totalPages,
-          statement: statementToCommit,
-          payloadHash,
-        });
+        continue;
       }
 
-      const fxByTxIndex = await resolveTransactionsFx(
-        statementToCommit,
-        deps.fxRateService,
-      );
+      try {
+        let statementToCommit: GeminiStatementExtraction;
 
-      const commitOutcome = await deps.checkpointStore.commitParsedStatement({
-        checkpointId: checkpoint.checkpointId,
-        driveFileRecordId: checkpoint.driveFileRecordId,
-        bank: file.bank,
-        statement: statementToCommit,
-        fxByTxIndex,
-      });
+        // Exact resume from already-parsed statement (e.g., DB failure during Phase 2 commit)
+        if (checkpoint.parsedPayload?.kind === 'complete_statement') {
+          statementToCommit = checkpoint.parsedPayload.statement;
+        } else {
+          await deps.checkpointStore.markFileExtracting({
+            checkpointId: checkpoint.checkpointId,
+            runId,
+          });
 
-      filesCommitted += 1;
-      fileResults.push({
-        driveFileId: file.driveFileId,
-        fileName: file.fileName,
-        status: 'committed',
-        insertedTxCount: commitOutcome.insertedTxCount,
-        dedupSkippedTxCount: commitOutcome.dedupSkippedTxCount,
-        errorCode: null,
-        errorMessage: null,
-      });
-    } catch (err) {
-      const mapped = mapUnknownToCheckpointError(err);
-      await deps.checkpointStore.markFileFailed({
-        checkpointId: checkpoint.checkpointId,
-        runId,
-        errorCode: mapped.code,
-        errorMessage: mapped.message,
-      });
-      filesFailed += 1;
-      fileResults.push({
-        driveFileId: file.driveFileId,
-        fileName: file.fileName,
-        status: 'failed',
-        insertedTxCount: 0,
-        dedupSkippedTxCount: 0,
-        errorCode: mapped.code,
-        errorMessage: mapped.message,
-      });
+          const pdfBytes = await deps.driveClient.downloadPdfFile({
+            driveFileId: file.driveFileId,
+            driveFolderId: file.driveFolderId,
+          });
+
+          const prepared = await prepareDrivePdfBatches({
+            file,
+            pdfBytes,
+            extractPdfPages: deps.extractPdfPages,
+          });
+
+          const existingCompletedBatches =
+            checkpoint.parsedPayload?.kind === 'partial_batches' &&
+            checkpoint.parsedPayload.totalBatches === prepared.batches.length
+              ? checkpoint.parsedPayload.completedBatches
+              : [];
+
+          const batchMap = new Map<number, CheckpointBatchRecord>();
+          for (const prior of existingCompletedBatches) {
+            batchMap.set(prior.batchIndex, prior);
+          }
+
+          for (const batch of prepared.batches) {
+            if (batchMap.has(batch.batchIndex)) {
+              continue;
+            }
+
+            const batchExtraction = await extractBatchWithFallback({
+              client: deps.geminiClient,
+              bank: file.bank,
+              fileName: file.fileName,
+              inferredAccountType: prepared.metadata.accountType,
+              inferredCurrency: prepared.metadata.currency,
+              batch,
+              timeoutMs: deps.geminiTimeoutMs,
+            });
+
+            const batchRecord: CheckpointBatchRecord = {
+              batchIndex: batch.batchIndex,
+              pageStart: batch.pageStart,
+              pageEnd: batch.pageEnd,
+              extraction: batchExtraction.extraction,
+            };
+
+            batchMap.set(batch.batchIndex, batchRecord);
+            await deps.checkpointStore.savePartialBatch({
+              checkpointId: checkpoint.checkpointId,
+              totalPages: prepared.totalPages,
+              totalBatches: prepared.batches.length,
+              batchRecord,
+            });
+          }
+
+          statementToCommit = mergeBatchExtractions([...batchMap.values()]);
+          const payloadHash = computeStatementPayloadHash(statementToCommit);
+
+          await deps.checkpointStore.markFileParsed({
+            checkpointId: checkpoint.checkpointId,
+            totalPages: prepared.totalPages,
+            statement: statementToCommit,
+            payloadHash,
+          });
+        }
+
+        const fxByTxIndex = await resolveTransactionsFx(
+          statementToCommit,
+          deps.fxRateService,
+        );
+
+        const commitOutcome = await deps.checkpointStore.commitParsedStatement({
+          checkpointId: checkpoint.checkpointId,
+          driveFileRecordId: checkpoint.driveFileRecordId,
+          bank: file.bank,
+          statement: statementToCommit,
+          fxByTxIndex,
+        });
+
+        filesCommitted += 1;
+        fileResults.push({
+          driveFileId: file.driveFileId,
+          fileName: file.fileName,
+          status: 'committed',
+          insertedTxCount: commitOutcome.insertedTxCount,
+          dedupSkippedTxCount: commitOutcome.dedupSkippedTxCount,
+          errorCode: null,
+          errorMessage: null,
+        });
+      } catch (err) {
+        const mapped = mapUnknownToCheckpointError(err);
+        await deps.checkpointStore.markFileFailed({
+          checkpointId: checkpoint.checkpointId,
+          runId,
+          errorCode: mapped.code,
+          errorMessage: mapped.message,
+        });
+        filesFailed += 1;
+        fileResults.push({
+          driveFileId: file.driveFileId,
+          fileName: file.fileName,
+          status: 'failed',
+          insertedTxCount: 0,
+          dedupSkippedTxCount: 0,
+          errorCode: mapped.code,
+          errorMessage: mapped.message,
+        });
+      }
     }
+
+    let runStatus: Exclude<SyncRunStatus, 'running'>;
+    if (filesFailed === 0) {
+      runStatus = 'completed';
+    } else if (filesCommitted > 0 || filesSkippedUnchanged > 0) {
+      runStatus = 'partial_error';
+    } else {
+      runStatus = 'failed';
+    }
+
+    const errorSummary =
+      filesFailed > 0
+        ? `${filesFailed} fichier(s) PDF en échec lors de la synchronisation.`
+        : null;
+
+    await deps.checkpointStore.finalizeRun({
+      runId,
+      status: runStatus,
+      totalFilesDiscovered,
+      filesSkippedUnchanged,
+      filesCommitted,
+      filesFailed,
+      errorSummary,
+    });
+
+    return {
+      runId,
+      status: runStatus,
+      totalFilesDiscovered,
+      filesSkippedUnchanged,
+      filesCommitted,
+      filesFailed,
+      fileResults,
+    };
+  } catch (err) {
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const errorSummary = rawMessage.trim().slice(0, 500) || 'Erreur interne lors de la synchronisation Drive/Gemini.';
+    try {
+      await deps.checkpointStore.finalizeRun({
+        runId,
+        status: 'failed',
+        totalFilesDiscovered,
+        filesSkippedUnchanged,
+        filesCommitted,
+        filesFailed,
+        errorSummary,
+      });
+    } catch (finalizeErr) {
+      console.error('[sync-worker] Impossible de finaliser le run en échec:', finalizeErr);
+    }
+
+    return {
+      runId,
+      status: 'failed',
+      totalFilesDiscovered,
+      filesSkippedUnchanged,
+      filesCommitted,
+      filesFailed,
+      fileResults,
+    };
   }
-
-  let runStatus: Exclude<SyncRunStatus, 'running'>;
-  if (filesFailed === 0) {
-    runStatus = 'completed';
-  } else if (filesCommitted > 0 || filesSkippedUnchanged > 0) {
-    runStatus = 'partial_error';
-  } else {
-    runStatus = 'failed';
-  }
-
-  const errorSummary =
-    filesFailed > 0
-      ? `${filesFailed} fichier(s) PDF en échec lors de la synchronisation.`
-      : null;
-
-  await deps.checkpointStore.finalizeRun({
-    runId,
-    status: runStatus,
-    totalFilesDiscovered: filesToProcess.length,
-    filesSkippedUnchanged,
-    filesCommitted,
-    filesFailed,
-    errorSummary,
-  });
-
-  return {
-    runId,
-    status: runStatus,
-    totalFilesDiscovered: filesToProcess.length,
-    filesSkippedUnchanged,
-    filesCommitted,
-    filesFailed,
-    fileResults,
-  };
 }
 
 // ============================================================================
@@ -2327,6 +2392,7 @@ export type TriggerWorkerRunResult =
 export interface WorkerAppDependencies {
   readonly internalWorkerToken: string;
   readonly now?: (() => Date) | undefined;
+  readonly getActiveRunId?: (() => string | null) | undefined;
   readonly triggerSync: (input: {
     readonly runId?: string | undefined;
     readonly driveFileId?: string | undefined;
@@ -2362,6 +2428,11 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isAuthorizedInternalRequest(c: Context, expectedToken: string): boolean {
+  const providedToken = extractInternalBearerToken(c);
+  return providedToken !== null && verifyInternalWorkerToken(providedToken, expectedToken);
+}
+
 export function createWorkerApp(deps: WorkerAppDependencies): Hono {
   const app = new Hono();
   const getNow = deps.now ?? (() => new Date());
@@ -2370,12 +2441,29 @@ export function createWorkerApp(deps: WorkerAppDependencies): Hono {
     return c.json({ status: 'ok' as const, service: 'sync-worker' as const }, 200);
   });
 
+  app.get('/internal/runs/active', (c) => {
+    if (!isAuthorizedInternalRequest(c, deps.internalWorkerToken)) {
+      return c.json(
+        {
+          error: {
+            code: 'UNAUTHORIZED' as const,
+            message: 'Jeton interne sync-worker absent ou invalide.',
+          },
+        },
+        401,
+      );
+    }
+
+    return c.json(
+      {
+        active_run_id: deps.getActiveRunId?.() ?? null,
+      },
+      200,
+    );
+  });
+
   app.post('/internal/runs', async (c) => {
-    const providedToken = extractInternalBearerToken(c);
-    if (
-      providedToken === null ||
-      !verifyInternalWorkerToken(providedToken, deps.internalWorkerToken)
-    ) {
+    if (!isAuthorizedInternalRequest(c, deps.internalWorkerToken)) {
       return c.json(
         {
           error: {
@@ -2522,19 +2610,32 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
   const env = parseWorkerEnv(rawEnv);
   const store = new NeonCheckpointStore(env.DATABASE_URL);
   const driveClient = createGoogleDriveClient({
-    getAccessToken: () => env.GOOGLE_DRIVE_ACCESS_TOKEN,
+    getAccessToken: createDriveAccessTokenProvider({
+      credentialsPath: env.GOOGLE_DRIVE_CREDENTIALS_PATH,
+      staticAccessToken: env.GOOGLE_DRIVE_ACCESS_TOKEN,
+    }),
   });
   const geminiClient = createHttpGeminiClient({
     apiKey: env.GEMINI_API_KEY,
   });
   const fxRateService = createFxRateService({ store });
 
+  const startupReconcilePromise = store
+    .reconcileOrphanedRuns('Synchronisation interrompue (redémarrage du service sync-worker).')
+    .catch((err: unknown) => {
+      console.error('[sync-worker] Échec réconciliation des runs orphelins au démarrage:', err);
+      return 0;
+    });
+
   let activeRunId: string | null = null;
   let activePromise: Promise<SyncRunResult> | null = null;
 
   const app = createWorkerApp({
     internalWorkerToken: env.INTERNAL_WORKER_TOKEN,
+    getActiveRunId: () => activeRunId,
     async triggerSync(input): Promise<TriggerWorkerRunResult> {
+      await startupReconcilePromise;
+
       if (activeRunId !== null) {
         return {
           ok: false,
@@ -2564,7 +2665,9 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
       });
 
       activePromise = promise;
-      void promise.catch(() => undefined);
+      void promise.catch((err: unknown) => {
+        console.error(`[sync-worker] Erreur fatale sur le run ${runId}:`, err);
+      });
 
       return {
         ok: true,
