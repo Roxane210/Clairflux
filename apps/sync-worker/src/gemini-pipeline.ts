@@ -263,11 +263,26 @@ export const GeminiStatementExtractionSchema = z.object({
 });
 export type GeminiStatementExtraction = z.infer<typeof GeminiStatementExtractionSchema>;
 
+export const GeminiBatchExtractionSchema = z
+  .object({
+    statement_period_start: CalendarIsoDateSchema,
+    statement_period_end: CalendarIsoDateSchema,
+    accounts: z.array(GeminiExtractedAccountSchema),
+    transactions: z.array(GeminiExtractedTransactionSchema),
+  })
+  .refine(
+    (value) => value.transactions.length === 0 || value.accounts.length > 0,
+    {
+      message: 'Au moins un compte requis lorsque des transactions sont présentes.',
+      path: ['accounts'],
+    },
+  );
+
 export const CheckpointBatchRecordSchema = z.object({
   batchIndex: z.number().int().nonnegative(),
   pageStart: z.number().int().positive(),
   pageEnd: z.number().int().positive(),
-  extraction: GeminiStatementExtractionSchema,
+  extraction: GeminiBatchExtractionSchema,
 });
 export type CheckpointBatchRecord = z.infer<typeof CheckpointBatchRecordSchema>;
 
@@ -506,9 +521,12 @@ export function buildStatementExtractionPrompt(input: {
     `Lot ${input.batch.batchIndex + 1}/${input.batch.totalBatches} (pages ${input.batch.pageStart}-${input.batch.pageEnd})`,
     'Retourne UNIQUEMENT un objet JSON unique (jamais un tableau racine) respectant :',
     '- statement_period_start, statement_period_end (YYYY-MM-DD)',
-    '- accounts: [{ detected_name, external_ref_masked (chaîne non nulle, ex. "****4709" avec exactement 4 astérisques ou identifiant court si absent), account_type, currency (EUR|USD), opening_balance_cents (entier|null), closing_balance_cents (entier) }]',
-    '- transactions: [{ account_ref_masked (doit correspondre exactement à accounts[].external_ref_masked), currency (EUR|USD), booking_date (YYYY-MM-DD), value_date (YYYY-MM-DD|null), raw_label, clean_label, amount_cents (entier signe non nul, jamais de float), statement_fx_rate_micro (entier positif|null) }]',
-    'INTERDICTION ABSOLUE de retourner des nombres décimaux (floats) pour les montants.',
+    '- accounts: [{ detected_name, external_ref_masked (chaîne non nulle, ex. "****4709" avec exactement 4 astérisques ou identifiant court si absent), account_type (strictement parmi: courant | epargne | carte_differee | multi_devises | coffre | autre), currency (strictement EUR | USD), opening_balance_cents (entier|null), closing_balance_cents (entier) }]',
+    '- transactions: [{ account_ref_masked (doit correspondre exactement à accounts[].external_ref_masked), currency (strictement EUR | USD), booking_date (YYYY-MM-DD), value_date (YYYY-MM-DD|null), raw_label, clean_label, amount_cents (entier signe non nul, jamais de float), statement_fx_rate_micro (taux USD -> EUR multiplié par 1_000_000, ex. 1 USD = 0.92 EUR => 920000, entier positif|null) }]',
+    'RÈGLES STRICTES :',
+    '- Extrais UNIQUEMENT les comptes et opérations en EUR ou USD (ignore toute autre devise comme GBP, CHF, etc., ainsi que crypto/actions).',
+    '- Si ce lot de pages ne contient aucune opération ni aucun compte EUR/USD (ex. pages légales, autres devises), retourne accounts: [] et transactions: [].',
+    '- INTERDICTION ABSOLUE de retourner des nombres décimaux (floats) pour les montants.',
     '',
     input.batch.text,
   ].join('\n');
@@ -522,6 +540,63 @@ export interface BatchExtractionResult {
     readonly errorCode?: GeminiCallErrorCode | undefined;
     readonly message?: string | undefined;
   }>;
+}
+
+const ACCOUNT_TYPE_ALIAS_MAP: Readonly<Record<string, AccountType>> = {
+  courant: 'courant',
+  checking: 'courant',
+  current: 'courant',
+  main: 'courant',
+  principal: 'courant',
+  personal: 'courant',
+  epargne: 'epargne',
+  savings: 'epargne',
+  livret: 'epargne',
+  carte_differee: 'carte_differee',
+  'carte differee': 'carte_differee',
+  deferred_card: 'carte_differee',
+  credit_card: 'carte_differee',
+  credit: 'carte_differee',
+  multi_devises: 'multi_devises',
+  'multi-devises': 'multi_devises',
+  multi_currency: 'multi_devises',
+  multicurrency: 'multi_devises',
+  coffre: 'coffre',
+  vault: 'coffre',
+  pocket: 'coffre',
+  poche: 'coffre',
+  autre: 'autre',
+  other: 'autre',
+  investissement: 'autre',
+  investment: 'autre',
+  trading: 'autre',
+  actions: 'autre',
+  bourse: 'autre',
+  crypto: 'autre',
+};
+
+function normalizeAccountType(rawType: unknown, fallback: AccountType): AccountType {
+  if (typeof rawType !== 'string') {
+    return fallback;
+  }
+  const normalized = rawType
+    .trim()
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/gu, '');
+  if (normalized.length === 0) {
+    return fallback;
+  }
+  return ACCOUNT_TYPE_ALIAS_MAP[normalized] ?? 'autre';
+}
+
+function parseSupportedCurrency(rawCurrency: unknown, fallback: Currency): Currency | null {
+  if (typeof rawCurrency !== 'string' || rawCurrency.trim().length === 0) {
+    return fallback;
+  }
+  const upper = rawCurrency.trim().toUpperCase();
+  const parsed = CurrencySchema.safeParse(upper);
+  return parsed.success ? parsed.data : null;
 }
 
 function normalizeMaskedAccountRef(rawRef: string): string {
@@ -568,34 +643,48 @@ function normalizeGeminiStatementPayload(
   }
 
   const refMapping = new Map<string, string>();
+  const ignoredAccountRefs = new Set<string>();
   const rawAccounts = Array.isArray(candidate['accounts']) ? candidate['accounts'] : [];
-  const normalizedAccounts = rawAccounts.map((acc) => {
-    if (!isPlainRecord(acc)) {
-      return acc;
-    }
-    const accType =
-      typeof acc['account_type'] === 'string' && acc['account_type'].trim().length > 0
-        ? acc['account_type'].trim()
-        : context.inferredAccountType;
-    const accCurrency =
-      typeof acc['currency'] === 'string' && acc['currency'].trim().length > 0
-        ? acc['currency'].trim().toUpperCase()
-        : context.inferredCurrency;
+  const normalizedAccounts: unknown[] = [];
 
+  for (const acc of rawAccounts) {
+    if (!isPlainRecord(acc)) {
+      normalizedAccounts.push(acc);
+      continue;
+    }
+
+    const supportedCurrency = parseSupportedCurrency(acc['currency'], context.inferredCurrency);
+    const accType = normalizeAccountType(acc['account_type'], context.inferredAccountType);
     const rawRef =
       typeof acc['external_ref_masked'] === 'string' ? acc['external_ref_masked'].trim() : '';
-    const fallbackRef = `${context.bank.toUpperCase()}-${accType.toUpperCase()}-${accCurrency}`;
+
+    if (supportedCurrency === null) {
+      const rawCurrencyLabel =
+        typeof acc['currency'] === 'string' ? acc['currency'].trim().toUpperCase() : 'INCONNUE';
+      console.warn(
+        `[sync-worker] Compte en devise non supportée ignoré (${rawCurrencyLabel}) dans ${context.bank}.`,
+      );
+      if (rawRef.length > 0) {
+        ignoredAccountRefs.add(rawRef);
+        ignoredAccountRefs.add(normalizeMaskedAccountRef(rawRef));
+      }
+      continue;
+    }
+
+    const fallbackRef = `${context.bank.toUpperCase()}-${accType.toUpperCase()}-${supportedCurrency}`;
     const normalizedRef = rawRef.length > 0 ? normalizeMaskedAccountRef(rawRef) : fallbackRef;
 
     if (rawRef.length > 0) {
       refMapping.set(rawRef, normalizedRef);
     }
 
-    return {
+    normalizedAccounts.push({
       ...acc,
+      account_type: accType,
+      currency: supportedCurrency,
       external_ref_masked: normalizedRef,
-    };
-  });
+    });
+  }
 
   const defaultAccountRef =
     normalizedAccounts.length === 1 &&
@@ -605,22 +694,37 @@ function normalizeGeminiStatementPayload(
       : `${context.bank.toUpperCase()}-${context.inferredAccountType.toUpperCase()}-${context.inferredCurrency}`;
 
   const rawTransactions = Array.isArray(candidate['transactions']) ? candidate['transactions'] : [];
-  const normalizedTransactions = rawTransactions.map((tx) => {
+  const normalizedTransactions: unknown[] = [];
+
+  for (const tx of rawTransactions) {
     if (!isPlainRecord(tx)) {
-      return tx;
+      normalizedTransactions.push(tx);
+      continue;
     }
+
     const rawTxRef =
       typeof tx['account_ref_masked'] === 'string' ? tx['account_ref_masked'].trim() : '';
+    const supportedCurrency = parseSupportedCurrency(tx['currency'], context.inferredCurrency);
+    if (
+      supportedCurrency === null ||
+      (rawTxRef.length > 0 &&
+        (ignoredAccountRefs.has(rawTxRef) ||
+          ignoredAccountRefs.has(normalizeMaskedAccountRef(rawTxRef))))
+    ) {
+      continue;
+    }
+
     const mappedRef =
       rawTxRef.length === 0
         ? defaultAccountRef
         : refMapping.get(rawTxRef) ?? normalizeMaskedAccountRef(rawTxRef);
 
-    return {
+    normalizedTransactions.push({
       ...tx,
+      currency: supportedCurrency,
       account_ref_masked: mappedRef,
-    };
-  });
+    });
+  }
 
   return {
     ...candidate,
@@ -696,7 +800,11 @@ export async function extractBatchWithFallback(input: {
       inferredAccountType: input.inferredAccountType,
       inferredCurrency: input.inferredCurrency,
     });
-    const validated = GeminiStatementExtractionSchema.safeParse(normalizedJson);
+    const batchSchema =
+      input.batch.totalBatches > 1
+        ? GeminiBatchExtractionSchema
+        : GeminiStatementExtractionSchema;
+    const validated = batchSchema.safeParse(normalizedJson);
     if (!validated.success) {
       const firstIssue = validated.error.issues[0];
       const issueMsg = `Validation Zod échouée (${model}) : ${firstIssue?.path.join('.') ?? 'root'} - ${firstIssue?.message ?? 'invalid'}`;
@@ -763,9 +871,15 @@ export function mergeBatchExtractions(
       if (existing === undefined) {
         accountByKey.set(key, account);
       } else {
+        const keepPriorClosingBalance =
+          ext.transactions.length === 0 &&
+          account.closing_balance_cents === 0 &&
+          existing.closing_balance_cents !== 0;
         accountByKey.set(key, {
           ...existing,
-          closing_balance_cents: account.closing_balance_cents,
+          closing_balance_cents: keepPriorClosingBalance
+            ? existing.closing_balance_cents
+            : account.closing_balance_cents,
           opening_balance_cents:
             existing.opening_balance_cents ?? account.opening_balance_cents,
         });
@@ -774,11 +888,35 @@ export function mergeBatchExtractions(
     allTransactions.push(...ext.transactions);
   }
 
+  const accountsByCurrency = new Map<Currency, GeminiExtractedAccount[]>();
+  for (const account of accountByKey.values()) {
+    const list = accountsByCurrency.get(account.currency) ?? [];
+    list.push(account);
+    accountsByCurrency.set(account.currency, list);
+  }
+
+  const alignedTransactions = allTransactions.map((tx) => {
+    const exactKey = `${tx.account_ref_masked}|${tx.currency}`;
+    if (accountByKey.has(exactKey)) {
+      return tx;
+    }
+    const matchingCurrencyAccounts = accountsByCurrency.get(tx.currency) ?? [];
+    const soleAccount =
+      matchingCurrencyAccounts.length === 1 ? matchingCurrencyAccounts[0] : undefined;
+    if (soleAccount !== undefined) {
+      return {
+        ...tx,
+        account_ref_masked: soleAccount.external_ref_masked,
+      };
+    }
+    return tx;
+  });
+
   return GeminiStatementExtractionSchema.parse({
     statement_period_start: periodStart,
     statement_period_end: periodEnd,
     accounts: [...accountByKey.values()],
-    transactions: allTransactions,
+    transactions: alignedTransactions,
   });
 }
 
@@ -818,6 +956,215 @@ export type ExternalFxRateFetcher = (
   baseCurrency: Currency,
   quoteCurrency: Currency,
 ) => Promise<{ readonly rateDate: string; readonly rateMicro: FxRateMicro; readonly source: FxSource } | null>;
+
+const FX_HTTP_TIMEOUT_MS = 10_000;
+const FX_MAX_LOOKBACK_DAYS = 14;
+
+const FrankfurterRangeResponseSchema = z.object({
+  rates: z.record(z.string(), z.record(z.string(), z.number().positive())),
+});
+
+const EcbSdmxResponseSchema = z.object({
+  dataSets: z
+    .array(
+      z.object({
+        series: z.record(
+          z.string(),
+          z.object({
+            observations: z.record(z.string(), z.array(z.number().positive()).min(1)),
+          }),
+        ),
+      }),
+    )
+    .min(1),
+  structure: z.object({
+    dimensions: z.object({
+      observation: z
+        .array(
+          z.object({
+            values: z.array(z.object({ id: z.string() })),
+          }),
+        )
+        .min(1),
+    }),
+  }),
+});
+
+function shiftIsoDate(isoDate: string, deltaDays: number): string {
+  const utcMs = Date.parse(`${isoDate}T00:00:00.000Z`);
+  return new Date(utcMs + deltaDays * MS_PER_DAY).toISOString().slice(0, 10);
+}
+
+function lookupRateInDateMap(
+  ratesByDate: ReadonlyMap<string, FxRateMicro>,
+  targetDate: string,
+  maxLookbackDays: number,
+): { readonly rateDate: string; readonly rateMicro: FxRateMicro } | null {
+  for (let offset = 0; offset <= maxLookbackDays; offset += 1) {
+    const candidate = offset === 0 ? targetDate : shiftIsoDate(targetDate, -offset);
+    const hit = ratesByDate.get(candidate);
+    if (hit !== undefined) {
+      return { rateDate: candidate, rateMicro: hit };
+    }
+  }
+  return null;
+}
+
+async function fetchFrankfurterRange(
+  url: string,
+  quoteCurrency: Currency,
+  fetchFn: typeof fetch,
+): Promise<Map<string, FxRateMicro> | null> {
+  try {
+    const res = await fetchFn(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(FX_HTTP_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const parsed = FrankfurterRangeResponseSchema.safeParse(await res.json());
+    if (!parsed.success) {
+      return null;
+    }
+    const map = new Map<string, FxRateMicro>();
+    for (const [dateKey, quoteMap] of Object.entries(parsed.data.rates)) {
+      const rateNum = quoteMap[quoteCurrency];
+      if (typeof rateNum === 'number' && Number.isFinite(rateNum) && rateNum > 0) {
+        map.set(dateKey, toFxRateMicro(Math.max(1, Math.round(rateNum * 1_000_000))));
+      }
+    }
+    return map.size > 0 ? map : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchEcbSdmxRange(
+  startDate: string,
+  endDate: string,
+  baseCurrency: Currency,
+  quoteCurrency: Currency,
+  fetchFn: typeof fetch,
+): Promise<Map<string, FxRateMicro> | null> {
+  if (baseCurrency === quoteCurrency) {
+    return null;
+  }
+  const url = `https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A?startPeriod=${startDate}&endPeriod=${endDate}&format=jsondata`;
+  try {
+    const res = await fetchFn(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(FX_HTTP_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const parsed = EcbSdmxResponseSchema.safeParse(await res.json());
+    if (!parsed.success) {
+      return null;
+    }
+    const firstDataset = parsed.data.dataSets[0];
+    const firstObsDim = parsed.data.structure.dimensions.observation[0];
+    if (firstDataset === undefined || firstObsDim === undefined) {
+      return null;
+    }
+    const firstSeries = Object.values(firstDataset.series)[0];
+    if (firstSeries === undefined) {
+      return null;
+    }
+    const map = new Map<string, FxRateMicro>();
+    for (let idx = 0; idx < firstObsDim.values.length; idx += 1) {
+      const dateEntry = firstObsDim.values[idx];
+      const obsValues = firstSeries.observations[String(idx)];
+      const usdPerEur = obsValues?.[0];
+      if (
+        dateEntry === undefined ||
+        typeof usdPerEur !== 'number' ||
+        !Number.isFinite(usdPerEur) ||
+        usdPerEur <= 0
+      ) {
+        continue;
+      }
+      const eurToUsdMicro = toFxRateMicro(Math.max(1, Math.round(usdPerEur * 1_000_000)));
+      const rateMicro =
+        baseCurrency === 'EUR' ? eurToUsdMicro : invertFxRateMicro(eurToUsdMicro);
+      map.set(dateEntry.id, rateMicro);
+    }
+    return map.size > 0 ? map : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetches official ECB EUR <-> USD reference rates per calendar year (including late December
+ * of the previous year for New Year holidays) with an in-memory range cache and 3-provider fallback.
+ */
+export function createEcbReferenceFxFetcher(
+  fetchFn: typeof fetch = fetch,
+): ExternalFxRateFetcher {
+  const yearRangeCache = new Map<string, Map<string, FxRateMicro>>();
+
+  return async (rateDate, baseCurrency, quoteCurrency) => {
+    if (baseCurrency === quoteCurrency) {
+      return { rateDate, rateMicro: EUR_FX_RATE_MICRO, source: 'ecb_reference' };
+    }
+
+    const validDate = CalendarIsoDateSchema.parse(rateDate);
+    const year = Number(validDate.slice(0, 4));
+    const cacheKey = `${year}|${baseCurrency}|${quoteCurrency}`;
+
+    let ratesByDate = yearRangeCache.get(cacheKey);
+    if (ratesByDate === undefined) {
+      const todayUtc = new Date().toISOString().slice(0, 10);
+      const startDate = `${year - 1}-12-15`;
+      const rawEndDate = `${year}-12-31`;
+      const endDate = rawEndDate <= todayUtc ? rawEndDate : todayUtc;
+
+      const effectiveStart = startDate <= endDate ? startDate : shiftIsoDate(endDate, -FX_MAX_LOOKBACK_DAYS);
+      ratesByDate =
+        (await fetchFrankfurterRange(
+          `https://api.frankfurter.dev/v1/${effectiveStart}..${endDate}?base=${baseCurrency}&symbols=${quoteCurrency}`,
+          quoteCurrency,
+          fetchFn,
+        )) ??
+        (await fetchFrankfurterRange(
+          `https://api.frankfurter.app/${effectiveStart}..${endDate}?from=${baseCurrency}&to=${quoteCurrency}`,
+          quoteCurrency,
+          fetchFn,
+        )) ??
+        (await fetchEcbSdmxRange(
+          effectiveStart,
+          endDate,
+          baseCurrency,
+          quoteCurrency,
+          fetchFn,
+        )) ??
+        undefined;
+
+      if (ratesByDate !== undefined) {
+        yearRangeCache.set(cacheKey, ratesByDate);
+      } else {
+        console.warn(
+          `[sync-worker] Échec récupération taux FX BCE (${baseCurrency}/${quoteCurrency}, plage ${effectiveStart}..${endDate}).`,
+        );
+        return null;
+      }
+    }
+
+    const hit = lookupRateInDateMap(ratesByDate, validDate, FX_MAX_LOOKBACK_DAYS);
+    if (hit === null) {
+      return null;
+    }
+    return {
+      rateDate: hit.rateDate,
+      rateMicro: hit.rateMicro,
+      source: 'ecb_reference',
+    };
+  };
+}
 
 const MICRO_UNIT_NUMERATOR = 1_000_000_000_000n;
 
@@ -2897,7 +3244,11 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
   const geminiClient = createHttpGeminiClient({
     apiKey: env.GEMINI_API_KEY,
   });
-  const fxRateService = createFxRateService({ store });
+  const fxRateService = createFxRateService({
+    store,
+    fetchReferenceRate: createEcbReferenceFxFetcher(),
+    maxLookbackDays: FX_MAX_LOOKBACK_DAYS,
+  });
 
   const startupReconcilePromise = store
     .reconcileOrphanedRuns('Synchronisation interrompue (redémarrage du service sync-worker).')

@@ -37,12 +37,14 @@ import {
   WorkerEnvValidationError,
   computeDedupHash,
   convertAmountCents,
+  createEcbReferenceFxFetcher,
   createFxRateService,
   createHttpGeminiClient,
   createWorkerApp,
   evaluateCategorizationRules,
   extractBatchWithFallback,
   matchInternalTransferPairs,
+  mergeBatchExtractions,
   normalizeLabel,
   parseWorkerEnv,
   runIngestionPipeline,
@@ -1869,5 +1871,231 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
     expect(parseSubprocessPdfStdout(pollutedStdout)).toEqual([
       { pageNumber: 1, rawText: 'Revolut EUR' },
     ]);
+  });
+
+  it('résout les taux USD/EUR historiques via BCE/Frankfurter avec cache annuel et repli SDMX', async () => {
+    const store = new InMemoryNeonCheckpointStore();
+    const fetchFrankfurterMock = vi.fn<typeof fetch>(async () => {
+      return new Response(
+        JSON.stringify({
+          amount: 1.0,
+          base: 'USD',
+          start_date: '2019-12-15',
+          end_date: '2020-12-31',
+          rates: {
+            '2020-08-07': { EUR: 0.8482 },
+            '2020-08-10': { EUR: 0.8508 },
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+
+    const fxService = createFxRateService({
+      store,
+      fetchReferenceRate: createEcbReferenceFxFetcher(fetchFrankfurterMock),
+      maxLookbackDays: 14,
+    });
+
+    const exact = await fxService.resolveRateMicro({
+      rateDate: '2020-08-10',
+      baseCurrency: 'USD',
+      quoteCurrency: 'EUR',
+    });
+    expect(exact).toEqual({
+      rateMicro: toFxRateMicro(850800),
+      source: 'ecb_reference',
+    });
+
+    const weekend = await fxService.resolveRateMicro({
+      rateDate: '2020-08-09',
+      baseCurrency: 'USD',
+      quoteCurrency: 'EUR',
+    });
+    expect(weekend).toEqual({
+      rateMicro: toFxRateMicro(848200),
+      source: 'nearest_business_day',
+    });
+    // Year range was cached in a single HTTP request across both dates
+    expect(fetchFrankfurterMock).toHaveBeenCalledTimes(1);
+
+    // Fallback to ECB SDMX API when Frankfurter endpoints fail
+    const fetchEcbFallbackMock = vi.fn<typeof fetch>(async (url) => {
+      const urlStr = String(url);
+      if (urlStr.includes('frankfurter')) {
+        return new Response('unavailable', { status: 503 });
+      }
+      return new Response(
+        JSON.stringify({
+          dataSets: [
+            {
+              series: {
+                '0:0:0:0:0': {
+                  observations: {
+                    '0': [1.25], // 1 EUR = 1.25 USD => 1 USD = 0.80 EUR (800000 micro)
+                  },
+                },
+              },
+            },
+          ],
+          structure: {
+            dimensions: {
+              observation: [
+                {
+                  values: [{ id: '2018-04-13' }],
+                },
+              ],
+            },
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+
+    const ecbFetcher = createEcbReferenceFxFetcher(fetchEcbFallbackMock);
+    const ecbRate = await ecbFetcher('2018-04-13', 'USD', 'EUR');
+    expect(ecbRate).toEqual({
+      rateDate: '2018-04-13',
+      rateMicro: toFxRateMicro(800000),
+      source: 'ecb_reference',
+    });
+  });
+
+  it('mappe investissement vers autre, ignore GBP et tolère les lots vides multi-pages Revolut', async () => {
+    const revolutMixedClient: GeminiModelClient = {
+      generateStructuredStatement: vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true as const,
+          rawJsonText: JSON.stringify({
+            statement_period_start: '2021-01-01',
+            statement_period_end: '2021-12-31',
+            accounts: [
+              {
+                detected_name: 'Revolut EUR',
+                external_ref_masked: '****1234',
+                account_type: 'courant',
+                currency: 'EUR',
+                opening_balance_cents: 10000,
+                closing_balance_cents: 25000,
+              },
+              {
+                detected_name: 'Trading Revolut',
+                external_ref_masked: 'INV-01',
+                account_type: 'investissement',
+                currency: 'EUR',
+                opening_balance_cents: null,
+                closing_balance_cents: 5000,
+              },
+              {
+                detected_name: 'Revolut GBP',
+                external_ref_masked: 'GBP-01',
+                account_type: 'multi_devises',
+                currency: 'GBP',
+                opening_balance_cents: 0,
+                closing_balance_cents: 4200,
+              },
+            ],
+            transactions: [
+              {
+                account_ref_masked: 'INV-01',
+                currency: 'EUR',
+                booking_date: '2021-06-15',
+                value_date: null,
+                raw_label: 'Stock dividend',
+                clean_label: 'Stock dividend',
+                amount_cents: 500,
+                statement_fx_rate_micro: null,
+              },
+              {
+                account_ref_masked: 'GBP-01',
+                currency: 'GBP',
+                booking_date: '2021-06-16',
+                value_date: null,
+                raw_label: 'London Tube',
+                clean_label: 'TfL',
+                amount_cents: -320,
+                statement_fx_rate_micro: null,
+              },
+            ],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true as const,
+          rawJsonText: JSON.stringify({
+            statement_period_start: '2021-01-01',
+            statement_period_end: '2021-12-31',
+            accounts: [
+              {
+                detected_name: 'Revolut GBP Only',
+                external_ref_masked: 'GBP-01',
+                account_type: 'multi_devises',
+                currency: 'GBP',
+                opening_balance_cents: 0,
+                closing_balance_cents: 100,
+              },
+            ],
+            transactions: [
+              {
+                account_ref_masked: 'GBP-01',
+                currency: 'GBP',
+                booking_date: '2021-12-01',
+                value_date: null,
+                raw_label: 'Pret A Manger',
+                clean_label: 'Pret A Manger',
+                amount_cents: -450,
+                statement_fx_rate_micro: null,
+              },
+            ],
+          }),
+        }),
+    };
+
+    const lot1 = await extractBatchWithFallback({
+      client: revolutMixedClient,
+      bank: 'revolut',
+      fileName: 'account-statement_2021-01-01_2021-12-31_fr-fr_2a7eb1.pdf',
+      inferredAccountType: 'multi_devises',
+      inferredCurrency: 'EUR',
+      batch: {
+        batchIndex: 0,
+        totalBatches: 2,
+        pageStart: 1,
+        pageEnd: 4,
+        text: 'EUR + Trading + GBP',
+        charCount: 19,
+      },
+    });
+
+    expect(lot1.extraction.accounts).toHaveLength(2);
+    expect(lot1.extraction.accounts[1]?.account_type).toBe('autre');
+    expect(lot1.extraction.transactions).toHaveLength(1);
+    expect(lot1.extraction.transactions[0]?.currency).toBe('EUR');
+
+    // Lot 2 contained only GBP -> normalized cleanly to empty multi-batch slice without failing
+    const lot2 = await extractBatchWithFallback({
+      client: revolutMixedClient,
+      bank: 'revolut',
+      fileName: 'account-statement_2021-01-01_2021-12-31_fr-fr_2a7eb1.pdf',
+      inferredAccountType: 'multi_devises',
+      inferredCurrency: 'EUR',
+      batch: {
+        batchIndex: 1,
+        totalBatches: 2,
+        pageStart: 5,
+        pageEnd: 8,
+        text: 'GBP only page',
+        charCount: 13,
+      },
+    });
+    expect(lot2.extraction.accounts).toHaveLength(0);
+    expect(lot2.extraction.transactions).toHaveLength(0);
+
+    const merged = mergeBatchExtractions([
+      { batchIndex: 0, pageStart: 1, pageEnd: 4, extraction: lot1.extraction },
+      { batchIndex: 1, pageStart: 5, pageEnd: 8, extraction: lot2.extraction },
+    ]);
+    expect(merged.accounts).toHaveLength(2);
+    expect(merged.transactions).toHaveLength(1);
   });
 });
