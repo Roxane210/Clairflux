@@ -207,11 +207,11 @@ export const driveFiles = pgTable(
     check('chk_drive_files_file_size_non_negative', sql`file_size_bytes >= 0`),
     check(
       'chk_drive_files_exclusive_folders',
-      sql`drive_folder_id IN ('1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus', '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h')`,
+      sql`drive_folder_id IN ('1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h', '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus')`,
     ),
     check(
       'chk_drive_files_folder_bank_match',
-      sql`(drive_folder_id = '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus' AND bank = 'boursobank') OR (drive_folder_id = '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h' AND bank = 'revolut')`,
+      sql`(drive_folder_id = '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h' AND bank = 'boursobank') OR (drive_folder_id = '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus' AND bank = 'revolut')`,
     ),
     index('idx_drive_files_folder_missing').on(t.driveFolderId, t.isMissingOnDrive),
     index('idx_drive_files_revision').on(t.revision),

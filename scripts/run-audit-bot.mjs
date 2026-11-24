@@ -12,8 +12,8 @@ import { fileURLToPath } from 'node:url';
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = resolve(SCRIPT_DIR, '..');
 
-const EXPECTED_BOURSO_FOLDER = '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus';
-const EXPECTED_REVOLUT_FOLDER = '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h';
+const EXPECTED_BOURSO_FOLDER = '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h';
+const EXPECTED_REVOLUT_FOLDER = '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus';
 
 const SECRET_PATTERNS = [
   'DATABASE_URL',

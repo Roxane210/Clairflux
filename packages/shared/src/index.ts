@@ -152,8 +152,8 @@ export const ApiErrorCodeSchema = z.enum([
 export type ApiErrorCode = z.infer<typeof ApiErrorCodeSchema>;
 
 export const ALLOWED_DRIVE_FOLDERS = {
-  boursobank: '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus',
-  revolut: '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h',
+  boursobank: '1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h',
+  revolut: '1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus',
 } as const satisfies Record<Bank, string>;
 
 export type AllowedDriveFolderId =

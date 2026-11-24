@@ -69,8 +69,8 @@ services:
       GOOGLE_DRIVE_ACCESS_TOKEN: ${GOOGLE_DRIVE_ACCESS_TOKEN:-}
       GOOGLE_DRIVE_CREDENTIALS_PATH: ${GOOGLE_DRIVE_CREDENTIALS_PATH:-/run/secrets/google_drive_credentials.json}
       INTERNAL_WORKER_TOKEN: ${INTERNAL_WORKER_TOKEN:?INTERNAL_WORKER_TOKEN is required}
-      ALLOWED_DRIVE_FOLDER_BOURSOBANK: 1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus
-      ALLOWED_DRIVE_FOLDER_REVOLUT: 1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h
+      ALLOWED_DRIVE_FOLDER_BOURSOBANK: 1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h
+      ALLOWED_DRIVE_FOLDER_REVOLUT: 1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus
     volumes:
       - ${GOOGLE_DRIVE_CREDENTIALS_HOST_PATH:-./secrets/google_drive_credentials.json}:/run/secrets/google_drive_credentials.json:ro
     networks:
