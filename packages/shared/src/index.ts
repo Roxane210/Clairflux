@@ -166,7 +166,7 @@ export const AllowedDriveFolderIdSchema = z.enum([
 
 export const EUR_FX_RATE_MICRO: FxRateMicro = toFxRateMicro(1_000_000);
 export const CLAIRFLUX_DELTA_SCHEMA_VERSION = '1.0.0' as const;
-export const CLAIRFLUX_BUILD_VERSION = '1.0.1-build.1' as const;
+export const CLAIRFLUX_BUILD_VERSION = '1.0.1-build.2' as const;
 
 export function isAllowedDriveFolderId(
   folderId: string,
