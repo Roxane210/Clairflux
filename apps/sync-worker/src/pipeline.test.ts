@@ -180,7 +180,7 @@ class InMemoryNeonCheckpointStore implements CheckpointStore {
     for (const cp of this.checkpointsById.values()) {
       if (cp.status === 'extracting' || cp.status === 'committing') {
         cp.status = 'failed';
-        cp.errorCode = null;
+        cp.errorCode = 'GEMINI_TIMEOUT';
         cp.errorMessage = reason;
       }
     }
@@ -1675,6 +1675,7 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
     expect(reconciled).toBe(1);
     expect(store.runs.get(runId)?.status).toBe('failed');
     expect(store.checkpointsById.get(cp.checkpointId)?.status).toBe('failed');
+    expect(store.checkpointsById.get(cp.checkpointId)?.errorCode).toBe('GEMINI_TIMEOUT');
     expect(store.checkpointsById.get(cp.checkpointId)?.errorMessage).toContain('redémarrage');
   });
 });

@@ -696,6 +696,26 @@ function isTextItemWithStr(
   );
 }
 
+const DEFAULT_PDF_PARSE_TIMEOUT_MS = 30_000;
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new PdfUnreadableError(`${label} (${timeoutMs} ms dépassés).`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 /**
  * Extracts per-page text from raw PDF bytes using `pdfjs-dist` (legacy Node build).
  */
@@ -712,12 +732,16 @@ export async function extractPdfPagesWithPdfjs(
     const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
     const loadingTask = pdfjs.getDocument({
       data: pdfBytes,
-      useSystemFonts: true,
+      useSystemFonts: false,
       disableFontFace: true,
       isEvalSupported: false,
       verbosity: 0,
     });
-    const doc = await loadingTask.promise;
+    const doc = await withTimeout(
+      loadingTask.promise,
+      DEFAULT_PDF_PARSE_TIMEOUT_MS,
+      'Délai dépassé lors de l’ouverture du PDF via pdfjs-dist',
+    );
     docToDestroy = doc;
 
     if (doc.numPages <= 0) {
@@ -726,8 +750,16 @@ export async function extractPdfPagesWithPdfjs(
 
     const pages: PdfPageText[] = [];
     for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
-      const page = await doc.getPage(pageNumber);
-      const content = await page.getTextContent();
+      const page = await withTimeout(
+        doc.getPage(pageNumber),
+        DEFAULT_PDF_PARSE_TIMEOUT_MS,
+        `Délai dépassé sur la page ${pageNumber} du PDF`,
+      );
+      const content = await withTimeout(
+        page.getTextContent(),
+        DEFAULT_PDF_PARSE_TIMEOUT_MS,
+        `Délai dépassé lors de l’extraction texte page ${pageNumber}`,
+      );
       const parts: string[] = [];
 
       for (const item of content.items) {
@@ -770,7 +802,7 @@ export async function extractPdfPagesWithPdfjs(
 // ============================================================================
 
 const TRANSACTION_OR_BALANCE_GUARD_PATTERN =
-  /(?:\b\d{2}[/.]\d{2}(?:[/.]\d{2,4})?\b|\b\d{4}-\d{2}-\d{2}\b).*(?:[+-]?\d[\d\s.,]*\d\s*(?:€|\$|EUR|USD)|solde|balance)/iu;
+  /(?:\b\d{2}[/.]\d{2}(?:[/.]\d{2,4})?\b|\b\d{4}-\d{2}-\d{2}\b)[^\r\n]{0,180}(?:[+-]?\d[\d\s.,]{0,24}\d\s*(?:€|\$|EUR|USD)|solde|balance)/iu;
 
 const BOILERPLATE_LINE_PATTERNS: readonly RegExp[] = [
   /^page\s+\d+(?:\s*(?:\/|sur|of)\s*\d+)?$/iu,

@@ -1478,6 +1478,9 @@ export class NeonCheckpointStore implements CheckpointStore {
     const sqlClient = neon(validatedUrl);
     this.httpDb = drizzleHttp(sqlClient, { schema: workerSchema });
     this.pool = new Pool({ connectionString: validatedUrl });
+    this.pool.on('error', (err: unknown) => {
+      console.error('[sync-worker] Erreur Neon Pool (non bloquante):', err);
+    });
     this.poolDb = drizzleServerless(this.pool, { schema: workerSchema });
   }
 
@@ -1554,7 +1557,7 @@ export class NeonCheckpointStore implements CheckpointStore {
       .update(pdfIngestionCheckpointsTable)
       .set({
         status: 'failed',
-        errorCode: null,
+        errorCode: 'GEMINI_TIMEOUT',
         errorMessage: reason,
         updatedAt: now,
       })
@@ -2274,6 +2277,9 @@ export async function runIngestionPipeline(
             driveFileId: file.driveFileId,
             driveFolderId: file.driveFolderId,
           });
+          console.info(
+            `[sync-worker] PDF téléchargé (${file.fileName}): ${pdfBytes.byteLength} o, extraction texte pdfjs...`,
+          );
 
           const prepared = await prepareDrivePdfBatches({
             file,
@@ -2716,6 +2722,7 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
     })
     .catch((err: unknown) => {
       console.error('[sync-worker] Échec réconciliation des runs orphelins au démarrage:', err);
+      console.info(`[sync-worker] Prêt sur le port ${env.PORT} (réconciliation échouée).`);
       return 0;
     });
 
@@ -2789,7 +2796,8 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
     await store.close();
   };
 
-  const handleSignal = (): void => {
+  const handleSignal = (signal: NodeJS.Signals): void => {
+    console.info(`[sync-worker] Signal ${signal} reçu, arrêt gracieux...`);
     void close().finally(() => {
       process.exit(0);
     });
@@ -2797,6 +2805,12 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
 
   process.once('SIGTERM', handleSignal);
   process.once('SIGINT', handleSignal);
+  process.on('uncaughtException', (err: Error) => {
+    console.error('[sync-worker] uncaughtException fatale:', err);
+  });
+  process.on('unhandledRejection', (reason: unknown) => {
+    console.error('[sync-worker] unhandledRejection détectée:', reason);
+  });
 
   return { close };
 }
