@@ -9,8 +9,8 @@ COPY apps/sync-worker/package.json ./apps/sync-worker/package.json
 COPY apps/api/package.json ./apps/api/package.json
 COPY apps/web/package.json ./apps/web/package.json
 
-RUN npm ci --omit=dev --ignore-scripts --workspace=@clairflux/sync-worker --workspace=@clairflux/shared --include-workspace-root \
-    || npm install --omit=dev --ignore-scripts --no-audit --no-fund --workspace=@clairflux/sync-worker --workspace=@clairflux/shared --include-workspace-root \
+RUN npm ci --omit=dev --omit=optional --ignore-scripts --workspace=@clairflux/sync-worker --workspace=@clairflux/shared --include-workspace-root \
+    || npm install --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund --workspace=@clairflux/sync-worker --workspace=@clairflux/shared --include-workspace-root \
   && npm cache clean --force
 
 FROM node:22-alpine AS runner
