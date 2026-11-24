@@ -80,7 +80,7 @@ export const GEMINI_FALLBACK_MODELS = [
 
 export type GeminiModelName = (typeof GEMINI_FALLBACK_MODELS)[number];
 
-const DEFAULT_GEMINI_TIMEOUT_MS = 90_000;
+const DEFAULT_GEMINI_TIMEOUT_MS = 120_000;
 const MS_PER_DAY = 86_400_000;
 const SAME_CURRENCY_TRANSFER_MAX_DAYS = 3;
 const REVOLUT_FX_TRANSFER_MAX_DAYS = 1;
@@ -504,10 +504,10 @@ export function buildStatementExtractionPrompt(input: {
     `Type de compte pressenti: ${input.inferredAccountType}`,
     `Devise pressentie: ${input.inferredCurrency}`,
     `Lot ${input.batch.batchIndex + 1}/${input.batch.totalBatches} (pages ${input.batch.pageStart}-${input.batch.pageEnd})`,
-    'Retourne UNIQUEMENT un JSON valide respectant :',
+    'Retourne UNIQUEMENT un objet JSON unique (jamais un tableau racine) respectant :',
     '- statement_period_start, statement_period_end (YYYY-MM-DD)',
-    '- accounts: [{ detected_name, external_ref_masked, account_type, currency (EUR|USD), opening_balance_cents (entier), closing_balance_cents (entier) }]',
-    '- transactions: [{ account_ref_masked, currency (EUR|USD), booking_date (YYYY-MM-DD), value_date (YYYY-MM-DD|null), raw_label, clean_label, amount_cents (entier signe non nul, jamais de float), statement_fx_rate_micro (entier positif|null) }]',
+    '- accounts: [{ detected_name, external_ref_masked (chaîne non nulle, ex. "****4709" avec exactement 4 astérisques ou identifiant court si absent), account_type, currency (EUR|USD), opening_balance_cents (entier|null), closing_balance_cents (entier) }]',
+    '- transactions: [{ account_ref_masked (doit correspondre exactement à accounts[].external_ref_masked), currency (EUR|USD), booking_date (YYYY-MM-DD), value_date (YYYY-MM-DD|null), raw_label, clean_label, amount_cents (entier signe non nul, jamais de float), statement_fx_rate_micro (entier positif|null) }]',
     'INTERDICTION ABSOLUE de retourner des nombres décimaux (floats) pour les montants.',
     '',
     input.batch.text,
@@ -522,6 +522,111 @@ export interface BatchExtractionResult {
     readonly errorCode?: GeminiCallErrorCode | undefined;
     readonly message?: string | undefined;
   }>;
+}
+
+function normalizeMaskedAccountRef(rawRef: string): string {
+  const trimmed = rawRef.trim();
+  const collapsedStars = trimmed.replace(/\*{2,}/gu, '****');
+  return collapsedStars.slice(0, 64);
+}
+
+function normalizeGeminiStatementPayload(
+  rawJson: unknown,
+  context: {
+    readonly bank: Bank;
+    readonly inferredAccountType: AccountType;
+    readonly inferredCurrency: Currency;
+  },
+): unknown {
+  let candidate: unknown = rawJson;
+  if (Array.isArray(rawJson)) {
+    const objectItems = rawJson.filter((item): item is Record<string, unknown> => isPlainRecord(item));
+    if (objectItems.length === 1) {
+      candidate = objectItems[0];
+    } else if (objectItems.length > 1) {
+      const firstItem = objectItems[0];
+      const mergedAccounts: unknown[] = [];
+      const mergedTransactions: unknown[] = [];
+      for (const item of objectItems) {
+        if (Array.isArray(item['accounts'])) {
+          mergedAccounts.push(...item['accounts']);
+        }
+        if (Array.isArray(item['transactions'])) {
+          mergedTransactions.push(...item['transactions']);
+        }
+      }
+      candidate = {
+        ...firstItem,
+        accounts: mergedAccounts,
+        transactions: mergedTransactions,
+      };
+    }
+  }
+
+  if (!isPlainRecord(candidate)) {
+    return candidate;
+  }
+
+  const refMapping = new Map<string, string>();
+  const rawAccounts = Array.isArray(candidate['accounts']) ? candidate['accounts'] : [];
+  const normalizedAccounts = rawAccounts.map((acc) => {
+    if (!isPlainRecord(acc)) {
+      return acc;
+    }
+    const accType =
+      typeof acc['account_type'] === 'string' && acc['account_type'].trim().length > 0
+        ? acc['account_type'].trim()
+        : context.inferredAccountType;
+    const accCurrency =
+      typeof acc['currency'] === 'string' && acc['currency'].trim().length > 0
+        ? acc['currency'].trim().toUpperCase()
+        : context.inferredCurrency;
+
+    const rawRef =
+      typeof acc['external_ref_masked'] === 'string' ? acc['external_ref_masked'].trim() : '';
+    const fallbackRef = `${context.bank.toUpperCase()}-${accType.toUpperCase()}-${accCurrency}`;
+    const normalizedRef = rawRef.length > 0 ? normalizeMaskedAccountRef(rawRef) : fallbackRef;
+
+    if (rawRef.length > 0) {
+      refMapping.set(rawRef, normalizedRef);
+    }
+
+    return {
+      ...acc,
+      external_ref_masked: normalizedRef,
+    };
+  });
+
+  const defaultAccountRef =
+    normalizedAccounts.length === 1 &&
+    isPlainRecord(normalizedAccounts[0]) &&
+    typeof normalizedAccounts[0]['external_ref_masked'] === 'string'
+      ? normalizedAccounts[0]['external_ref_masked']
+      : `${context.bank.toUpperCase()}-${context.inferredAccountType.toUpperCase()}-${context.inferredCurrency}`;
+
+  const rawTransactions = Array.isArray(candidate['transactions']) ? candidate['transactions'] : [];
+  const normalizedTransactions = rawTransactions.map((tx) => {
+    if (!isPlainRecord(tx)) {
+      return tx;
+    }
+    const rawTxRef =
+      typeof tx['account_ref_masked'] === 'string' ? tx['account_ref_masked'].trim() : '';
+    const mappedRef =
+      rawTxRef.length === 0
+        ? defaultAccountRef
+        : refMapping.get(rawTxRef) ?? normalizeMaskedAccountRef(rawTxRef);
+
+    return {
+      ...tx,
+      account_ref_masked: mappedRef,
+    };
+  });
+
+  return {
+    ...candidate,
+    accounts: normalizedAccounts,
+    transactions: normalizedTransactions,
+  };
 }
 
 export async function extractBatchWithFallback(input: {
@@ -586,13 +691,22 @@ export async function extractBatchWithFallback(input: {
       continue;
     }
 
-    const validated = GeminiStatementExtractionSchema.safeParse(parsedJson);
+    const normalizedJson = normalizeGeminiStatementPayload(parsedJson, {
+      bank: input.bank,
+      inferredAccountType: input.inferredAccountType,
+      inferredCurrency: input.inferredCurrency,
+    });
+    const validated = GeminiStatementExtractionSchema.safeParse(normalizedJson);
     if (!validated.success) {
       const firstIssue = validated.error.issues[0];
+      const issueMsg = `Validation Zod échouée (${model}) : ${firstIssue?.path.join('.') ?? 'root'} - ${firstIssue?.message ?? 'invalid'}`;
+      console.warn(
+        `[sync-worker] Gemini ${model} lot ${input.batch.batchIndex + 1}/${input.batch.totalBatches} (${input.fileName}): ${issueMsg}`,
+      );
       attempts.push({
         model,
         errorCode: 'GEMINI_SCHEMA_INVALID',
-        message: `Validation Zod échouée (${model}) : ${firstIssue?.path.join('.') ?? 'root'} - ${firstIssue?.message ?? 'invalid'}`,
+        message: issueMsg,
       });
       continue;
     }

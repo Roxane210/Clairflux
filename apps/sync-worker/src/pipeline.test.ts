@@ -23,6 +23,7 @@ import {
   extractPdfPagesInSubprocess,
   extractPdfPagesWithPdfjs,
   inferAccountMetadata,
+  parseSubprocessPdfStdout,
   splitPagesIntoBatches,
   stripBankingBoilerplate,
   type DiscoveredDrivePdf,
@@ -1794,5 +1795,79 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
     await expect(
       extractPdfPagesInSubprocess(new Uint8Array([1, 2, 3, 4])),
     ).rejects.toThrowError();
+  });
+
+  it('normalise les réponses Gemini en tableau, external_ref_masked null et masques d astérisques variables', async () => {
+    const arrayAndNullRefClient: GeminiModelClient = {
+      generateStructuredStatement: vi.fn(async () => ({
+        ok: true as const,
+        rawJsonText: JSON.stringify([
+          {
+            statement_period_start: '2026-08-01',
+            statement_period_end: '2026-08-31',
+            accounts: [
+              {
+                detected_name: 'Compte courant BoursoBank',
+                external_ref_masked: '*******4709',
+                account_type: 'courant',
+                currency: 'EUR',
+                opening_balance_cents: 10000,
+                closing_balance_cents: 9500,
+              },
+              {
+                detected_name: 'Poche Epargne',
+                external_ref_masked: null,
+                account_type: 'epargne',
+                currency: 'EUR',
+                opening_balance_cents: null,
+                closing_balance_cents: 50000,
+              },
+            ],
+            transactions: [
+              {
+                account_ref_masked: '*******4709',
+                currency: 'EUR',
+                booking_date: '2026-08-10',
+                value_date: '2026-08-10',
+                raw_label: 'CB PAIN',
+                clean_label: 'Boulangerie',
+                amount_cents: -500,
+                statement_fx_rate_micro: null,
+              },
+            ],
+          },
+        ]),
+      })),
+    };
+
+    const extracted = await extractBatchWithFallback({
+      client: arrayAndNullRefClient,
+      bank: 'boursobank',
+      fileName: 'Releve.pdf',
+      inferredAccountType: 'courant',
+      inferredCurrency: 'EUR',
+      batch: {
+        batchIndex: 0,
+        totalBatches: 1,
+        pageStart: 1,
+        pageEnd: 1,
+        text: '10/08/2026 CB PAIN -5,00 EUR',
+        charCount: 28,
+      },
+    });
+
+    expect(extracted.extraction.accounts[0]?.external_ref_masked).toBe('****4709');
+    expect(extracted.extraction.accounts[1]?.external_ref_masked).toBeTruthy();
+    expect(extracted.extraction.transactions[0]?.account_ref_masked).toBe('****4709');
+
+    const pollutedStdout = [
+      'Warning: Cannot polyfill `DOMMatrix`, rendering may be broken.',
+      '__CLAIRFLUX_PDFJS_JSON_START__',
+      JSON.stringify([{ pageNumber: 1, rawText: 'Revolut EUR' }]),
+      '__CLAIRFLUX_PDFJS_JSON_END__',
+    ].join('\n');
+    expect(parseSubprocessPdfStdout(pollutedStdout)).toEqual([
+      { pageNumber: 1, rawText: 'Revolut EUR' },
+    ]);
   });
 });

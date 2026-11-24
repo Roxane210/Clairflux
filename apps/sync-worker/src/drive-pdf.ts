@@ -805,8 +805,14 @@ const SubprocessPdfPagesSchema = z.array(
   }),
 );
 
+const PDFJS_JSON_START_MARKER = '__CLAIRFLUX_PDFJS_JSON_START__';
+const PDFJS_JSON_END_MARKER = '__CLAIRFLUX_PDFJS_JSON_END__';
+
 const PDFJS_SUBPROCESS_SCRIPT = `
-import { pathToFileURL } from 'node:url';
+const forwardToStderr = (...args) => console.error(...args);
+console.log = forwardToStderr;
+console.info = forwardToStderr;
+console.warn = forwardToStderr;
 const chunks = [];
 for await (const chunk of process.stdin) {
   chunks.push(chunk);
@@ -843,13 +849,29 @@ try {
     const rawText = parts.join('').replace(/[ \\t]+\\n/gu, '\\n').replace(/\\n{3,}/gu, '\\n\\n').trim();
     pages.push({ pageNumber, rawText });
   }
-  process.stdout.write(JSON.stringify(pages));
+  process.stdout.write('${PDFJS_JSON_START_MARKER}\\n' + JSON.stringify(pages) + '\\n${PDFJS_JSON_END_MARKER}');
 } finally {
   await doc.destroy().catch(() => undefined);
 }
 `;
 
-const DEFAULT_SUBPROCESS_PDF_TIMEOUT_MS = 20_000;
+const DEFAULT_SUBPROCESS_PDF_TIMEOUT_MS = 45_000;
+
+export function parseSubprocessPdfStdout(rawStdout: string): readonly PdfPageText[] {
+  const startIdx = rawStdout.indexOf(PDFJS_JSON_START_MARKER);
+  const endIdx = rawStdout.lastIndexOf(PDFJS_JSON_END_MARKER);
+  const jsonPayload =
+    startIdx !== -1 && endIdx > startIdx
+      ? rawStdout.slice(startIdx + PDFJS_JSON_START_MARKER.length, endIdx).trim()
+      : rawStdout.trim();
+
+  const rawJson: unknown = JSON.parse(jsonPayload);
+  const parsed = SubprocessPdfPagesSchema.safeParse(rawJson);
+  if (!parsed.success) {
+    throw new PdfUnreadableError('Sortie JSON pdfjs invalide.');
+  }
+  return parsed.data;
+}
 
 /**
  * Runs `pdfjs-dist` in an isolated Node subprocess with bounded heap (`256 MB`)
@@ -918,14 +940,12 @@ export async function extractPdfPagesInSubprocess(
       }
 
       try {
-        const rawJson: unknown = JSON.parse(Buffer.concat(stdoutChunks).toString('utf8'));
-        const parsed = SubprocessPdfPagesSchema.safeParse(rawJson);
-        if (!parsed.success) {
-          reject(new PdfUnreadableError('Sortie JSON pdfjs invalide.'));
+        resolve(parseSubprocessPdfStdout(Buffer.concat(stdoutChunks).toString('utf8')));
+      } catch (err) {
+        if (err instanceof PdfUnreadableError) {
+          reject(err);
           return;
         }
-        resolve(parsed.data);
-      } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         reject(new PdfUnreadableError(`Erreur de parsing sortie pdfjs : ${msg}`));
       }
