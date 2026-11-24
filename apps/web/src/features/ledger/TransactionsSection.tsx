@@ -12,8 +12,10 @@ import { memo, useCallback, useDeferredValue, useMemo, useState, type ReactEleme
 import {
   ACCOUNT_TYPE_LABELS,
   BANK_LABELS,
+  isTransactionInBounds,
   type CurrencyViewMode,
   type DashboardBankFilter,
+  type ResolvedDateBounds,
   type TransactionsSubTab,
 } from '../dashboard/types';
 import { exportTransactionsToCsv } from './csvExport';
@@ -28,6 +30,7 @@ export interface TransactionsSectionProps {
   readonly onChangeSubTab: (subTab: TransactionsSubTab) => void;
   readonly currencyMode: CurrencyViewMode;
   readonly bankFilter: DashboardBankFilter;
+  readonly dateBounds?: ResolvedDateBounds | undefined;
   readonly isOnline: boolean;
   readonly rulePrefillPattern: string;
   readonly onSelectTransaction: (transactionId: TransactionId) => void;
@@ -56,6 +59,7 @@ export const TransactionsSection = memo(function TransactionsSection({
   onChangeSubTab,
   currencyMode,
   bankFilter,
+  dateBounds,
   isOnline,
   rulePrefillPattern,
   onSelectTransaction,
@@ -76,6 +80,7 @@ export const TransactionsSection = memo(function TransactionsSection({
     return transactions.filter((tx) => {
       if (bankFilter !== 'all' && tx.bank !== bankFilter) return false;
       if (currencyMode === 'usd_only' && tx.currency !== 'USD') return false;
+      if (dateBounds !== undefined && !isTransactionInBounds(tx, dateBounds)) return false;
       const note = notesByTxId.get(tx.id);
       if (onlyWithNotes && !note) return false;
       if (query.length === 0) return true;
@@ -89,7 +94,7 @@ export const TransactionsSection = memo(function TransactionsSection({
         (note?.content.toLowerCase().includes(query) ?? false)
       );
     });
-  }, [transactions, bankFilter, currencyMode, onlyWithNotes, deferredSearch, notesByTxId, accountsById]);
+  }, [transactions, bankFilter, currencyMode, dateBounds, onlyWithNotes, deferredSearch, notesByTxId, accountsById]);
 
   const handleExportCsv = useCallback((): void => {
     const csv = exportTransactionsToCsv(filteredTransactions, accounts, notes);
@@ -113,6 +118,7 @@ export const TransactionsSection = memo(function TransactionsSection({
           </h2>
           <p className="tabular-amount" style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
             {filteredTransactions.length} opération(s) affichée(s)
+            {dateBounds !== undefined ? ` · ${dateBounds.label}` : ''}
           </p>
         </div>
         <div className="cf-scope-bar" role="group" aria-label="Sous-onglets du grand livre">

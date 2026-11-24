@@ -21,6 +21,17 @@ import {
   type TransactionNote,
 } from '@clairflux/shared';
 import { useEffect, useState } from 'react';
+import {
+  addDaysIso,
+  addMonthsClampedIso,
+  addMonthsToYm,
+  enumerateDaySlots,
+  enumerateMonthSlots,
+  isTransactionInBounds,
+  type ResolvedDateBounds,
+} from './periodFilter';
+
+export * from './periodFilter';
 
 // ============================================================================
 // Shared UI Contracts (Dashboard, Ledger, Offline Store)
@@ -207,6 +218,7 @@ export function computeKpiMetrics(
   transactions: readonly Transaction[],
   bankFilter: DashboardBankFilter,
   currencyMode: CurrencyViewMode,
+  dateBounds?: ResolvedDateBounds,
 ): KpiMetricsSummary {
   const displayCurrency: Currency = currencyMode === 'usd_only' ? 'USD' : 'EUR';
   const latestMonth = MONTH_WINDOW[MONTH_WINDOW.length - 1]?.month ?? '2026-11';
@@ -233,7 +245,11 @@ export function computeKpiMetrics(
     if (!matchesDashboardScope(tx, bankFilter, currencyMode)) {
       continue;
     }
-    if (!tx.booking_date.startsWith(latestMonth)) {
+    if (dateBounds !== undefined) {
+      if (!isTransactionInBounds(tx, dateBounds)) {
+        continue;
+      }
+    } else if (!tx.booking_date.startsWith(latestMonth)) {
       continue;
     }
     const value = getTxDisplayCents(tx, currencyMode);
@@ -260,6 +276,7 @@ export function buildCumulativeBalanceSeries(
   transactions: readonly Transaction[],
   bankFilter: DashboardBankFilter,
   currencyMode: CurrencyViewMode,
+  dateBounds?: ResolvedDateBounds,
 ): readonly CumulativeBalancePoint[] {
   let closingBalance = 0;
   for (const acc of accounts) {
@@ -273,6 +290,52 @@ export function buildCumulativeBalanceSeries(
       currencyMode === 'usd_only'
         ? acc.current_balance_cents
         : acc.current_balance_eur_cents;
+  }
+
+  if (dateBounds !== undefined) {
+    let postPeriodNet = 0;
+    const netBySlot = new Map<string, number>();
+
+    for (const tx of transactions) {
+      if (!matchesDashboardScope(tx, bankFilter, currencyMode)) {
+        continue;
+      }
+      const value = getTxDisplayCents(tx, currencyMode);
+      if (tx.booking_date > dateBounds.to) {
+        postPeriodNet += value;
+        continue;
+      }
+      const key =
+        dateBounds.granularity === 'day'
+          ? tx.booking_date
+          : tx.booking_date.slice(0, 7);
+      netBySlot.set(key, (netBySlot.get(key) ?? 0) + value);
+    }
+
+    const slots =
+      dateBounds.granularity === 'day'
+        ? enumerateDaySlots(dateBounds.from, dateBounds.to)
+        : enumerateMonthSlots(dateBounds.from, dateBounds.to);
+
+    const points: CumulativeBalancePoint[] = new Array<CumulativeBalancePoint>(slots.length);
+    let runningClosing = closingBalance - postPeriodNet;
+
+    for (let idx = slots.length - 1; idx >= 0; idx -= 1) {
+      const slot = slots[idx];
+      if (!slot) {
+        continue;
+      }
+      const slotNet = netBySlot.get(slot.key) ?? 0;
+      points[idx] = {
+        month: slot.key,
+        label: slot.label,
+        closing_balance_cents: toCents(runningClosing),
+        net_change_cents: toCents(slotNet),
+      };
+      runningClosing -= slotNet;
+    }
+
+    return points;
   }
 
   const netByMonth = new Map<string, number>();
@@ -310,7 +373,93 @@ export function buildMonthlyExpenseSeries(
   transactions: readonly Transaction[],
   bankFilter: DashboardBankFilter,
   currencyMode: CurrencyViewMode,
+  dateBounds?: ResolvedDateBounds,
 ): readonly MonthlyExpensePoint[] {
+  if (dateBounds !== undefined) {
+    if (dateBounds.granularity === 'day') {
+      const expensesByDay = new Map<string, number>();
+      for (const tx of transactions) {
+        if (!matchesDashboardScope(tx, bankFilter, currencyMode)) {
+          continue;
+        }
+        if (tx.is_internal_transfer) {
+          continue;
+        }
+        const value = getTxDisplayCents(tx, currencyMode);
+        if (value >= 0) {
+          continue;
+        }
+        expensesByDay.set(
+          tx.booking_date,
+          (expensesByDay.get(tx.booking_date) ?? 0) + Math.abs(value),
+        );
+      }
+
+      const slots = enumerateDaySlots(dateBounds.from, dateBounds.to);
+      const useWeeklyLookback = dateBounds.daySpan <= 7;
+
+      return slots.map((slot) => {
+        const currentAmount = expensesByDay.get(slot.key) ?? 0;
+        const prevKey = useWeeklyLookback
+          ? addDaysIso(slot.key, -7)
+          : addMonthsClampedIso(slot.key, -1);
+        const prevAmount = expensesByDay.get(prevKey) ?? 0;
+
+        let avgSum = 0;
+        for (let step = 1; step <= 3; step += 1) {
+          const histKey = useWeeklyLookback
+            ? addDaysIso(slot.key, -7 * step)
+            : addMonthsClampedIso(slot.key, -step);
+          avgSum += expensesByDay.get(histKey) ?? 0;
+        }
+        const avg3 = Math.round(avgSum / 3);
+
+        return {
+          month: slot.key,
+          label: slot.label,
+          amountCents: toCents(currentAmount),
+          prevMonthCents: toCents(prevAmount),
+          avg3mCents: toCents(avg3),
+        };
+      });
+    }
+
+    const expensesByMonth = new Map<string, number>();
+    for (const tx of transactions) {
+      if (!matchesDashboardScope(tx, bankFilter, currencyMode)) {
+        continue;
+      }
+      if (tx.is_internal_transfer || tx.booking_date > dateBounds.to) {
+        continue;
+      }
+      const value = getTxDisplayCents(tx, currencyMode);
+      if (value >= 0) {
+        continue;
+      }
+      const monthKey = tx.booking_date.slice(0, 7);
+      expensesByMonth.set(monthKey, (expensesByMonth.get(monthKey) ?? 0) + Math.abs(value));
+    }
+
+    const slots = enumerateMonthSlots(dateBounds.from, dateBounds.to);
+    return slots.map((slot) => {
+      const currentAmount = expensesByMonth.get(slot.key) ?? 0;
+      const prevAmount = expensesByMonth.get(addMonthsToYm(slot.key, -1)) ?? 0;
+      const avgSum =
+        (expensesByMonth.get(addMonthsToYm(slot.key, -1)) ?? 0) +
+        (expensesByMonth.get(addMonthsToYm(slot.key, -2)) ?? 0) +
+        (expensesByMonth.get(addMonthsToYm(slot.key, -3)) ?? 0);
+      const avg3m = Math.round(avgSum / 3);
+
+      return {
+        month: slot.key,
+        label: slot.label,
+        amountCents: toCents(currentAmount),
+        prevMonthCents: toCents(prevAmount),
+        avg3mCents: toCents(avg3m),
+      };
+    });
+  }
+
   const expensesByMonth = new Map<string, number>();
   for (const tx of transactions) {
     if (!matchesDashboardScope(tx, bankFilter, currencyMode)) {
@@ -927,6 +1076,17 @@ const INITIAL_DRIVE_FILES: readonly DriveSyncFileStatus[] = [
     updated_at: '2026-11-20T18:02:15.000Z',
   },
 ];
+
+export const EMPTY_LIVE_DATASET: ClairFluxDataset = {
+  accounts: [],
+  transactions: [],
+  notes: [],
+  rules: [],
+  budgets: [],
+  driveFiles: [],
+  revision: 0,
+  syncedAt: '',
+};
 
 export const INITIAL_SEED_DATASET: ClairFluxDataset = {
   accounts: INITIAL_ACCOUNTS,

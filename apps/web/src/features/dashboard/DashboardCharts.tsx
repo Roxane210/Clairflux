@@ -16,6 +16,7 @@ import {
   type CurrencyViewMode,
   type DashboardBankFilter,
   type ExpenseComparisonMode,
+  type ResolvedDateBounds,
 } from './types';
 
 export interface DashboardChartsProps {
@@ -24,9 +25,8 @@ export interface DashboardChartsProps {
   readonly bankFilter: DashboardBankFilter;
   readonly currencyMode: CurrencyViewMode;
   readonly comparisonMode: ExpenseComparisonMode;
+  readonly dateBounds: ResolvedDateBounds;
   readonly prefersReducedMotion: boolean;
-  readonly onChangeBankFilter: (filter: DashboardBankFilter) => void;
-  readonly onChangeCurrencyMode: (mode: CurrencyViewMode) => void;
   readonly onChangeComparisonMode: (mode: ExpenseComparisonMode) => void;
 }
 
@@ -81,20 +81,9 @@ const ChartTooltip = memo(function ChartTooltip({
   );
 });
 
-const BANK_OPTIONS: readonly { readonly value: DashboardBankFilter; readonly label: string }[] = [
-  { value: 'all', label: 'Tous les comptes' },
-  { value: 'boursobank', label: 'BoursoBank' },
-  { value: 'revolut', label: 'Revolut' },
-];
-
-const CURRENCY_OPTIONS: readonly { readonly value: CurrencyViewMode; readonly label: string }[] = [
-  { value: 'eur_consolidated', label: 'EUR consolidé' },
-  { value: 'usd_only', label: 'USD seul' },
-];
-
 const COMPARISON_OPTIONS: readonly { readonly value: ExpenseComparisonMode; readonly label: string }[] = [
   { value: 'none', label: 'Sans comparaison' },
-  { value: 'prev_month', label: 'Mois précédent (M-1)' },
+  { value: 'prev_month', label: 'Période préc. (M-1)' },
   { value: 'avg_3m', label: 'Moyenne 3 mois' },
 ];
 
@@ -112,21 +101,34 @@ export const DashboardCharts = memo(function DashboardCharts({
   bankFilter,
   currencyMode,
   comparisonMode,
+  dateBounds,
   prefersReducedMotion,
-  onChangeBankFilter,
-  onChangeCurrencyMode,
   onChangeComparisonMode,
 }: DashboardChartsProps): ReactElement {
   const displayCurrency: Currency = currencyMode === 'usd_only' ? 'USD' : 'EUR';
+  const isDaily = dateBounds.granularity === 'day';
 
   const balanceSeries = useMemo(
-    () => buildCumulativeBalanceSeries(accounts, transactions, bankFilter, currencyMode),
-    [accounts, transactions, bankFilter, currencyMode],
+    () =>
+      buildCumulativeBalanceSeries(
+        accounts,
+        transactions,
+        bankFilter,
+        currencyMode,
+        dateBounds,
+      ),
+    [accounts, transactions, bankFilter, currencyMode, dateBounds],
   );
 
   const expenseSeries = useMemo(
-    () => buildMonthlyExpenseSeries(transactions, bankFilter, currencyMode),
-    [transactions, bankFilter, currencyMode],
+    () =>
+      buildMonthlyExpenseSeries(
+        transactions,
+        bankFilter,
+        currencyMode,
+        dateBounds,
+      ),
+    [transactions, bankFilter, currencyMode, dateBounds],
   );
 
   const formatAxisMoney = useCallback(
@@ -147,42 +149,14 @@ export const DashboardCharts = memo(function DashboardCharts({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-      <div className="cf-chart-controls" role="region" aria-label="Filtres des graphiques">
-        <div className="cf-scope-bar" role="group" aria-label="Périmètre bancaire">
-          {BANK_OPTIONS.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              className="cf-pill-btn"
-              aria-pressed={bankFilter === opt.value}
-              onClick={() => onChangeBankFilter(opt.value)}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-
-        <div className="cf-scope-bar" role="group" aria-label="Affichage de devise">
-          {CURRENCY_OPTIONS.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              className="cf-pill-btn"
-              aria-pressed={currencyMode === opt.value}
-              onClick={() => onChangeCurrencyMode(opt.value)}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
       <div className="cf-charts-container">
         <div className="cf-charts-grid">
           <section className="cf-surface cf-chart-card" aria-labelledby="chart-balance-title">
             <div className="cf-chart-controls">
               <h2 id="chart-balance-title" style={{ fontSize: '1rem' }}>
-                Solde bancaire cumulé 6M ({displayCurrency})
+                {isDaily
+                  ? `Solde bancaire cumulé — jour par jour (${displayCurrency})`
+                  : `Solde bancaire cumulé (${displayCurrency})`}
               </h2>
               <span style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
                 {currencyMode === 'usd_only' ? 'Natifs USD uniquement' : 'Taux historique figé'}
@@ -218,7 +192,9 @@ export const DashboardCharts = memo(function DashboardCharts({
           <section className="cf-surface cf-chart-card" aria-labelledby="chart-expenses-title">
             <div className="cf-chart-controls">
               <h2 id="chart-expenses-title" style={{ fontSize: '1rem' }}>
-                Dépenses mensuelles ({displayCurrency})
+                {isDaily
+                  ? `Dépenses quotidiennes (${displayCurrency})`
+                  : `Dépenses mensuelles (${displayCurrency})`}
               </h2>
               <span style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
                 Hors transferts internes
@@ -254,7 +230,7 @@ export const DashboardCharts = memo(function DashboardCharts({
                   <Area
                     type="monotone"
                     dataKey="amountCents"
-                    name="Dépenses du mois"
+                    name={isDaily ? 'Dépenses du jour' : 'Dépenses du mois'}
                     stroke="#b42318"
                     fill="#fef3f2"
                     fillOpacity={0.75}
@@ -265,7 +241,7 @@ export const DashboardCharts = memo(function DashboardCharts({
                     <Area
                       type="monotone"
                       dataKey="prevMonthCents"
-                      name="Mois précédent (M-1)"
+                      name="Période précédente (M-1)"
                       stroke="#64748b"
                       fill="#64748b"
                       fillOpacity={0.14}
@@ -304,7 +280,7 @@ export const DashboardCharts = memo(function DashboardCharts({
                 }}
               >
                 <span style={{ color: 'var(--text-secondary)' }}>
-                  Dernier mois ({latestExpensePoint.label}) :{' '}
+                  {isDaily ? 'Dernier jour' : 'Dernier mois'} ({latestExpensePoint.label}) :{' '}
                   <strong className="tabular-amount" style={{ color: 'var(--text-primary)' }}>
                     {formatMoney(latestExpensePoint.amountCents, displayCurrency)}
                   </strong>

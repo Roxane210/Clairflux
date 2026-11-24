@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useState, type ReactElement } from 'react
 import { z } from 'zod';
 import { buildApiEndpointUrl } from '../../offline/apiUrl';
 import type { FetchLike } from '../../offline/deltaSyncEngine';
+import { createAuthAwareFetcher } from '../auth/authClient';
 
 // ============================================================================
 // Zod Schema & Discriminated State Union
@@ -30,6 +31,7 @@ export interface ResolveApkStatusOptions {
   readonly apiBaseUrl?: string | undefined;
   readonly fetcher?: FetchLike | undefined;
   readonly signal?: AbortSignal | undefined;
+  readonly onUnauthorized?: (() => void) | undefined;
 }
 
 // ============================================================================
@@ -102,7 +104,7 @@ export async function resolveApkCardState(
     return { kind: 'offline' };
   }
 
-  const fetcher = options.fetcher ?? defaultFetch;
+  const fetcher = options.fetcher ?? createAuthAwareFetcher(defaultFetch);
   const url = buildApkStatusUrl(options.apiBaseUrl);
 
   let response: Response;
@@ -137,6 +139,9 @@ export async function resolveApkCardState(
   }
 
   if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
+      options.onUnauthorized?.();
+    }
     return {
       kind: 'error',
       message: `Authentification requise pour consulter le statut APK (HTTP ${response.status}).`,
@@ -254,12 +259,14 @@ export interface ApkDownloadCardProps {
   readonly isOnline: boolean;
   readonly apiBaseUrl?: string | undefined;
   readonly fetcher?: FetchLike | undefined;
+  readonly onUnauthorized?: (() => void) | undefined;
 }
 
 export const ApkDownloadCard = memo(function ApkDownloadCard({
   isOnline,
   apiBaseUrl,
   fetcher,
+  onUnauthorized,
 }: ApkDownloadCardProps): ReactElement {
   const [state, setState] = useState<ApkCardState>(() =>
     isOnline ? { kind: 'loading' } : { kind: 'offline' },
@@ -280,6 +287,7 @@ export const ApkDownloadCard = memo(function ApkDownloadCard({
       apiBaseUrl,
       fetcher,
       signal: controller.signal,
+      onUnauthorized,
     }).then((nextState) => {
       if (!controller.signal.aborted) {
         setState(nextState);
@@ -289,7 +297,7 @@ export const ApkDownloadCard = memo(function ApkDownloadCard({
     return () => {
       controller.abort();
     };
-  }, [isOnline, apiBaseUrl, fetcher, refreshTick]);
+  }, [isOnline, apiBaseUrl, fetcher, onUnauthorized, refreshTick]);
 
   const handleRefresh = useCallback((): void => {
     setRefreshTick((prev) => prev + 1);

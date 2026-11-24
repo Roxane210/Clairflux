@@ -134,6 +134,7 @@ export interface KpiSummaryCardProps {
   readonly incomeCents: number;
   readonly expensesExclTransfersCents: number;
   readonly internalTransfersCents: number;
+  readonly periodLabel?: string | undefined;
 }
 
 export const KpiSummaryCard = memo(function KpiSummaryCard({
@@ -142,7 +143,10 @@ export const KpiSummaryCard = memo(function KpiSummaryCard({
   incomeCents,
   expensesExclTransfersCents,
   internalTransfersCents,
+  periodLabel,
 }: KpiSummaryCardProps): ReactElement {
+  const scopeSuffix = periodLabel ? ` (${periodLabel})` : ' du mois';
+
   return (
     <section className="cf-surface cf-kpi-container" aria-label="Indicateurs clés">
       <div className="cf-kpi-grid">
@@ -156,7 +160,7 @@ export const KpiSummaryCard = memo(function KpiSummaryCard({
         </div>
         <div className="cf-kpi-cell">
           <span style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
-            Revenus du mois
+            Revenus{scopeSuffix}
           </span>
           <span className="tabular-amount" style={{ fontSize: '1.25rem', fontWeight: 600 }}>
             {formatMoney(toCents(incomeCents), displayCurrency)}
@@ -164,7 +168,7 @@ export const KpiSummaryCard = memo(function KpiSummaryCard({
         </div>
         <div className="cf-kpi-cell">
           <span style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
-            Dépenses hors transferts
+            Dépenses hors transferts{scopeSuffix}
           </span>
           <span className="tabular-amount" style={{ fontSize: '1.25rem', fontWeight: 600 }}>
             {formatMoney(toCents(expensesExclTransfersCents), displayCurrency)}
@@ -413,19 +417,23 @@ const CHECKPOINT_STATUS_LABELS: Readonly<Record<CheckpointStatus, string>> = {
 export interface SyncDrivePanelProps {
   readonly driveFiles: readonly DriveSyncFileStatus[];
   readonly isOnline: boolean;
+  readonly isSyncingDrive?: boolean | undefined;
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
   readonly onTriggerDriveSync: () => void;
   readonly onFlushOutbox: () => void;
+  readonly onUnauthorized?: (() => void) | undefined;
 }
 
 export const SyncDrivePanel = memo(function SyncDrivePanel({
   driveFiles,
   isOnline,
+  isSyncingDrive = false,
   pendingOutboxCount,
   syncMessage,
   onTriggerDriveSync,
   onFlushOutbox,
+  onUnauthorized,
 }: SyncDrivePanelProps): ReactElement {
   return (
     <>
@@ -468,10 +476,14 @@ export const SyncDrivePanel = memo(function SyncDrivePanel({
             <button
               type="button"
               className="cf-btn cf-btn-primary"
-              disabled={!isOnline}
+              disabled={!isOnline || isSyncingDrive}
               onClick={onTriggerDriveSync}
             >
-              {isOnline ? 'Synchroniser Drive / Gemini' : 'Connexion requise (hors-ligne)'}
+              {!isOnline
+                ? 'Connexion requise (hors-ligne)'
+                : isSyncingDrive
+                  ? 'Synchronisation…'
+                  : 'Synchroniser Drive / Gemini'}
             </button>
           </div>
         </div>
@@ -504,6 +516,12 @@ export const SyncDrivePanel = memo(function SyncDrivePanel({
         ) : null}
 
         <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {driveFiles.length === 0 ? (
+            <p style={{ paddingBlock: '16px', color: 'var(--text-secondary)' }}>
+              Aucun relevé synchronisé pour le moment — cliquez sur « Synchroniser » pour analyser
+              vos dossiers BoursoBank et Revolut.
+            </p>
+          ) : null}
           {driveFiles.map((file, index) => (
             <div
               key={file.drive_file_id}
@@ -539,7 +557,7 @@ export const SyncDrivePanel = memo(function SyncDrivePanel({
           ))}
         </div>
       </section>
-      <ApkDownloadCard isOnline={isOnline} />
+      <ApkDownloadCard isOnline={isOnline} onUnauthorized={onUnauthorized} />
     </>
   );
 });

@@ -10,6 +10,7 @@ import {
   type TransactionNote,
 } from '@clairflux/shared';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createAuthAwareFetcher } from '../features/auth/authClient';
 import type { ClairFluxDataset } from '../features/dashboard/types';
 import { buildApiEndpointUrl } from './apiUrl';
 import {
@@ -44,6 +45,7 @@ export interface SaveRuleInput {
 export interface OfflineStoreApi {
   readonly dataset: ClairFluxDataset;
   readonly isOnline: boolean;
+  readonly isSyncingDrive: boolean;
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
   readonly saveQuickNote: (transactionId: TransactionId, content: string) => Promise<void>;
@@ -57,12 +59,14 @@ export interface OfflineStoreApi {
   readonly toggleRule: (ruleId: RuleId) => Promise<void>;
   readonly reapplyRules: () => Promise<void>;
   readonly triggerDriveSync: () => Promise<void>;
+  readonly syncFromServer: () => Promise<void>;
   readonly flushNow: () => Promise<void>;
 }
 
 export interface OfflineStoreState {
   readonly dataset: ClairFluxDataset;
   readonly isOnline: boolean;
+  readonly isSyncingDrive: boolean;
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
 }
@@ -75,6 +79,7 @@ export interface OfflineControllerOptions {
   readonly nowProvider?: (() => string) | undefined;
   readonly uuidProvider?: (() => string) | undefined;
   readonly onHaptic?: (() => Promise<void>) | undefined;
+  readonly onUnauthorized?: (() => void) | undefined;
 }
 
 export interface OfflineController {
@@ -93,6 +98,7 @@ export interface OfflineController {
   toggleRule(ruleId: RuleId): Promise<void>;
   reapplyRules(): Promise<void>;
   triggerDriveSync(): Promise<void>;
+  syncFromServer(): Promise<void>;
   flushNow(): Promise<void>;
 }
 
@@ -169,13 +175,14 @@ export function createOfflineController(
   const store = options.store ?? createOfflineStore();
   const apiBaseUrl = options.apiBaseUrl ?? resolveApiBaseUrl();
   const fetcher: FetchLike =
-    options.fetcher ?? ((input, init) => globalThis.fetch(input, init));
+    options.fetcher ?? createAuthAwareFetcher((input, init) => globalThis.fetch(input, init));
   const nowProvider = options.nowProvider ?? defaultNowIso;
   const uuidProvider = options.uuidProvider ?? defaultUuid;
 
   let state: OfflineStoreState = {
     dataset: initialSeed,
     isOnline: options.initialOnline ?? detectInitialOnlineStatus(),
+    isSyncingDrive: false,
     pendingOutboxCount: 0,
     syncMessage: null,
   };
@@ -197,6 +204,57 @@ export function createOfflineController(
     }
   };
 
+  const pullCompleteDelta = async (
+    baseDataset: ClairFluxDataset,
+  ): Promise<
+    | { readonly ok: true; readonly dataset: ClairFluxDataset }
+    | { readonly ok: false; readonly message: string; readonly unauthorized: boolean }
+  > => {
+    let workingDataset = baseDataset;
+    let cursor = baseDataset.revision;
+    const maxPages = 20;
+
+    for (let page = 0; page < maxPages; page += 1) {
+      const pullResult = await pullDelta(apiBaseUrl, cursor, fetcher);
+      if (!pullResult.ok) {
+        return {
+          ok: false,
+          message: pullResult.message,
+          unauthorized: pullResult.status === 401,
+        };
+      }
+
+      const delta = pullResult.data;
+      if (page === 0 && cursor > delta.latest_revision && !delta.full_resync_required) {
+        const resyncResult = await pullDelta(apiBaseUrl, 0, fetcher);
+        if (!resyncResult.ok) {
+          return {
+            ok: false,
+            message: resyncResult.message,
+            unauthorized: resyncResult.status === 401,
+          };
+        }
+        workingDataset = applyDeltaToDataset(workingDataset, {
+          ...resyncResult.data,
+          full_resync_required: true,
+        });
+        if (!resyncResult.data.has_more) {
+          return { ok: true, dataset: workingDataset };
+        }
+        cursor = resyncResult.data.batch_end_revision;
+        continue;
+      }
+
+      workingDataset = applyDeltaToDataset(workingDataset, delta);
+      if (!delta.has_more || delta.batch_end_revision <= cursor && !delta.full_resync_required) {
+        return { ok: true, dataset: workingDataset };
+      }
+      cursor = delta.batch_end_revision;
+    }
+
+    return { ok: true, dataset: workingDataset };
+  };
+
   const flushNow = async (): Promise<void> => {
     if (!state.isOnline) {
       const pending = await store.listOutbox();
@@ -209,6 +267,9 @@ export function createOfflineController(
 
     const flushResult = await flushOutbox(store, apiBaseUrl, fetcher);
     if (!flushResult.ok) {
+      if (flushResult.status === 401) {
+        options.onUnauthorized?.();
+      }
       emit({
         pendingOutboxCount: flushResult.remainingCount,
         syncMessage: flushResult.message,
@@ -218,17 +279,22 @@ export function createOfflineController(
 
     let nextDataset = state.dataset;
     const syncedTotal = flushResult.appliedCount + flushResult.duplicateCount;
-    const pullResult = await pullDelta(apiBaseUrl, state.dataset.revision, fetcher);
-    if (pullResult.ok) {
-      nextDataset = applyDeltaToDataset(state.dataset, pullResult.data);
+    const pullOutcome = await pullCompleteDelta(state.dataset);
+    if (pullOutcome.ok) {
+      nextDataset = pullOutcome.dataset;
       await persistSnapshot(nextDataset);
-    } else if (flushResult.latestRevision !== null) {
-      nextDataset = {
-        ...state.dataset,
-        revision: Math.max(state.dataset.revision, flushResult.latestRevision),
-        syncedAt: nowProvider(),
-      };
-      await persistSnapshot(nextDataset);
+    } else {
+      if (pullOutcome.unauthorized) {
+        options.onUnauthorized?.();
+      }
+      if (flushResult.latestRevision !== null) {
+        nextDataset = {
+          ...state.dataset,
+          revision: Math.max(state.dataset.revision, flushResult.latestRevision),
+          syncedAt: nowProvider(),
+        };
+        await persistSnapshot(nextDataset);
+      }
     }
 
     const nextMessage =
@@ -236,7 +302,7 @@ export function createOfflineController(
         ? `${syncedTotal} mutation(s) synchronisée(s), ${flushResult.rejectedCount} rejetée(s).`
         : syncedTotal > 0
           ? `Outbox synchronisée (${syncedTotal} modification(s)).`
-          : pullResult.ok
+          : pullOutcome.ok
             ? `Données à jour (révision #${nextDataset.revision}).`
             : state.syncMessage;
 
@@ -244,6 +310,37 @@ export function createOfflineController(
       dataset: nextDataset,
       pendingOutboxCount: flushResult.remainingCount,
       syncMessage: nextMessage,
+    });
+  };
+
+  const syncFromServer = async (): Promise<void> => {
+    if (!state.isOnline) {
+      return;
+    }
+
+    const pending = await store.listOutbox();
+    if (pending.length > 0) {
+      await flushNow();
+      return;
+    }
+
+    const pullOutcome = await pullCompleteDelta(state.dataset);
+    if (!pullOutcome.ok) {
+      if (pullOutcome.unauthorized) {
+        options.onUnauthorized?.();
+        return;
+      }
+      emit({ syncMessage: pullOutcome.message });
+      return;
+    }
+
+    await persistSnapshot(pullOutcome.dataset);
+    emit({
+      dataset: pullOutcome.dataset,
+      syncMessage:
+        pullOutcome.dataset.revision > 0
+          ? `Données synchronisées (révision #${pullOutcome.dataset.revision}).`
+          : null,
     });
   };
 
@@ -587,7 +684,11 @@ export function createOfflineController(
         emit({ syncMessage: guard.reason });
         return;
       }
+      if (state.isSyncingDrive) {
+        return;
+      }
 
+      emit({ isSyncingDrive: true });
       try {
         const response = await fetcher(buildApiEndpointUrl(apiBaseUrl, '/api/sync/drive'), {
           method: 'POST',
@@ -600,6 +701,14 @@ export function createOfflineController(
           body: '{}',
         });
 
+        if (response.status === 401) {
+          options.onUnauthorized?.();
+          emit({
+            syncMessage: 'Session expirée — veuillez vous reconnecter.',
+          });
+          return;
+        }
+
         if (!response.ok) {
           emit({
             syncMessage: `Synchronisation Drive/Gemini indisponible (HTTP ${response.status}).`,
@@ -607,16 +716,28 @@ export function createOfflineController(
           return;
         }
 
-        emit({
-          syncMessage: 'Synchronisation Drive/Gemini déclenchée sur les 2 dossiers autorisés.',
-        });
+        const pullOutcome = await pullCompleteDelta(state.dataset);
+        if (pullOutcome.ok) {
+          await persistSnapshot(pullOutcome.dataset);
+          emit({
+            dataset: pullOutcome.dataset,
+            syncMessage: 'Synchronisation Drive/Gemini déclenchée sur les 2 dossiers autorisés.',
+          });
+        } else {
+          emit({
+            syncMessage: 'Synchronisation Drive/Gemini déclenchée sur les 2 dossiers autorisés.',
+          });
+        }
       } catch (error: unknown) {
         const message =
           error instanceof Error ? error.message : 'Erreur réseau lors du déclenchement Drive.';
         emit({ syncMessage: message });
+      } finally {
+        emit({ isSyncingDrive: false });
       }
     },
 
+    syncFromServer,
     flushNow,
   };
 }
@@ -625,14 +746,22 @@ export function createOfflineController(
 // React Hook (`useOfflineStore`)
 // ============================================================================
 
-export function useOfflineStore(initialSeed: ClairFluxDataset): OfflineStoreApi {
+export function useOfflineStore(
+  initialSeed: ClairFluxDataset,
+  options?: { readonly onUnauthorized?: (() => void) | undefined },
+): OfflineStoreApi {
   const bridgeRef = useRef<AndroidBridgeHandle | null>(null);
   const controllerRef = useRef<OfflineController | null>(null);
+  const onUnauthorizedRef = useRef(options?.onUnauthorized);
+  onUnauthorizedRef.current = options?.onUnauthorized;
 
   if (controllerRef.current === null) {
     controllerRef.current = createOfflineController(initialSeed, {
       onHaptic: async () => {
         await bridgeRef.current?.triggerLightHaptic();
+      },
+      onUnauthorized: () => {
+        onUnauthorizedRef.current?.();
       },
     });
   }
@@ -686,11 +815,13 @@ export function useOfflineStore(initialSeed: ClairFluxDataset): OfflineStoreApi 
 
   const reapplyRules = useCallback(() => controller.reapplyRules(), [controller]);
   const triggerDriveSync = useCallback(() => controller.triggerDriveSync(), [controller]);
+  const syncFromServer = useCallback(() => controller.syncFromServer(), [controller]);
   const flushNow = useCallback(() => controller.flushNow(), [controller]);
 
   return {
     dataset: state.dataset,
     isOnline: state.isOnline,
+    isSyncingDrive: state.isSyncingDrive,
     pendingOutboxCount: state.pendingOutboxCount,
     syncMessage: state.syncMessage,
     saveQuickNote,
@@ -700,6 +831,7 @@ export function useOfflineStore(initialSeed: ClairFluxDataset): OfflineStoreApi 
     toggleRule,
     reapplyRules,
     triggerDriveSync,
+    syncFromServer,
     flushNow,
   };
 }

@@ -882,4 +882,53 @@ describe('ClairFlux Offline-First Engine & Capacitor Bridge', () => {
     expect(requestedUrls).toContain(`GET /api/sync/delta?since=${seed.revision}`);
     expect(requestedUrls.some((u) => u.includes('/api/api/'))).toBe(false);
   });
+
+  it('déclenche onUnauthorized sur 401 et réinitialise le cache obsolète lors d un full_resync_required', async () => {
+    const store = createMemoryOfflineStore();
+    const staleSeed = buildSeedDataset();
+    let unauthorizedCount = 0;
+
+    const fetcher401: FetchLike = async () =>
+      new Response(JSON.stringify({ error: { code: 'UNAUTHORIZED' } }), { status: 401 });
+
+    const unauthorizedController = createOfflineController(staleSeed, {
+      store,
+      apiBaseUrl: '/api',
+      fetcher: fetcher401,
+      initialOnline: true,
+      onUnauthorized: () => {
+        unauthorizedCount += 1;
+      },
+    });
+
+    await unauthorizedController.syncFromServer();
+    await unauthorizedController.triggerDriveSync();
+    expect(unauthorizedCount).toBe(2);
+
+    const serverDelta: DeltaSyncResponse = {
+      since_revision: toSyncRevision(staleSeed.revision),
+      batch_end_revision: toSyncRevision(5),
+      latest_revision: toSyncRevision(5),
+      has_more: false,
+      full_resync_required: true,
+      server_time: '2026-11-24T10:00:00.000Z',
+      accounts: { upserted: [], deleted_ids: [] },
+      transactions: { upserted: [], deleted_ids: [] },
+      transaction_notes: { upserted: [], deleted_transaction_ids: [] },
+      categorization_rules: { upserted: [], deleted_ids: [] },
+      drive_sync_status: { last_run: null, files: [] },
+      aggregates_snapshot: null,
+    };
+
+    const resyncController = createOfflineController(staleSeed, {
+      store: createMemoryOfflineStore(),
+      apiBaseUrl: '/api',
+      fetcher: async () => new Response(JSON.stringify(serverDelta), { status: 200 }),
+      initialOnline: true,
+    });
+
+    await resyncController.syncFromServer();
+    expect(resyncController.getState().dataset.revision).toBe(5);
+    expect(resyncController.getState().dataset.transactions).toHaveLength(0);
+  });
 });

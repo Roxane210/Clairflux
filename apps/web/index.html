@@ -285,6 +285,59 @@
         gap: 8px;
       }
 
+      /* Bandeau commun de filtres (non sticky sur mobile, élévation unique) */
+      .cf-filter-bar {
+        padding: 14px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .cf-filter-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px 12px;
+      }
+
+      .cf-filter-row-divided {
+        padding-block-start: 12px;
+        border-block-start: 1px solid var(--border-subtle);
+      }
+
+      .cf-filter-groups {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px 14px;
+      }
+
+      .cf-filter-custom-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        gap: 12px;
+        padding-block-start: 12px;
+        border-block-start: 1px solid var(--border-subtle);
+      }
+
+      /* Écran d'authentification personnel */
+      .cf-auth-shell {
+        min-block-size: 100dvh;
+        display: grid;
+        place-items: center;
+        padding: 20px 16px;
+        background: var(--bg-canvas);
+      }
+
+      .cf-auth-card {
+        inline-size: min(420px, 100%);
+        padding: 24px;
+        display: grid;
+        gap: 18px;
+      }
+
       .cf-pill-btn {
         min-block-size: 44px;
         min-inline-size: 44px;
