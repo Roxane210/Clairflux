@@ -56,12 +56,15 @@ import {
   assertAllowedDriveFolderId,
   createDriveAccessTokenProvider,
   createGoogleDriveClient,
+  extractPdfPagesInSubprocess,
+  inferAccountMetadata,
   prepareDrivePdfBatches,
   type DiscoveredDrivePdf,
   type FetchLike,
   type GoogleDriveClient,
   type PdfTextBatch,
   type PdfTextExtractor,
+  type PreparedPdfStatement,
 } from './drive-pdf.js';
 
 // ============================================================================
@@ -293,6 +296,7 @@ export interface GeminiGenerateRequest {
   readonly model: GeminiModelName;
   readonly prompt: string;
   readonly timeoutMs: number;
+  readonly pdfInlineBase64?: string | undefined;
 }
 
 export type GeminiModelResponse =
@@ -377,6 +381,22 @@ export function createHttpGeminiClient(options: {
     ): Promise<GeminiModelResponse> {
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(request.model)}:generateContent`;
 
+      const requestParts: Array<
+        | { readonly text: string }
+        | { readonly inlineData: { readonly mimeType: 'application/pdf'; readonly data: string } }
+      > =
+        request.pdfInlineBase64 !== undefined
+          ? [
+              {
+                inlineData: {
+                  mimeType: 'application/pdf',
+                  data: request.pdfInlineBase64,
+                },
+              },
+              { text: request.prompt },
+            ]
+          : [{ text: request.prompt }];
+
       let response: Response;
       try {
         response = await fetchFn(endpoint, {
@@ -386,9 +406,10 @@ export function createHttpGeminiClient(options: {
             'x-goog-api-key': options.apiKey,
           },
           body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: request.prompt }] }],
+            contents: [{ role: 'user', parts: requestParts }],
             generationConfig: {
               temperature: 0,
+              maxOutputTokens: 65536,
               responseMimeType: 'application/json',
             },
           }),
@@ -510,6 +531,7 @@ export async function extractBatchWithFallback(input: {
   readonly inferredCurrency: Currency;
   readonly batch: PdfTextBatch;
   readonly timeoutMs?: number | undefined;
+  readonly pdfInlineBase64?: string | undefined;
 }): Promise<BatchExtractionResult> {
   const timeoutMs = input.timeoutMs ?? DEFAULT_GEMINI_TIMEOUT_MS;
   const prompt = buildStatementExtractionPrompt({
@@ -531,6 +553,9 @@ export async function extractBatchWithFallback(input: {
       model,
       prompt,
       timeoutMs,
+      ...(input.pdfInlineBase64 !== undefined
+        ? { pdfInlineBase64: input.pdfInlineBase64 }
+        : {}),
     });
 
     if (!response.ok) {
@@ -2199,6 +2224,36 @@ async function resolveTransactionsFx(
   return result;
 }
 
+const MAX_INLINE_GEMINI_PDF_BYTES = 18 * 1024 * 1024;
+
+function buildNativePdfOcrFallbackPrepared(
+  file: DiscoveredDrivePdf,
+): PreparedPdfStatement {
+  const metadata = inferAccountMetadata({
+    bank: file.bank,
+    fileName: file.fileName,
+    textSample: file.fileName,
+  });
+  const ocrInstruction =
+    'Document PDF binaire joint en pièce jointe : effectue une lecture OCR complète de toutes les pages et extrais toutes les opérations bancaires et soldes sans en omettre.';
+  return {
+    file,
+    metadata,
+    totalPages: 1,
+    removedBoilerplateLines: 0,
+    batches: [
+      {
+        batchIndex: 0,
+        totalBatches: 1,
+        pageStart: 1,
+        pageEnd: 1,
+        text: ocrInstruction,
+        charCount: ocrInstruction.length,
+      },
+    ],
+  };
+}
+
 export async function runIngestionPipeline(
   deps: IngestionPipelineDependencies,
   options?: {
@@ -2278,17 +2333,31 @@ export async function runIngestionPipeline(
             driveFolderId: file.driveFolderId,
           });
           console.info(
-            `[sync-worker] PDF téléchargé (${file.fileName}): ${pdfBytes.byteLength} o, extraction texte pdfjs...`,
+            `[sync-worker] PDF téléchargé (${file.fileName}): ${pdfBytes.byteLength} o, extraction texte pdfjs isolée...`,
           );
 
-          const prepared = await prepareDrivePdfBatches({
-            file,
-            pdfBytes,
-            extractPdfPages: deps.extractPdfPages,
-          });
-          console.info(
-            `[sync-worker] PDF extrait (${file.fileName}): ${prepared.totalPages} page(s), ${prepared.batches.length} lot(s).`,
-          );
+          let prepared: PreparedPdfStatement;
+          let pdfInlineBase64: string | undefined;
+          try {
+            prepared = await prepareDrivePdfBatches({
+              file,
+              pdfBytes,
+              extractPdfPages: deps.extractPdfPages ?? extractPdfPagesInSubprocess,
+            });
+            console.info(
+              `[sync-worker] PDF extrait (${file.fileName}): ${prepared.totalPages} page(s), ${prepared.batches.length} lot(s).`,
+            );
+          } catch (pdfErr) {
+            const pdfMsg = pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
+            if (pdfBytes.byteLength > MAX_INLINE_GEMINI_PDF_BYTES) {
+              throw pdfErr;
+            }
+            console.warn(
+              `[sync-worker] Extraction pdfjs indisponible (${file.fileName}: ${pdfMsg}) — bascule OCR natif Gemini PDF...`,
+            );
+            prepared = buildNativePdfOcrFallbackPrepared(file);
+            pdfInlineBase64 = Buffer.from(pdfBytes).toString('base64');
+          }
 
           const existingCompletedBatches =
             checkpoint.parsedPayload?.kind === 'partial_batches' &&
@@ -2307,7 +2376,7 @@ export async function runIngestionPipeline(
             }
 
             console.info(
-              `[sync-worker] Extraction Gemini lot ${batch.batchIndex + 1}/${prepared.batches.length} (${file.fileName}, pages ${batch.pageStart}-${batch.pageEnd})...`,
+              `[sync-worker] Extraction Gemini lot ${batch.batchIndex + 1}/${prepared.batches.length} (${file.fileName}, pages ${batch.pageStart}-${batch.pageEnd}${pdfInlineBase64 !== undefined ? ', OCR PDF natif' : ''})...`,
             );
             const batchExtraction = await extractBatchWithFallback({
               client: deps.geminiClient,
@@ -2317,6 +2386,7 @@ export async function runIngestionPipeline(
               inferredCurrency: prepared.metadata.currency,
               batch,
               timeoutMs: deps.geminiTimeoutMs,
+              pdfInlineBase64,
             });
             console.info(
               `[sync-worker] Lot ${batch.batchIndex + 1}/${prepared.batches.length} extrait via ${batchExtraction.modelUsed} (${batchExtraction.extraction.transactions.length} op.).`,

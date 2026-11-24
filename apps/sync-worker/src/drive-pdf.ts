@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { createSign } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
@@ -795,6 +796,144 @@ export async function extractPdfPagesWithPdfjs(
       await docToDestroy.destroy().catch(() => undefined);
     }
   }
+}
+
+const SubprocessPdfPagesSchema = z.array(
+  z.object({
+    pageNumber: z.number().int().positive(),
+    rawText: z.string(),
+  }),
+);
+
+const PDFJS_SUBPROCESS_SCRIPT = `
+import { pathToFileURL } from 'node:url';
+const chunks = [];
+for await (const chunk of process.stdin) {
+  chunks.push(chunk);
+}
+const pdfBytes = new Uint8Array(Buffer.concat(chunks));
+const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+const loadingTask = pdfjs.getDocument({
+  data: pdfBytes,
+  useSystemFonts: false,
+  disableFontFace: true,
+  isEvalSupported: false,
+  verbosity: 0,
+});
+const doc = await loadingTask.promise;
+try {
+  if (doc.numPages <= 0) {
+    throw new Error('Le document PDF ne contient aucune page.');
+  }
+  const pages = [];
+  for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
+    const page = await doc.getPage(pageNumber);
+    const content = await page.getTextContent();
+    const parts = [];
+    for (const item of content.items) {
+      if (typeof item === 'object' && item !== null && 'str' in item && typeof item.str === 'string') {
+        parts.push(item.str);
+        if (item.hasEOL === true) {
+          parts.push('\\n');
+        } else if (item.str.length > 0 && !item.str.endsWith(' ')) {
+          parts.push(' ');
+        }
+      }
+    }
+    const rawText = parts.join('').replace(/[ \\t]+\\n/gu, '\\n').replace(/\\n{3,}/gu, '\\n\\n').trim();
+    pages.push({ pageNumber, rawText });
+  }
+  process.stdout.write(JSON.stringify(pages));
+} finally {
+  await doc.destroy().catch(() => undefined);
+}
+`;
+
+const DEFAULT_SUBPROCESS_PDF_TIMEOUT_MS = 20_000;
+
+/**
+ * Runs `pdfjs-dist` in an isolated Node subprocess with bounded heap (`256 MB`)
+ * so a native crash, OOM, or malformed PDF stream never terminates the worker process.
+ */
+export async function extractPdfPagesInSubprocess(
+  pdfBytes: Uint8Array,
+  timeoutMs: number = DEFAULT_SUBPROCESS_PDF_TIMEOUT_MS,
+): Promise<readonly PdfPageText[]> {
+  if (pdfBytes.byteLength === 0) {
+    throw new PdfUnreadableError('Le contenu binaire du PDF est vide.');
+  }
+
+  return new Promise<readonly PdfPageText[]>((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['--max-old-space-size=256', '--input-type=module', '-e', PDFJS_SUBPROCESS_SCRIPT],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      },
+    );
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let settled = false;
+
+    const finishReject = (message: string): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(new PdfUnreadableError(message));
+    };
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finishReject(`Délai dépassé (${timeoutMs} ms) dans le sous-processus pdfjs.`);
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrChunks.push(chunk);
+    });
+    child.on('error', (err: Error) => {
+      finishReject(`Impossible de lancer le sous-processus pdfjs : ${err.message}`);
+    });
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+
+      if (code !== 0) {
+        const stderrText = Buffer.concat(stderrChunks).toString('utf8').trim().slice(0, 240);
+        const detail = stderrText.length > 0 ? ` — ${stderrText}` : '';
+        reject(
+          new PdfUnreadableError(
+            `Sous-processus pdfjs interrompu (code=${String(code)}, signal=${String(signal)})${detail}`,
+          ),
+        );
+        return;
+      }
+
+      try {
+        const rawJson: unknown = JSON.parse(Buffer.concat(stdoutChunks).toString('utf8'));
+        const parsed = SubprocessPdfPagesSchema.safeParse(rawJson);
+        if (!parsed.success) {
+          reject(new PdfUnreadableError('Sortie JSON pdfjs invalide.'));
+          return;
+        }
+        resolve(parsed.data);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        reject(new PdfUnreadableError(`Erreur de parsing sortie pdfjs : ${msg}`));
+      }
+    });
+
+    child.stdin.on('error', () => undefined);
+    child.stdin.end(Buffer.from(pdfBytes));
+  });
 }
 
 // ============================================================================

@@ -20,6 +20,7 @@ import {
   assertAllowedDriveFolderId,
   createDriveAccessTokenProvider,
   createGoogleDriveClient,
+  extractPdfPagesInSubprocess,
   extractPdfPagesWithPdfjs,
   inferAccountMetadata,
   splitPagesIntoBatches,
@@ -1677,5 +1678,121 @@ describe('Worker internal HTTP server & INTERNAL_WORKER_TOKEN auth', () => {
     expect(store.checkpointsById.get(cp.checkpointId)?.status).toBe('failed');
     expect(store.checkpointsById.get(cp.checkpointId)?.errorCode).toBe('GEMINI_TIMEOUT');
     expect(store.checkpointsById.get(cp.checkpointId)?.errorMessage).toContain('redémarrage');
+  });
+
+  it('bascule sur l extraction OCR native Gemini (inlineData PDF) quand pdfjs échoue ou détecte un PDF scanné', async () => {
+    const store = new InMemoryNeonCheckpointStore();
+    const fxRateService = createFxRateService({ store });
+    const runId = '66666666-6666-4666-8666-666666666666';
+    const rawPdfBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34]);
+
+    const driveClient: GoogleDriveClient = {
+      listFolderPdfFiles: vi.fn(async () => []),
+      discoverAllAllowedPdfs: vi.fn(async () => [
+        {
+          driveFileId: parseDriveFileId('1c_UHG0yek3m5-IAsOuSXUiZfPCuVTCeH'),
+          driveFolderId: ALLOWED_DRIVE_FOLDERS.boursobank,
+          bank: 'boursobank' as const,
+          fileName: 'Releve-compte-principal-31-08-2026.pdf',
+          md5Checksum: createHash('md5').update(rawPdfBytes).digest('hex'),
+          fileSizeBytes: rawPdfBytes.byteLength,
+          driveModifiedTime: new Date('2026-11-24T12:00:00.000Z'),
+        },
+      ]),
+      downloadPdfFile: vi.fn(async () => rawPdfBytes),
+    };
+
+    const requestsSeen: Array<{ readonly pdfInlineBase64?: string | undefined; readonly prompt: string }> = [];
+    const geminiClient: GeminiModelClient = {
+      generateStructuredStatement: vi.fn(async (req) => {
+        requestsSeen.push({ pdfInlineBase64: req.pdfInlineBase64, prompt: req.prompt });
+        return {
+          ok: true as const,
+          rawJsonText: JSON.stringify({
+            statement_period_start: '2026-08-01',
+            statement_period_end: '2026-08-31',
+            accounts: [
+              {
+                detected_name: 'Compte Principal BoursoBank',
+                external_ref_masked: 'FR76****8899',
+                account_type: 'courant',
+                currency: 'EUR',
+                opening_balance_cents: 250000,
+                closing_balance_cents: 245000,
+              },
+            ],
+            transactions: [
+              {
+                account_ref_masked: 'FR76****8899',
+                currency: 'EUR',
+                booking_date: '2026-08-15',
+                value_date: '2026-08-15',
+                raw_label: 'CB BOULANGERIE',
+                clean_label: 'Boulangerie',
+                amount_cents: -5000,
+                statement_fx_rate_micro: null,
+              },
+            ],
+          }),
+        };
+      }),
+    };
+
+    const failingPdfjs = vi.fn(async () => {
+      throw new Error('Simulated pdfjs worker crash or scanned image PDF');
+    });
+
+    const result = await runIngestionPipeline(
+      {
+        driveClient,
+        geminiClient,
+        checkpointStore: store,
+        fxRateService,
+        extractPdfPages: failingPdfjs,
+      },
+      { runId },
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.filesCommitted).toBe(1);
+    expect(requestsSeen).toHaveLength(1);
+    expect(requestsSeen[0]?.pdfInlineBase64).toBe(Buffer.from(rawPdfBytes).toString('base64'));
+    expect(store.transactionsByDedupHash.size).toBe(1);
+
+    // Also verify createHttpGeminiClient sends inlineData in HTTP body when pdfInlineBase64 is set
+    let sentBody = '';
+    const httpClient = createHttpGeminiClient({
+      apiKey: 'secret-key',
+      fetchFn: async (_input, init) => {
+        sentBody = String(init?.body ?? '');
+        return new Response(
+          JSON.stringify({
+            candidates: [{ content: { parts: [{ text: '{}' }] } }],
+          }),
+          { status: 200 },
+        );
+      },
+    });
+    await httpClient.generateStructuredStatement({
+      model: 'gemini-4-hydrogen',
+      prompt: 'Extract OCR',
+      timeoutMs: 5000,
+      pdfInlineBase64: 'JVBERi0xLjQ=',
+    });
+    expect(sentBody).toContain('"mimeType":"application/pdf"');
+    expect(sentBody).toContain('"data":"JVBERi0xLjQ="');
+  });
+
+  it('exécute pdfjs dans un sous-processus isolé et protège le worker si le PDF est corrompu', async () => {
+    const minimalPdf = Buffer.from(
+      '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 58>>stream\nBT /F1 12 Tf 72 720 Td (12/01/2026 Carrefour -42,50 EUR) Tj ET\nendstream\nendobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000056 00000 n \n0000000111 00000 n \n0000000212 00000 n \n0000000319 00000 n \ntrailer<</Size 6/Root 1 0 R>>\nstartxref\n387\n%%EOF',
+    );
+    const pages = await extractPdfPagesInSubprocess(new Uint8Array(minimalPdf));
+    expect(pages).toHaveLength(1);
+    expect(pages[0]?.rawText).toContain('Carrefour');
+
+    await expect(
+      extractPdfPagesInSubprocess(new Uint8Array([1, 2, 3, 4])),
+    ).rejects.toThrowError();
   });
 });
