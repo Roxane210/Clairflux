@@ -1,4 +1,12 @@
 import { z } from 'zod';
+import {
+  AiReviewStatusSchema,
+  CategoryIdSchema,
+  CategorySchema,
+  CategorySourceSchema,
+} from './categories.js';
+
+export * from './categories.js';
 
 // ============================================================================
 // Branded Primitives & Safe Constructors
@@ -143,6 +151,10 @@ export const ApiErrorCodeSchema = z.enum([
   'SYNC_ALREADY_RUNNING',
   'FILE_NOT_RETRYABLE',
   'VALIDATION_ERROR',
+  'CATEGORY_DEPTH_EXCEEDED',
+  'CATEGORY_REASSIGN_REQUIRED',
+  'CATEGORY_CONFLICT',
+  'CATEGORY_HAS_CHILDREN_OR_SYSTEM',
   'RATE_LIMITED',
   'UPSTREAM_DRIVE_ERROR',
   'UPSTREAM_GEMINI_ERROR',
@@ -166,7 +178,7 @@ export const AllowedDriveFolderIdSchema = z.enum([
 
 export const EUR_FX_RATE_MICRO: FxRateMicro = toFxRateMicro(1_000_000);
 export const CLAIRFLUX_DELTA_SCHEMA_VERSION = '1.0.0' as const;
-export const CLAIRFLUX_BUILD_VERSION = '1.0.1-build.3' as const;
+export const CLAIRFLUX_BUILD_VERSION = '1.1.0-build.1' as const;
 
 export function isAllowedDriveFolderId(
   folderId: string,
@@ -233,6 +245,10 @@ export const TransactionSchema = z.object({
   fx_rate_micro: FxRateMicroSchema,
   amount_eur_cents: CentsSchema,
   category: z.string().trim().min(1).max(64),
+  category_id: CategoryIdSchema.nullable().optional(),
+  subcategory_id: CategoryIdSchema.nullable().optional(),
+  category_source: CategorySourceSchema.optional(),
+  ai_review_status: AiReviewStatusSchema.optional(),
   is_manual_category: z.boolean(),
   matched_rule_id: RuleIdSchema.nullable(),
   is_internal_transfer: z.boolean(),
@@ -262,6 +278,8 @@ export const CategorizationRuleSchema = z.object({
   match_mode: RuleMatchModeSchema,
   pattern: z.string().trim().min(1).max(200),
   target_category: z.string().trim().min(1).max(64),
+  target_category_id: CategoryIdSchema.nullable().optional(),
+  target_subcategory_id: CategoryIdSchema.nullable().optional(),
   mark_as_internal_transfer: z.boolean(),
   is_active: z.boolean(),
   revision: SyncRevisionSchema,
@@ -367,6 +385,12 @@ export const DeltaSyncResponseSchema = z.object({
     upserted: z.array(CategorizationRuleSchema),
     deleted_ids: z.array(RuleIdSchema),
   }),
+  categories: z
+    .object({
+      upserted: z.array(CategorySchema),
+      deleted_ids: z.array(CategoryIdSchema),
+    })
+    .optional(),
   drive_sync_status: DriveSyncStatusSchema,
   aggregates_snapshot: AggregatesSnapshotSchema.nullable(),
 });

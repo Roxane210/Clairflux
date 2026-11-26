@@ -1,7 +1,10 @@
 import {
   ALLOWED_DRIVE_FOLDERS,
   AccountTypeSchema,
+  AiReviewStatusSchema,
   BankSchema,
+  BudgetGroupSchema,
+  CategorySourceSchema,
   CheckpointErrorCodeSchema,
   CheckpointStatusSchema,
   CurrencySchema,
@@ -13,6 +16,7 @@ import {
 } from '@clairflux/shared';
 import { relations, sql } from 'drizzle-orm';
 import {
+  type AnyPgColumn,
   bigint,
   boolean,
   check,
@@ -26,6 +30,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
   varchar,
 } from 'drizzle-orm/pg-core';
@@ -33,7 +38,10 @@ import {
 export {
   ALLOWED_DRIVE_FOLDERS,
   AccountTypeSchema,
+  AiReviewStatusSchema,
   BankSchema,
+  BudgetGroupSchema,
+  CategorySourceSchema,
   CheckpointErrorCodeSchema,
   CheckpointStatusSchema,
   CurrencySchema,
@@ -99,6 +107,30 @@ export const checkpointStatusEnum = pgEnum('checkpoint_status_enum', [
   'committing',
   'committed',
   'failed',
+]);
+
+export const budgetGroupEnum = pgEnum('budget_group_enum', [
+  'fixed',
+  'variable',
+  'non_monthly',
+  'income',
+  'savings',
+  'transfer',
+]);
+
+export const categorySourceEnum = pgEnum('category_source_enum', [
+  'manual',
+  'rule',
+  'ai_auto',
+  'ai_validated',
+  'uncategorized',
+]);
+
+export const aiReviewStatusEnum = pgEnum('ai_review_status_enum', [
+  'none',
+  'pending_review',
+  'accepted',
+  'rejected',
 ]);
 
 const nextRevisionDefault = sql`nextval('sync_revision_seq')`;
@@ -261,6 +293,50 @@ export const pdfIngestionCheckpoints = pgTable(
   ],
 );
 
+export const categories = pgTable(
+  'categories',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    parentId: uuid('parent_id').references((): AnyPgColumn => categories.id, {
+      onDelete: 'restrict',
+    }),
+    name: varchar('name', { length: 64 }).notNull(),
+    slug: varchar('slug', { length: 80 }).notNull(),
+    budgetGroup: budgetGroupEnum('budget_group').notNull(),
+    colorToken: varchar('color_token', { length: 32 }).notNull().default('slate'),
+    sortOrder: integer('sort_order').notNull().default(0),
+    isSystem: boolean('is_system').notNull().default(false),
+    isArchived: boolean('is_archived').notNull().default(false),
+    revision: bigint('revision', { mode: 'number' }).notNull().default(nextRevisionDefault),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
+  },
+  (t) => [
+    check('chk_categories_name_non_empty', sql`char_length(trim(name)) > 0`),
+    check('chk_categories_slug_non_empty', sql`char_length(trim(slug)) > 0`),
+    check('chk_categories_color_non_empty', sql`char_length(trim(color_token)) > 0`),
+    check('chk_categories_sort_non_negative', sql`sort_order >= 0`),
+    check('chk_categories_no_self_parent', sql`parent_id IS NULL OR parent_id <> id`),
+    uniqueIndex('uq_categories_active_slug')
+      .on(t.slug)
+      .where(sql`deleted_at IS NULL`),
+    uniqueIndex('uq_categories_active_sibling_name')
+      .on(
+        sql`COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid)`,
+        sql`lower(trim(name))`,
+      )
+      .where(sql`deleted_at IS NULL`),
+    index('idx_categories_parent_sort')
+      .on(t.parentId, t.sortOrder)
+      .where(sql`deleted_at IS NULL`),
+    index('idx_categories_budget_group')
+      .on(t.budgetGroup)
+      .where(sql`deleted_at IS NULL`),
+    index('idx_categories_revision').on(t.revision),
+  ],
+);
+
 export const categorizationRules = pgTable(
   'categorization_rules',
   {
@@ -275,6 +351,12 @@ export const categorizationRules = pgTable(
     pattern: varchar('pattern', { length: 200 }).notNull(),
     matchMode: ruleMatchModeEnum('match_mode').notNull().default('contains'),
     targetCategory: varchar('target_category', { length: 64 }).notNull(),
+    targetCategoryId: uuid('target_category_id').references(() => categories.id, {
+      onDelete: 'set null',
+    }),
+    targetSubcategoryId: uuid('target_subcategory_id').references(() => categories.id, {
+      onDelete: 'set null',
+    }),
     markAsInternalTransfer: boolean('mark_as_internal_transfer').notNull().default(false),
     isActive: boolean('is_active').notNull().default(true),
     revision: bigint('revision', { mode: 'number' }).notNull().default(nextRevisionDefault),
@@ -287,6 +369,10 @@ export const categorizationRules = pgTable(
     check('chk_rules_priority_range', sql`priority >= 1 AND priority <= 10000`),
     check('chk_rules_pattern_non_empty', sql`char_length(trim(pattern)) > 0`),
     check('chk_rules_target_category_non_empty', sql`char_length(trim(target_category)) > 0`),
+    check(
+      'chk_rules_subcat_requires_cat',
+      sql`target_subcategory_id IS NULL OR target_category_id IS NOT NULL`,
+    ),
     index('idx_rules_evaluation')
       .on(t.priority.asc(), t.createdAt.asc(), t.id.asc())
       .where(sql`is_active = true AND deleted_at IS NULL`),
@@ -313,6 +399,19 @@ export const transactions = pgTable(
     fxRateMicro: bigint('fx_rate_micro', { mode: 'number' }).notNull(),
     amountEurCents: bigint('amount_eur_cents', { mode: 'number' }).notNull(),
     category: varchar('category', { length: 64 }).notNull().default('Non catégorisé'),
+    categoryId: uuid('category_id').references(() => categories.id, { onDelete: 'set null' }),
+    subcategoryId: uuid('subcategory_id').references(() => categories.id, { onDelete: 'set null' }),
+    categorySource: categorySourceEnum('category_source').notNull().default('uncategorized'),
+    aiSuggestedCategoryId: uuid('ai_suggested_category_id').references(() => categories.id, {
+      onDelete: 'set null',
+    }),
+    aiSuggestedSubcategoryId: uuid('ai_suggested_subcategory_id').references(() => categories.id, {
+      onDelete: 'set null',
+    }),
+    aiConfidenceBp: integer('ai_confidence_bp'),
+    aiReviewStatus: aiReviewStatusEnum('ai_review_status').notNull().default('none'),
+    aiReason: varchar('ai_reason', { length: 240 }),
+    aiModel: varchar('ai_model', { length: 64 }),
     matchedRuleId: uuid('matched_rule_id').references(() => categorizationRules.id, {
       onDelete: 'set null',
     }),
@@ -335,6 +434,15 @@ export const transactions = pgTable(
       sql`currency <> 'EUR' OR (fx_rate_micro = 1000000 AND amount_eur_cents = amount_cents)`,
     ),
     check('chk_tx_occurrence_min', sql`statement_occurrence_index >= 1`),
+    check('chk_tx_subcat_requires_cat', sql`subcategory_id IS NULL OR category_id IS NOT NULL`),
+    check(
+      'chk_tx_ai_subcat_requires_cat',
+      sql`ai_suggested_subcategory_id IS NULL OR ai_suggested_category_id IS NOT NULL`,
+    ),
+    check(
+      'chk_tx_ai_confidence_bp_range',
+      sql`ai_confidence_bp IS NULL OR (ai_confidence_bp >= 0 AND ai_confidence_bp <= 10000)`,
+    ),
     index('idx_tx_account_date')
       .on(t.accountId, t.bookingDate.desc())
       .where(sql`deleted_at IS NULL`),
@@ -344,6 +452,12 @@ export const transactions = pgTable(
     index('idx_tx_aggregates')
       .on(t.isInternalTransfer, t.bookingDate, t.category)
       .where(sql`deleted_at IS NULL`),
+    index('idx_tx_category_booking')
+      .on(t.categoryId, t.subcategoryId, t.bookingDate.desc())
+      .where(sql`deleted_at IS NULL`),
+    index('idx_tx_ai_review_queue')
+      .on(t.aiReviewStatus, t.aiConfidenceBp.desc(), t.bookingDate.desc())
+      .where(sql`ai_review_status = 'pending_review' AND deleted_at IS NULL`),
     index('idx_tx_transfer_group')
       .on(t.transferGroupId)
       .where(sql`transfer_group_id IS NOT NULL AND deleted_at IS NULL`),
@@ -467,10 +581,31 @@ export const pdfIngestionCheckpointsRelations = relations(pdfIngestionCheckpoint
   }),
 }));
 
+export const categoriesRelations = relations(categories, ({ one, many }) => ({
+  parent: one(categories, {
+    fields: [categories.parentId],
+    references: [categories.id],
+    relationName: 'category_parent_child',
+  }),
+  children: many(categories, {
+    relationName: 'category_parent_child',
+  }),
+}));
+
 export const categorizationRulesRelations = relations(categorizationRules, ({ one, many }) => ({
   accountFilter: one(accounts, {
     fields: [categorizationRules.accountIdFilter],
     references: [accounts.id],
+  }),
+  targetCategoryRef: one(categories, {
+    fields: [categorizationRules.targetCategoryId],
+    references: [categories.id],
+    relationName: 'rule_target_category',
+  }),
+  targetSubcategoryRef: one(categories, {
+    fields: [categorizationRules.targetSubcategoryId],
+    references: [categories.id],
+    relationName: 'rule_target_subcategory',
   }),
   matchedTransactions: many(transactions),
 }));
@@ -487,6 +622,26 @@ export const transactionsRelations = relations(transactions, ({ one }) => ({
   matchedRule: one(categorizationRules, {
     fields: [transactions.matchedRuleId],
     references: [categorizationRules.id],
+  }),
+  categoryRef: one(categories, {
+    fields: [transactions.categoryId],
+    references: [categories.id],
+    relationName: 'transaction_category',
+  }),
+  subcategoryRef: one(categories, {
+    fields: [transactions.subcategoryId],
+    references: [categories.id],
+    relationName: 'transaction_subcategory',
+  }),
+  aiSuggestedCategoryRef: one(categories, {
+    fields: [transactions.aiSuggestedCategoryId],
+    references: [categories.id],
+    relationName: 'transaction_ai_suggested_category',
+  }),
+  aiSuggestedSubcategoryRef: one(categories, {
+    fields: [transactions.aiSuggestedSubcategoryId],
+    references: [categories.id],
+    relationName: 'transaction_ai_suggested_subcategory',
   }),
   note: one(transactionNotes, {
     fields: [transactions.id],
@@ -520,6 +675,9 @@ export type NewDriveFileRow = typeof driveFiles.$inferInsert;
 export type PdfIngestionCheckpointRow = typeof pdfIngestionCheckpoints.$inferSelect;
 export type NewPdfIngestionCheckpointRow = typeof pdfIngestionCheckpoints.$inferInsert;
 
+export type CategoryRow = typeof categories.$inferSelect;
+export type NewCategoryRow = typeof categories.$inferInsert;
+
 export type CategorizationRuleRow = typeof categorizationRules.$inferSelect;
 export type NewCategorizationRuleRow = typeof categorizationRules.$inferInsert;
 
@@ -548,11 +706,15 @@ export const schema = {
   syncTriggerEnum,
   syncRunStatusEnum,
   checkpointStatusEnum,
+  budgetGroupEnum,
+  categorySourceEnum,
+  aiReviewStatusEnum,
   accounts,
   fxRates,
   driveSyncRuns,
   driveFiles,
   pdfIngestionCheckpoints,
+  categories,
   categorizationRules,
   transactions,
   transactionNotes,
@@ -563,6 +725,7 @@ export const schema = {
   driveSyncRunsRelations,
   driveFilesRelations,
   pdfIngestionCheckpointsRelations,
+  categoriesRelations,
   categorizationRulesRelations,
   transactionsRelations,
   transactionNotesRelations,
