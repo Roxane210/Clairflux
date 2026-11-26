@@ -3,6 +3,7 @@ import {
   buildCategoryTree,
   type BudgetGroup,
   type Category,
+  type CategoryId,
   type CategoryTreeNode,
 } from '@clairflux/shared';
 import type { MouseEvent, ReactElement } from 'react';
@@ -136,6 +137,92 @@ export function GroupedCategorySelectOptions({
         </option>
       ))}
     </>
+  );
+}
+
+/**
+ * Resolves a selected category or subcategory UUID into `(category_id, subcategory_id)`
+ * matching the 2-level hierarchy invariant.
+ */
+export interface CategoryTwoLevelPair {
+  readonly category_id: CategoryId;
+  readonly subcategory_id: CategoryId | null;
+}
+
+export function resolveCategoryTwoLevelPair(
+  categories: readonly Category[] | undefined,
+  selectedId: string,
+): CategoryTwoLevelPair | null {
+  const source =
+    categories !== undefined && categories.length > 0
+      ? categories
+      : DEFAULT_FRENCH_CATEGORY_PACK;
+  const found = source.find((cat) => cat.id === selectedId);
+  if (found === undefined) {
+    return null;
+  }
+  if (found.parent_id !== null) {
+    return { category_id: found.parent_id, subcategory_id: found.id };
+  }
+  return { category_id: found.id, subcategory_id: null };
+}
+
+export interface CategoryTwoLevelSelectProps {
+  readonly id?: string | undefined;
+  readonly ariaLabel?: string | undefined;
+  readonly categories?: readonly Category[] | undefined;
+  readonly value: string;
+  readonly disabled?: boolean | undefined;
+  readonly onChange: (selectedId: string, pair: CategoryTwoLevelPair | null) => void;
+}
+
+/**
+ * 2-level `<select>` (`<optgroup>` root -> subcategory options) returning category IDs.
+ */
+export function CategoryTwoLevelSelect({
+  id,
+  ariaLabel,
+  categories,
+  value,
+  disabled = false,
+  onChange,
+}: CategoryTwoLevelSelectProps): ReactElement {
+  const source =
+    categories !== undefined && categories.length > 0
+      ? categories
+      : DEFAULT_FRENCH_CATEGORY_PACK;
+  const tree = buildCategoryTree(source.filter((cat) => !cat.is_archived));
+
+  return (
+    <select
+      id={id}
+      aria-label={ariaLabel}
+      className="cf-field-input"
+      value={value}
+      disabled={disabled}
+      onChange={(event) => {
+        const nextId = event.target.value;
+        onChange(nextId, resolveCategoryTwoLevelPair(source, nextId));
+      }}
+    >
+      <option value="">Choisir une catégorie…</option>
+      {tree.map((root) =>
+        root.children.length > 0 ? (
+          <optgroup key={root.id} label={root.name}>
+            <option value={root.id}>{root.name} (catégorie générale)</option>
+            {root.children.map((sub) => (
+              <option key={sub.id} value={sub.id}>
+                {sub.name}
+              </option>
+            ))}
+          </optgroup>
+        ) : (
+          <option key={root.id} value={root.id}>
+            {root.name}
+          </option>
+        ),
+      )}
+    </select>
   );
 }
 

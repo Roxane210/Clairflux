@@ -7,6 +7,7 @@ import {
   type DriveSyncFileStatus,
 } from '@clairflux/shared';
 import { memo, type ReactElement } from 'react';
+import type { AiBackfillStatusSummary } from '../../offline/useOfflineStore';
 import { ApkDownloadCard } from '../apk/ApkDownloadCard';
 import { BANK_LABELS, type AppTab, type BudgetLimit } from './types';
 
@@ -414,14 +415,27 @@ const CHECKPOINT_STATUS_LABELS: Readonly<Record<CheckpointStatus, string>> = {
   failed: 'Échec',
 };
 
+const AI_RUN_STATUS_LABELS: Readonly<Record<string, string>> = {
+  running: 'Analyse Gemini en cours…',
+  completed: 'Terminé',
+  partial_error: 'Terminé avec erreurs partielles',
+  failed: 'Échec',
+  cancelled: 'Annulé',
+};
+
 export interface SyncDrivePanelProps {
   readonly driveFiles: readonly DriveSyncFileStatus[];
   readonly isOnline: boolean;
   readonly isSyncingDrive?: boolean | undefined;
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
+  readonly aiBackfillStatus?: AiBackfillStatusSummary | null | undefined;
+  readonly isAiLoading?: boolean | undefined;
   readonly onTriggerDriveSync: () => void;
   readonly onFlushOutbox: () => void;
+  readonly onTriggerAiBackfill?: (() => void) | undefined;
+  readonly onCancelAiBackfill?: (() => void) | undefined;
+  readonly onOpenAiReviewQueue?: (() => void) | undefined;
   readonly onUnauthorized?: (() => void) | undefined;
 }
 
@@ -431,10 +445,25 @@ export const SyncDrivePanel = memo(function SyncDrivePanel({
   isSyncingDrive = false,
   pendingOutboxCount,
   syncMessage,
+  aiBackfillStatus = null,
+  isAiLoading = false,
   onTriggerDriveSync,
   onFlushOutbox,
+  onTriggerAiBackfill,
+  onCancelAiBackfill,
+  onOpenAiReviewQueue,
   onUnauthorized,
 }: SyncDrivePanelProps): ReactElement {
+  const aiRun = aiBackfillStatus?.run ?? null;
+  const isAiRunning = aiRun?.status === 'running';
+  const eligibleCount = aiBackfillStatus?.uncategorized_eligible_count ?? 0;
+  const pendingReviewCount = aiBackfillStatus?.pending_review_count ?? 0;
+  const progressTotal = Math.max(1, aiRun?.total_candidates ?? 0);
+  const progressProcessed = Math.min(aiRun?.processed_count ?? 0, progressTotal);
+  const progressPercent =
+    aiRun && aiRun.total_candidates > 0
+      ? Math.min(100, Math.round((aiRun.processed_count / aiRun.total_candidates) * 100))
+      : 0;
   return (
     <>
       <section className="cf-surface" style={{ padding: '16px' }} aria-labelledby="sync-heading">
@@ -557,6 +586,117 @@ export const SyncDrivePanel = memo(function SyncDrivePanel({
           ))}
         </div>
       </section>
+
+      <section className="cf-surface" style={{ padding: '16px', display: 'grid', gap: '12px' }} aria-labelledby="ai-sync-heading">
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '12px',
+            paddingBlockEnd: '12px',
+            borderBlockEnd: '1px solid var(--border-subtle)',
+          }}
+        >
+          <div style={{ minInlineSize: 0, display: 'grid', gap: '4px' }}>
+            <h2 id="ai-sync-heading" style={{ fontSize: '1.125rem' }}>
+              Catégorisation IA Gemini des opérations existantes
+            </h2>
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
+              Priorité stricte : Manuel &gt; Transfert interne &gt; Règle &gt; IA Gemini (&gt;= 85 % auto-appliqué)
+            </p>
+            <p className="tabular-amount" style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
+              {eligibleCount} opération(s) sans règle éligibles · {pendingReviewCount} en attente de révision IA
+            </p>
+          </div>
+
+          <div className="cf-header-actions">
+            {pendingReviewCount > 0 && onOpenAiReviewQueue ? (
+              <button type="button" className="cf-btn" onClick={onOpenAiReviewQueue}>
+                Ouvrir la boîte de révision IA ({pendingReviewCount})
+              </button>
+            ) : null}
+            {isAiRunning && onCancelAiBackfill ? (
+              <button
+                type="button"
+                className="cf-btn"
+                disabled={!isOnline || isAiLoading}
+                onClick={onCancelAiBackfill}
+              >
+                Annuler
+              </button>
+            ) : null}
+            {onTriggerAiBackfill ? (
+              <button
+                type="button"
+                className="cf-btn cf-btn-primary"
+                disabled={!isOnline || isAiRunning || isAiLoading}
+                onClick={onTriggerAiBackfill}
+              >
+                {!isOnline
+                  ? 'Connexion requise (hors-ligne)'
+                  : isAiRunning
+                    ? 'Analyse IA en cours…'
+                    : 'Catégoriser par IA les opérations sans règle'}
+              </button>
+            ) : null}
+          </div>
+        </div>
+
+        {!isOnline ? (
+          <p role="note" style={{ color: 'var(--warning)', fontWeight: 600 }}>
+            Catégorisation IA Gemini indisponible hors-ligne. Les validations déjà synchronisées restent consultables.
+          </p>
+        ) : null}
+
+        {aiRun !== null ? (
+          <div style={{ display: 'grid', gap: '8px' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '8px', fontSize: '0.8125rem' }}>
+              <span style={{ fontWeight: 600 }}>
+                {AI_RUN_STATUS_LABELS[aiRun.status] ?? aiRun.status}
+                {aiRun.model_used ? ` · Modèle : ${aiRun.model_used}` : ''}
+              </span>
+              <span className="tabular-amount">
+                {aiRun.processed_count} / {aiRun.total_candidates} ({progressPercent} %)
+              </span>
+            </div>
+
+            <div
+              className="cf-budget-track"
+              role="progressbar"
+              aria-label="Progression de la catégorisation IA"
+              aria-valuemin={0}
+              aria-valuemax={progressTotal}
+              aria-valuenow={progressProcessed}
+            >
+              <div
+                className="cf-budget-fill"
+                data-level={
+                  aiRun.status === 'failed'
+                    ? 'danger'
+                    : aiRun.status === 'partial_error'
+                      ? 'warning'
+                      : 'ok'
+                }
+                style={{ inlineSize: `${progressPercent}%` }}
+              />
+            </div>
+
+            <div className="tabular-amount" style={{ display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
+              <span>Auto-appliquées (&gt;= 85 %) : {aiRun.auto_applied_count}</span>
+              <span>À réviser (&lt; 85 %) : {aiRun.queued_review_count}</span>
+              {aiRun.failed_count > 0 ? (
+                <span style={{ color: 'var(--danger)' }}>Échecs : {aiRun.failed_count}</span>
+              ) : null}
+            </div>
+            {aiRun.last_error ? (
+              <p style={{ color: 'var(--danger)', fontSize: '0.8125rem' }}>{aiRun.last_error}</p>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
+
       <ApkDownloadCard isOnline={isOnline} onUnauthorized={onUnauthorized} />
     </>
   );

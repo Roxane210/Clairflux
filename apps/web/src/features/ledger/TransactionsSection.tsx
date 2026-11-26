@@ -1,8 +1,11 @@
 import {
   formatMoney,
   type Account,
+  type AiReviewItem,
+  type AiRuleSuggestion,
   type CategorizationRule,
   type Category,
+  type ResolveAiReviewDecision,
   type RuleId,
   type Transaction,
   type TransactionId,
@@ -10,6 +13,7 @@ import {
 } from '@clairflux/shared';
 import { memo, useCallback, useDeferredValue, useMemo, useState, type ReactElement } from 'react';
 import type {
+  AiActionResult,
   CategoryActionResult,
   CreateCategoryInput,
   DeleteCategoryInput,
@@ -25,6 +29,7 @@ import {
   type ResolvedDateBounds,
   type TransactionsSubTab,
 } from '../dashboard/types';
+import { AiReviewTab } from './AiReviewTab';
 import { CategoriesTab } from './CategoriesTab';
 import { exportTransactionsToCsv } from './csvExport';
 import { RulesTab, type SaveRuleInput } from './RulesTab';
@@ -35,6 +40,10 @@ export interface TransactionsSectionProps {
   readonly notes: readonly TransactionNote[];
   readonly rules: readonly CategorizationRule[];
   readonly categories?: readonly Category[] | undefined;
+  readonly aiReviewItems?: readonly AiReviewItem[] | undefined;
+  readonly aiRuleSuggestions?: readonly AiRuleSuggestion[] | undefined;
+  readonly pendingAiReviewCount?: number | undefined;
+  readonly isAiLoading?: boolean | undefined;
   readonly activeSubTab: TransactionsSubTab;
   readonly onChangeSubTab: (subTab: TransactionsSubTab) => void;
   readonly currencyMode: CurrencyViewMode;
@@ -51,6 +60,28 @@ export interface TransactionsSectionProps {
   readonly onUpdateCategory: (input: UpdateCategoryInput) => Promise<CategoryActionResult>;
   readonly onMergeCategory: (input: MergeCategoryInput) => Promise<CategoryActionResult>;
   readonly onDeleteCategory: (input: DeleteCategoryInput) => Promise<CategoryActionResult>;
+  readonly onRefreshAiReviewQueue?: (() => void) | undefined;
+  readonly onResolveAiReviewDecisions?:
+    | ((decisions: readonly ResolveAiReviewDecision[]) => Promise<AiActionResult>)
+    | undefined;
+  readonly onAcceptAiRuleSuggestion?: ((id: string) => Promise<AiActionResult>) | undefined;
+  readonly onDismissAiRuleSuggestion?: ((id: string) => Promise<AiActionResult>) | undefined;
+}
+
+function formatCategorySourceSuffix(tx: Transaction): string {
+  switch (tx.category_source) {
+    case 'manual':
+      return ' · Manuel';
+    case 'rule':
+      return ' · Règle';
+    case 'ai_auto':
+      return ' · IA';
+    case 'ai_validated':
+      return ' · IA validée';
+    case 'uncategorized':
+    case undefined:
+      return tx.is_manual_category ? ' · Manuel' : '';
+  }
 }
 
 const BAR_STYLE = {
@@ -69,6 +100,10 @@ export const TransactionsSection = memo(function TransactionsSection({
   notes,
   rules,
   categories,
+  aiReviewItems = [],
+  aiRuleSuggestions = [],
+  pendingAiReviewCount = 0,
+  isAiLoading = false,
   activeSubTab,
   onChangeSubTab,
   currencyMode,
@@ -85,6 +120,10 @@ export const TransactionsSection = memo(function TransactionsSection({
   onUpdateCategory,
   onMergeCategory,
   onDeleteCategory,
+  onRefreshAiReviewQueue,
+  onResolveAiReviewDecisions,
+  onAcceptAiRuleSuggestion,
+  onDismissAiRuleSuggestion,
 }: TransactionsSectionProps): ReactElement {
   const [searchQuery, setSearchQuery] = useState('');
   const [onlyWithNotes, setOnlyWithNotes] = useState(false);
@@ -143,6 +182,9 @@ export const TransactionsSection = memo(function TransactionsSection({
           <button type="button" className="cf-pill-btn" aria-pressed={activeSubTab === 'operations'} onClick={() => onChangeSubTab('operations')}>
             Opérations
           </button>
+          <button type="button" className="cf-pill-btn" aria-pressed={activeSubTab === 'review'} onClick={() => onChangeSubTab('review')}>
+            À réviser (IA){pendingAiReviewCount > 0 ? ` (${pendingAiReviewCount})` : ''}
+          </button>
           <button type="button" className="cf-pill-btn" aria-pressed={activeSubTab === 'rules'} onClick={() => onChangeSubTab('rules')}>
             Règles de catégorisation
           </button>
@@ -164,6 +206,27 @@ export const TransactionsSection = memo(function TransactionsSection({
           onReorderRule={onReorderRule}
           onToggleRule={onToggleRule}
           onReapplyRules={onReapplyRules}
+        />
+      ) : activeSubTab === 'review' ? (
+        <AiReviewTab
+          items={aiReviewItems}
+          suggestions={aiRuleSuggestions}
+          categories={categories}
+          isOnline={isOnline}
+          isAiLoading={isAiLoading}
+          onRefreshQueue={onRefreshAiReviewQueue ?? (() => undefined)}
+          onResolveDecisions={
+            onResolveAiReviewDecisions ??
+            (async () => ({ ok: false, message: 'Action IA indisponible.' }))
+          }
+          onAcceptSuggestion={
+            onAcceptAiRuleSuggestion ??
+            (async () => ({ ok: false, message: 'Action IA indisponible.' }))
+          }
+          onDismissSuggestion={
+            onDismissAiRuleSuggestion ??
+            (async () => ({ ok: false, message: 'Action IA indisponible.' }))
+          }
         />
       ) : activeSubTab === 'categories' ? (
         <CategoriesTab
@@ -239,7 +302,7 @@ export const TransactionsSection = memo(function TransactionsSection({
                               {tx.clean_label}
                             </button>
                           </td>
-                          <td>{tx.category}{tx.is_manual_category ? ' · Manuel' : ''}</td>
+                          <td>{tx.category}{formatCategorySourceSuffix(tx)}</td>
                           <td style={{ color: 'var(--text-secondary)' }}>{note ? note.content : '—'}</td>
                           <td style={{ textAlign: 'end' }} className="tabular-amount">
                             <div>{formatMoney(tx.amount_cents, tx.currency)}</div>
@@ -266,7 +329,7 @@ export const TransactionsSection = memo(function TransactionsSection({
                         <span className="tabular-amount" style={{ fontWeight: 600, flexShrink: 0 }}>{formatMoney(tx.amount_cents, tx.currency)}</span>
                       </span>
                       <span className="cf-row-line" style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
-                        <span className="cf-truncate">{tx.booking_date} · {BANK_LABELS[tx.bank]} · {accountLabel} · {tx.category}</span>
+                        <span className="cf-truncate">{tx.booking_date} · {BANK_LABELS[tx.bank]} · {accountLabel} · {tx.category}{formatCategorySourceSuffix(tx)}</span>
                         {tx.currency === 'USD' && currencyMode === 'eur_consolidated' ? (
                           <span className="tabular-amount" style={{ flexShrink: 0 }}>≈ {formatMoney(tx.amount_eur_cents, 'EUR')}</span>
                         ) : null}

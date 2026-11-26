@@ -12,6 +12,7 @@ import {
   toSyncRevision,
   type Account,
   type AccountType,
+  type AiRuleSuggestion,
   type Bank,
   type CategorizationRule,
   type Category,
@@ -44,7 +45,7 @@ export type AppTab =
   | { readonly kind: 'transactions' }
   | { readonly kind: 'sync' };
 
-export type TransactionsSubTab = 'operations' | 'rules' | 'categories';
+export type TransactionsSubTab = 'operations' | 'review' | 'rules' | 'categories';
 
 export type ExpenseComparisonMode = 'none' | 'prev_month' | 'avg_3m';
 
@@ -74,6 +75,8 @@ export type ClairFluxDataset = {
   readonly notes: readonly TransactionNote[];
   readonly rules: readonly CategorizationRule[];
   readonly categories?: readonly Category[] | undefined;
+  readonly ai_rule_suggestions?: readonly AiRuleSuggestion[] | undefined;
+  readonly pending_ai_review_count?: number | undefined;
   readonly budgets: readonly BudgetLimit[];
   readonly driveFiles: readonly DriveSyncFileStatus[];
   readonly revision: number;
@@ -1086,6 +1089,8 @@ export const EMPTY_LIVE_DATASET: ClairFluxDataset = {
   notes: [],
   rules: [],
   categories: [],
+  ai_rule_suggestions: [],
+  pending_ai_review_count: 0,
   budgets: [],
   driveFiles: [],
   revision: 0,
@@ -1098,6 +1103,8 @@ export const INITIAL_SEED_DATASET: ClairFluxDataset = {
   notes: INITIAL_NOTES,
   rules: INITIAL_RULES,
   categories: DEFAULT_FRENCH_CATEGORY_PACK,
+  ai_rule_suggestions: [],
+  pending_ai_review_count: 0,
   budgets: INITIAL_BUDGETS,
   driveFiles: INITIAL_DRIVE_FILES,
   revision: 1482,

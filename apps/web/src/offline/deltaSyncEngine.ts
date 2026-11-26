@@ -241,6 +241,28 @@ export function applyDeltaToDataset(
       : left.name.localeCompare(right.name, 'fr'),
   );
 
+  const suggestionMap = new Map(
+    (reset ? [] : (current.ai_rule_suggestions ?? [])).map((sug) => [sug.id, sug] as const),
+  );
+  if (delta.ai_rule_suggestions !== undefined) {
+    for (const suggestion of delta.ai_rule_suggestions) {
+      suggestionMap.set(suggestion.id, suggestion);
+    }
+  }
+  const sortedSuggestions = [...suggestionMap.values()].sort((left, right) => {
+    if (left.sample_count !== right.sample_count) {
+      return right.sample_count - left.sample_count;
+    }
+    return left.merchant_pattern.localeCompare(right.merchant_pattern, 'fr');
+  });
+
+  const nextPendingAiReviewCount =
+    delta.pending_ai_review_count !== undefined
+      ? delta.pending_ai_review_count
+      : reset
+        ? 0
+        : current.pending_ai_review_count;
+
   return {
     accounts: [...accountMap.values()],
     transactions: sortedTransactions,
@@ -248,6 +270,14 @@ export function applyDeltaToDataset(
     rules: sortedRules,
     ...(current.categories !== undefined || delta.categories !== undefined || reset
       ? { categories: sortedCategories }
+      : {}),
+    ...(current.ai_rule_suggestions !== undefined ||
+    delta.ai_rule_suggestions !== undefined ||
+    reset
+      ? { ai_rule_suggestions: sortedSuggestions }
+      : {}),
+    ...(nextPendingAiReviewCount !== undefined
+      ? { pending_ai_review_count: nextPendingAiReviewCount }
       : {}),
     budgets: current.budgets,
     driveFiles,

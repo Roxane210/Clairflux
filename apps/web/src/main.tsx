@@ -84,9 +84,20 @@ function ClairFluxApp(): ReactElement {
     isSyncingDrive,
     pendingOutboxCount,
     syncMessage,
+    aiBackfillStatus,
+    aiReviewItems,
+    aiRuleSuggestions,
+    isAiLoading,
     flushNow,
     syncFromServer,
     triggerDriveSync,
+    refreshAiStatus,
+    triggerAiBackfill,
+    cancelAiBackfill,
+    fetchAiReviewQueue,
+    resolveAiReviewDecisions,
+    acceptAiRuleSuggestion,
+    dismissAiRuleSuggestion,
   } = store;
 
   const hasCachedData =
@@ -227,6 +238,34 @@ function ClairFluxApp(): ReactElement {
     void triggerDriveSync();
   }, [triggerDriveSync]);
 
+  const handleOpenAiReviewQueue = useCallback((): void => {
+    setActiveSubTab('review');
+    runWithViewTransition(
+      () => setActiveTab({ kind: 'transactions' }),
+      prefersReducedMotion,
+      HEADING_BY_TAB.transactions,
+    );
+    if (isOnline) {
+      void fetchAiReviewQueue();
+    }
+  }, [fetchAiReviewQueue, isOnline, prefersReducedMotion]);
+
+  const handleChangeTransactionsSubTab = useCallback(
+    (nextSubTab: TransactionsSubTab): void => {
+      setActiveSubTab(nextSubTab);
+      if (nextSubTab === 'review' && isOnline) {
+        void fetchAiReviewQueue();
+      }
+    },
+    [fetchAiReviewQueue, isOnline],
+  );
+
+  useEffect(() => {
+    if (authState.kind === 'authenticated' && isOnline) {
+      void refreshAiStatus();
+    }
+  }, [authState.kind, isOnline, refreshAiStatus]);
+
   if (authState.kind === 'checking') {
     return (
       <div className="cf-auth-shell">
@@ -288,8 +327,16 @@ function ClairFluxApp(): ReactElement {
               notes={dataset.notes}
               rules={dataset.rules}
               categories={dataset.categories}
+              aiReviewItems={aiReviewItems}
+              aiRuleSuggestions={aiRuleSuggestions}
+              pendingAiReviewCount={
+                aiBackfillStatus?.pending_review_count ??
+                dataset.pending_ai_review_count ??
+                aiReviewItems.length
+              }
+              isAiLoading={isAiLoading}
               activeSubTab={activeSubTab}
-              onChangeSubTab={setActiveSubTab}
+              onChangeSubTab={handleChangeTransactionsSubTab}
               currencyMode={currencyMode}
               bankFilter={bankFilter}
               dateBounds={dateBounds}
@@ -304,6 +351,10 @@ function ClairFluxApp(): ReactElement {
               onUpdateCategory={store.updateCategory}
               onMergeCategory={store.mergeCategory}
               onDeleteCategory={store.deleteCategory}
+              onRefreshAiReviewQueue={() => void fetchAiReviewQueue()}
+              onResolveAiReviewDecisions={resolveAiReviewDecisions}
+              onAcceptAiRuleSuggestion={acceptAiRuleSuggestion}
+              onDismissAiRuleSuggestion={dismissAiRuleSuggestion}
             />
           </Suspense>
         );
@@ -315,8 +366,13 @@ function ClairFluxApp(): ReactElement {
             isSyncingDrive={isSyncingDrive}
             pendingOutboxCount={pendingOutboxCount}
             syncMessage={syncMessage}
+            aiBackfillStatus={aiBackfillStatus}
+            isAiLoading={isAiLoading}
             onTriggerDriveSync={handleTriggerDriveSync}
             onFlushOutbox={handleFlushOutbox}
+            onTriggerAiBackfill={() => void triggerAiBackfill()}
+            onCancelAiBackfill={() => void cancelAiBackfill()}
+            onOpenAiReviewQueue={handleOpenAiReviewQueue}
             onUnauthorized={handleUnauthorized}
           />
         );

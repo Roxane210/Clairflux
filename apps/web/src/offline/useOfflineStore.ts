@@ -1,21 +1,29 @@
 import {
+  AiCategorizationRunSchema,
+  AiReviewItemSchema,
+  AiRuleSuggestionSchema,
   ApiErrorEnvelopeSchema,
   CategorySchema,
   parseRuleId,
   toSyncRevision,
   type AccountId,
+  type AiCategorizationRun,
+  type AiReviewItem,
+  type AiRuleSuggestion,
   type Bank,
   type BudgetGroup,
   type CategorizationRule,
   type Category,
   type CategoryId,
   type DriveSyncRunSummary,
+  type ResolveAiReviewDecision,
   type RuleId,
   type Transaction,
   type TransactionId,
   type TransactionNote,
 } from '@clairflux/shared';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { z } from 'zod';
 import { createAuthAwareFetcher } from '../features/auth/authClient';
 import type { ClairFluxDataset } from '../features/dashboard/types';
 import { buildApiEndpointUrl } from './apiUrl';
@@ -41,6 +49,19 @@ import {
 
 export const CATEGORY_OFFLINE_MESSAGE =
   'Gestion des catégories indisponible hors-ligne — connexion requise.' as const;
+
+export const AI_OFFLINE_MESSAGE =
+  'Catégorisation IA Gemini indisponible hors-ligne — connexion requise.' as const;
+
+export interface AiBackfillStatusSummary {
+  readonly run: AiCategorizationRun | null;
+  readonly pending_review_count: number;
+  readonly uncategorized_eligible_count: number;
+}
+
+export type AiActionResult =
+  | { readonly ok: true; readonly message: string }
+  | { readonly ok: false; readonly message: string };
 
 export interface CreateCategoryInput {
   readonly parent_id: CategoryId | null;
@@ -90,6 +111,10 @@ export interface OfflineStoreApi {
   readonly isSyncingDrive: boolean;
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
+  readonly aiBackfillStatus: AiBackfillStatusSummary | null;
+  readonly aiReviewItems: readonly AiReviewItem[];
+  readonly aiRuleSuggestions: readonly AiRuleSuggestion[];
+  readonly isAiLoading: boolean;
   readonly saveQuickNote: (transactionId: TransactionId, content: string) => Promise<void>;
   readonly updateManualCategory: (
     transactionId: TransactionId,
@@ -105,6 +130,15 @@ export interface OfflineStoreApi {
   readonly toggleRule: (ruleId: RuleId) => Promise<void>;
   readonly reapplyRules: () => Promise<void>;
   readonly triggerDriveSync: () => Promise<void>;
+  readonly refreshAiStatus: () => Promise<AiBackfillStatusSummary | null>;
+  readonly triggerAiBackfill: () => Promise<AiActionResult>;
+  readonly cancelAiBackfill: () => Promise<AiActionResult>;
+  readonly fetchAiReviewQueue: () => Promise<readonly AiReviewItem[]>;
+  readonly resolveAiReviewDecisions: (
+    decisions: readonly ResolveAiReviewDecision[],
+  ) => Promise<AiActionResult>;
+  readonly acceptAiRuleSuggestion: (id: string) => Promise<AiActionResult>;
+  readonly dismissAiRuleSuggestion: (id: string) => Promise<AiActionResult>;
   readonly syncFromServer: () => Promise<void>;
   readonly flushNow: () => Promise<void>;
 }
@@ -115,6 +149,10 @@ export interface OfflineStoreState {
   readonly isSyncingDrive: boolean;
   readonly pendingOutboxCount: number;
   readonly syncMessage: string | null;
+  readonly aiBackfillStatus: AiBackfillStatusSummary | null;
+  readonly aiReviewItems: readonly AiReviewItem[];
+  readonly aiRuleSuggestions: readonly AiRuleSuggestion[];
+  readonly isAiLoading: boolean;
 }
 
 export interface OfflineControllerOptions {
@@ -148,9 +186,31 @@ export interface OfflineController {
   toggleRule(ruleId: RuleId): Promise<void>;
   reapplyRules(): Promise<void>;
   triggerDriveSync(): Promise<void>;
+  refreshAiStatus(): Promise<AiBackfillStatusSummary | null>;
+  triggerAiBackfill(): Promise<AiActionResult>;
+  cancelAiBackfill(): Promise<AiActionResult>;
+  fetchAiReviewQueue(): Promise<readonly AiReviewItem[]>;
+  resolveAiReviewDecisions(decisions: readonly ResolveAiReviewDecision[]): Promise<AiActionResult>;
+  acceptAiRuleSuggestion(id: string): Promise<AiActionResult>;
+  dismissAiRuleSuggestion(id: string): Promise<AiActionResult>;
   syncFromServer(): Promise<void>;
   flushNow(): Promise<void>;
 }
+
+const AiStatusResponseSchema = z.object({
+  run: AiCategorizationRunSchema.nullable(),
+  pending_review_count: z.number().int().min(0),
+  uncategorized_eligible_count: z.number().int().min(0),
+});
+
+const AiReviewQueueResponseSchema = z.object({
+  items: z.array(AiReviewItemSchema),
+  total_pending: z.number().int().min(0).optional(),
+});
+
+const AiRuleSuggestionsResponseSchema = z.object({
+  suggestions: z.array(AiRuleSuggestionSchema),
+});
 
 // ============================================================================
 // Pure Dataset Mutation Helpers
@@ -235,6 +295,10 @@ export function createOfflineController(
     isSyncingDrive: false,
     pendingOutboxCount: 0,
     syncMessage: null,
+    aiBackfillStatus: null,
+    aiReviewItems: [],
+    aiRuleSuggestions: initialSeed.ai_rule_suggestions ?? [],
+    isAiLoading: false,
   };
 
   const listeners = new Set<(next: OfflineStoreState) => void>();
@@ -401,6 +465,9 @@ export function createOfflineController(
         : null;
     emit({
       dataset: pullOutcome.dataset,
+      ...(pullOutcome.dataset.ai_rule_suggestions !== undefined
+        ? { aiRuleSuggestions: pullOutcome.dataset.ai_rule_suggestions }
+        : {}),
       syncMessage:
         failedRunMessage ??
         (pullOutcome.dataset.revision > 0
@@ -409,18 +476,19 @@ export function createOfflineController(
     });
   };
 
-    const requestCategoryApi = async (
+    const requestJsonApi = async (
       path: `/api/${string}`,
-      method: 'POST' | 'PATCH' | 'DELETE',
-      bodyPayload: Record<string, unknown>,
+      method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
+      bodyPayload: Record<string, unknown> | null,
       fallbackError: string,
+      offlineMessage: string,
     ): Promise<
       | { readonly ok: true; readonly json: unknown }
       | { readonly ok: false; readonly message: string }
     > => {
       if (!state.isOnline) {
-        emit({ syncMessage: CATEGORY_OFFLINE_MESSAGE });
-        return { ok: false, message: CATEGORY_OFFLINE_MESSAGE };
+        emit({ syncMessage: offlineMessage });
+        return { ok: false, message: offlineMessage };
       }
 
       try {
@@ -428,11 +496,11 @@ export function createOfflineController(
           method,
           credentials: 'include',
           headers: {
-            'Content-Type': 'application/json',
+            ...(bodyPayload !== null ? { 'Content-Type': 'application/json' } : {}),
             Accept: 'application/json',
             'X-Clairflux-Client': 'web',
           },
-          body: JSON.stringify(bodyPayload),
+          ...(bodyPayload !== null ? { body: JSON.stringify(bodyPayload) } : {}),
         });
 
         if (response.status === 401) {
@@ -460,7 +528,7 @@ export function createOfflineController(
         try {
           json = await response.json();
         } catch {
-          // Non-JSON body still triggers delta sync refresh
+          // Non-JSON body still succeeds
         }
         return { ok: true, json };
       } catch (error: unknown) {
@@ -469,6 +537,16 @@ export function createOfflineController(
         return { ok: false, message: msg };
       }
     };
+
+    const requestCategoryApi = (
+      path: `/api/${string}`,
+      method: 'POST' | 'PATCH' | 'DELETE',
+      bodyPayload: Record<string, unknown>,
+      fallbackError: string,
+    ): Promise<
+      | { readonly ok: true; readonly json: unknown }
+      | { readonly ok: false; readonly message: string }
+    > => requestJsonApi(path, method, bodyPayload, fallbackError, CATEGORY_OFFLINE_MESSAGE);
 
     const finalizeCategoryDataset = async (
       optimisticDataset: ClairFluxDataset,
@@ -641,6 +719,244 @@ export function createOfflineController(
       return finalizeCategoryDataset(nextDataset, 'Catégorie supprimée et opérations réaffectées.');
     }
 
+    async function refreshAiStatus(): Promise<AiBackfillStatusSummary | null> {
+      if (!state.isOnline) {
+        return null;
+      }
+      const outcome = await requestJsonApi(
+        '/api/ai/categorize/status',
+        'GET',
+        null,
+        'Impossible de lire le statut IA',
+        AI_OFFLINE_MESSAGE,
+      );
+      if (!outcome.ok) {
+        return null;
+      }
+      const parsed = AiStatusResponseSchema.safeParse(outcome.json);
+      if (!parsed.success) {
+        return null;
+      }
+      emit({
+        aiBackfillStatus: parsed.data,
+        dataset: {
+          ...state.dataset,
+          pending_ai_review_count: parsed.data.pending_review_count,
+        },
+      });
+      return parsed.data;
+    }
+
+    async function triggerAiBackfill(): Promise<AiActionResult> {
+      if (!state.isOnline) {
+        emit({ syncMessage: AI_OFFLINE_MESSAGE });
+        return { ok: false, message: AI_OFFLINE_MESSAGE };
+      }
+      emit({ isAiLoading: true });
+      try {
+        const outcome = await requestJsonApi(
+          '/api/ai/categorize/backfill',
+          'POST',
+          {},
+          'Impossible de lancer la catégorisation IA',
+          AI_OFFLINE_MESSAGE,
+        );
+        if (!outcome.ok) {
+          return outcome;
+        }
+        await refreshAiStatus();
+        const msg = 'Catégorisation IA Gemini lancée en lots de 50 opérations.';
+        emit({ syncMessage: msg });
+        return { ok: true, message: msg };
+      } finally {
+        emit({ isAiLoading: false });
+      }
+    }
+
+    async function cancelAiBackfill(): Promise<AiActionResult> {
+      if (!state.isOnline) {
+        emit({ syncMessage: AI_OFFLINE_MESSAGE });
+        return { ok: false, message: AI_OFFLINE_MESSAGE };
+      }
+      emit({ isAiLoading: true });
+      try {
+        const activeRunId = state.aiBackfillStatus?.run?.id;
+        const outcome = await requestJsonApi(
+          '/api/ai/categorize/cancel',
+          'POST',
+          activeRunId ? { run_id: activeRunId } : {},
+          'Impossible d’annuler la catégorisation IA',
+          AI_OFFLINE_MESSAGE,
+        );
+        if (!outcome.ok) {
+          return outcome;
+        }
+        await refreshAiStatus();
+        const msg = 'Annulation de la catégorisation IA demandée.';
+        emit({ syncMessage: msg });
+        return { ok: true, message: msg };
+      } finally {
+        emit({ isAiLoading: false });
+      }
+    }
+
+    async function fetchAiReviewQueue(): Promise<readonly AiReviewItem[]> {
+      if (!state.isOnline) {
+        return state.aiReviewItems;
+      }
+      emit({ isAiLoading: true });
+      try {
+        const [queueOutcome, suggestionsOutcome] = await Promise.all([
+          requestJsonApi(
+            '/api/ai/review-queue?limit=50&offset=0',
+            'GET',
+            null,
+            'Impossible de charger la boîte de révision IA',
+            AI_OFFLINE_MESSAGE,
+          ),
+          requestJsonApi(
+            '/api/ai/rule-suggestions?status=pending',
+            'GET',
+            null,
+            'Impossible de charger les suggestions de règles',
+            AI_OFFLINE_MESSAGE,
+          ),
+        ]);
+
+        let nextItems = state.aiReviewItems;
+        let nextPendingCount = state.dataset.pending_ai_review_count ?? 0;
+        if (queueOutcome.ok) {
+          const parsedQueue = AiReviewQueueResponseSchema.safeParse(queueOutcome.json);
+          if (parsedQueue.success) {
+            nextItems = parsedQueue.data.items;
+            nextPendingCount = parsedQueue.data.total_pending ?? parsedQueue.data.items.length;
+          }
+        }
+
+        let nextSuggestions = state.aiRuleSuggestions;
+        if (suggestionsOutcome.ok) {
+          const parsedSuggestions = AiRuleSuggestionsResponseSchema.safeParse(
+            suggestionsOutcome.json,
+          );
+          if (parsedSuggestions.success) {
+            nextSuggestions = parsedSuggestions.data.suggestions;
+          }
+        }
+
+        emit({
+          aiReviewItems: nextItems,
+          aiRuleSuggestions: nextSuggestions,
+          dataset: {
+            ...state.dataset,
+            ai_rule_suggestions: nextSuggestions,
+            pending_ai_review_count: nextPendingCount,
+          },
+        });
+        return nextItems;
+      } finally {
+        emit({ isAiLoading: false });
+      }
+    }
+
+    async function resolveAiReviewDecisions(
+      decisions: readonly ResolveAiReviewDecision[],
+    ): Promise<AiActionResult> {
+      if (!state.isOnline) {
+        emit({ syncMessage: AI_OFFLINE_MESSAGE });
+        return { ok: false, message: AI_OFFLINE_MESSAGE };
+      }
+      if (decisions.length === 0) {
+        return { ok: true, message: 'Aucune décision à enregistrer.' };
+      }
+      emit({ isAiLoading: true });
+      try {
+        const outcome = await requestJsonApi(
+          '/api/ai/review-queue/resolve',
+          'POST',
+          { decisions },
+          'Impossible de valider la révision IA',
+          AI_OFFLINE_MESSAGE,
+        );
+        if (!outcome.ok) {
+          return outcome;
+        }
+        const resolvedIds = new Set(decisions.map((d) => d.transaction_id));
+        const remainingItems = state.aiReviewItems.filter(
+          (item) => !resolvedIds.has(item.transaction_id),
+        );
+        emit({
+          aiReviewItems: remainingItems,
+          dataset: {
+            ...state.dataset,
+            pending_ai_review_count: remainingItems.length,
+          },
+        });
+        await syncFromServer();
+        await fetchAiReviewQueue();
+        await refreshAiStatus();
+        const msg = `${decisions.length} opération(s) traitée(s) dans la boîte de révision IA.`;
+        emit({ syncMessage: msg });
+        return { ok: true, message: msg };
+      } finally {
+        emit({ isAiLoading: false });
+      }
+    }
+
+    async function handleRuleSuggestionAction(
+      id: string,
+      verb: 'accept' | 'dismiss',
+      fallbackError: string,
+      successMessage: string,
+    ): Promise<AiActionResult> {
+      if (!state.isOnline) {
+        emit({ syncMessage: AI_OFFLINE_MESSAGE });
+        return { ok: false, message: AI_OFFLINE_MESSAGE };
+      }
+      emit({ isAiLoading: true });
+      try {
+        const outcome = await requestJsonApi(
+          `/api/ai/rule-suggestions/${encodeURIComponent(id)}/${verb}`,
+          'POST',
+          {},
+          fallbackError,
+          AI_OFFLINE_MESSAGE,
+        );
+        if (!outcome.ok) {
+          return outcome;
+        }
+        const nextSuggestions = state.aiRuleSuggestions.filter((sug) => sug.id !== id);
+        emit({
+          aiRuleSuggestions: nextSuggestions,
+          dataset: {
+            ...state.dataset,
+            ai_rule_suggestions: nextSuggestions,
+          },
+        });
+        await syncFromServer();
+        await refreshAiStatus();
+        emit({ syncMessage: successMessage });
+        return { ok: true, message: successMessage };
+      } finally {
+        emit({ isAiLoading: false });
+      }
+    }
+
+    const acceptAiRuleSuggestion = (id: string): Promise<AiActionResult> =>
+      handleRuleSuggestionAction(
+        id,
+        'accept',
+        'Impossible d’accepter la suggestion de règle',
+        'Règle automatique créée et appliquée aux opérations éligibles.',
+      );
+
+    const dismissAiRuleSuggestion = (id: string): Promise<AiActionResult> =>
+      handleRuleSuggestionAction(
+        id,
+        'dismiss',
+        'Impossible d’ignorer la suggestion de règle',
+        'Suggestion de règle ignorée.',
+      );
+
     return {
       getState(): OfflineStoreState {
       return state;
@@ -660,6 +976,7 @@ export function createOfflineController(
         if (cached !== null) {
           emit({
             dataset: cached,
+            aiRuleSuggestions: cached.ai_rule_suggestions ?? [],
             pendingOutboxCount: outbox.length,
           });
         } else {
@@ -1058,6 +1375,13 @@ export function createOfflineController(
       }
     },
 
+    refreshAiStatus,
+    triggerAiBackfill,
+    cancelAiBackfill,
+    fetchAiReviewQueue,
+    resolveAiReviewDecisions,
+    acceptAiRuleSuggestion,
+    dismissAiRuleSuggestion,
     syncFromServer,
     flushNow,
   };
@@ -1089,6 +1413,7 @@ export function useOfflineStore(
 
   const controller = controllerRef.current;
   const [state, setState] = useState<OfflineStoreState>(() => controller.getState());
+  const prevRunStatusRef = useRef<AiCategorizationRun['status'] | null>(null);
 
   useEffect(() => {
     const unsubscribe = controller.subscribe(setState);
@@ -1106,6 +1431,35 @@ export function useOfflineStore(
       bridgeRef.current = null;
     };
   }, [controller]);
+
+  const currentRunStatus = state.aiBackfillStatus?.run?.status ?? null;
+
+  useEffect(() => {
+    const prevStatus = prevRunStatusRef.current;
+    prevRunStatusRef.current = currentRunStatus;
+
+    if (
+      prevStatus === 'running' &&
+      currentRunStatus !== null &&
+      currentRunStatus !== 'running' &&
+      state.isOnline
+    ) {
+      void controller.syncFromServer();
+      void controller.fetchAiReviewQueue();
+    }
+  }, [controller, currentRunStatus, state.isOnline]);
+
+  useEffect(() => {
+    if (!state.isOnline || currentRunStatus !== 'running') {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      void controller.refreshAiStatus();
+    }, 2000);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [controller, currentRunStatus, state.isOnline]);
 
   const saveQuickNote = useCallback(
     (transactionId: TransactionId, content: string) =>
@@ -1156,6 +1510,23 @@ export function useOfflineStore(
 
   const reapplyRules = useCallback(() => controller.reapplyRules(), [controller]);
   const triggerDriveSync = useCallback(() => controller.triggerDriveSync(), [controller]);
+  const refreshAiStatus = useCallback(() => controller.refreshAiStatus(), [controller]);
+  const triggerAiBackfill = useCallback(() => controller.triggerAiBackfill(), [controller]);
+  const cancelAiBackfill = useCallback(() => controller.cancelAiBackfill(), [controller]);
+  const fetchAiReviewQueue = useCallback(() => controller.fetchAiReviewQueue(), [controller]);
+  const resolveAiReviewDecisions = useCallback(
+    (decisions: readonly ResolveAiReviewDecision[]) =>
+      controller.resolveAiReviewDecisions(decisions),
+    [controller],
+  );
+  const acceptAiRuleSuggestion = useCallback(
+    (id: string) => controller.acceptAiRuleSuggestion(id),
+    [controller],
+  );
+  const dismissAiRuleSuggestion = useCallback(
+    (id: string) => controller.dismissAiRuleSuggestion(id),
+    [controller],
+  );
   const syncFromServer = useCallback(() => controller.syncFromServer(), [controller]);
   const flushNow = useCallback(() => controller.flushNow(), [controller]);
 
@@ -1165,6 +1536,10 @@ export function useOfflineStore(
     isSyncingDrive: state.isSyncingDrive,
     pendingOutboxCount: state.pendingOutboxCount,
     syncMessage: state.syncMessage,
+    aiBackfillStatus: state.aiBackfillStatus,
+    aiReviewItems: state.aiReviewItems,
+    aiRuleSuggestions: state.aiRuleSuggestions,
+    isAiLoading: state.isAiLoading,
     saveQuickNote,
     updateManualCategory,
     createCategory,
@@ -1176,6 +1551,13 @@ export function useOfflineStore(
     toggleRule,
     reapplyRules,
     triggerDriveSync,
+    refreshAiStatus,
+    triggerAiBackfill,
+    cancelAiBackfill,
+    fetchAiReviewQueue,
+    resolveAiReviewDecisions,
+    acceptAiRuleSuggestion,
+    dismissAiRuleSuggestion,
     syncFromServer,
     flushNow,
   };
