@@ -2,12 +2,25 @@
 
 Application personnelle de suivi financier multi-banques et multi-comptes (**BoursoBank** & **Revolut**), conçue selon la gouvernance **EGM (Elephant-and-Goldfish Model)** : spécifications normatives verrouillées avant code, arithmétique comptable exacte en centimes entiers, ingestion PDF manuelle via Google Drive & Gemini, et application Web / APK Android **Offline-First**.
 
-- **Version active** : `v1.1.0-build.1` (Lot 1 — Catégories à 2 niveaux & Google Pixel 8 Portrait/Paysage)
+- **Version active** : `v1.1.0-build.2` (Lot 2 — Catégorisation hybride IA Gemini, Boîte de révision & Suggestions de règles)
 - **Dépôt GitHub officiel** : <https://github.com/Roxane210/Clairflux>
 - **Mode d'emploi utilisateur (Product Owner)** : [./docs/USER_GUIDE.md](./docs/USER_GUIDE.md)
 - **Journal des versions** : [./CHANGELOG.md](./CHANGELOG.md)
 - **Guide de mise en production** : [./PRODUCTION_DEPLOY.md](./PRODUCTION_DEPLOY.md)
 - **Modèle de variables d'environnement** : [./.env.example](./.env.example)
+
+---
+
+## Nouveautés Lot 2 (`v1.1.0-build.2`)
+
+### Catégorisation hybride IA Gemini, Boîte de révision & Suggestions de règles
+- **Hiérarchie de priorité stricte** : **`Manuel > Virement interne > Règle utilisateur > IA Gemini`**. Aucune correction manuelle, aucun virement interne apparié ni aucune règle existante n'est jamais écrasé par l'IA.
+- **Seuil d'application automatique (`>= 85 %` / `8500 bp`) & Boîte de révision IA** :
+  - Confiance `>= 85 %` : classement automatique en sous-catégorie du pack actif (toujours modifiable ensuite).
+  - Confiance `< 85 %` : mise en attente dans **`Transactions > À réviser (IA)`** avec explication courte et score de confiance (Valider en 1 clic, Corriger sur 2 niveaux, Ignorer, ou Valider + Créer une règle permanente).
+- **Suggestions automatiques de règles gratuites** : dès **3 opérations similaires** sans règle (`ai_rule_suggestions`), ClairFlux propose une règle durable acceptable en 1 clic afin que les relevés suivants soient classés localement sans consommer d'appel Gemini.
+- **Rattrapage manuel de l'historique depuis `Synchro`** : déclenchement exclusivement manuel (jamais en tâche de fond), traitement par lots de 50 opérations dans `sync-worker` via la chaîne de repli 3 modèles **`gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.1-flash-lite`** (clé `GEMINI_API_KEY` isolée dans `sync-worker` via en-tête `x-goog-api-key`, zéro ajout `.env` requis), barre de progression en direct et bouton d'annulation coopérative.
+- **Persistance & API `/api/ai/*`** : migration SQL additive `0002_lot2_ai_categorization_expand.sql` (`ai_categorization_runs`, `ai_rule_suggestions`), routes `/api/ai/categorize/*`, `/api/ai/review-queue*`, `/api/ai/rule-suggestions*` et extension rétrocompatible de `GET /api/sync/delta`.
 
 ---
 
@@ -73,12 +86,12 @@ Application personnelle de suivi financier multi-banques et multi-comptes (**Bou
 
 ## Index des packages (EGM Blueprint)
 
-| Workspace / Artefact | Rôle (`v1.1.0-build.1`) | Documentation EGM |
+| Workspace / Artefact | Rôle (`v1.1.0-build.2`) | Documentation EGM |
 | :--- | :--- | :--- |
-| **`@clairflux/shared`** | Contrats Zod partagés, Branded Types, constantes Drive, pack français de catégories à 2 niveaux, arithmétique centimes/FX et `CLAIRFLUX_BUILD_VERSION`. | [./packages/shared/README.md](./packages/shared/README.md) |
-| **`@clairflux/api`** | API HTTP Node 22 (`Hono` + `apps/api/src/server.ts`), auth Argon2id/HMAC-SHA256 + CSRF fail-closed, routes métier (`/api/categories`, `/api/transactions`, `/api/rules`, `/api/budgets`, `/api/aggregates`, `GET/POST /api/sync/delta`, `POST /api/sync/drive`, `GET /api/apk/status`, `GET /api/apk/download`), persistance Drizzle Neon & migrations Expand. | [./apps/api/README.md](./apps/api/README.md) |
-| **`@clairflux/sync-worker`** | Worker isolé Drive (2 dossiers exclusifs) + `pdfjs-dist` en sous-processus + fallback OCR Gemini (`x-goog-api-key`) + resolver FX BCE + checkpoints SQL Neon (`backend_net`). | [./apps/sync-worker/README.md](./apps/sync-worker/README.md) |
-| **`@clairflux/web`** | Frontend React 19 + Vite + Recharts + Grand Livre (`Opérations`, `Règles`, `Catégories` 2 niveaux) + Export CSV sécurisé + `<dialog>` adaptatif Pixel 8 Portrait/Paysage + moteur Offline IndexedDB/Outbox + `ApkDownloadCard` + `capacitor.config.ts`. | [./apps/web/README.md](./apps/web/README.md) |
+| **`@clairflux/shared`** | Contrats Zod partagés, Branded Types, constantes Drive, pack français de catégories à 2 niveaux, primitives IA (`ai.ts` : seuil `8500 bp`, anti-prompt-injection, normalisation commerçant), arithmétique centimes/FX et `CLAIRFLUX_BUILD_VERSION`. | [./packages/shared/README.md](./packages/shared/README.md) |
+| **`@clairflux/api`** | API HTTP Node 22 (`Hono` + `apps/api/src/server.ts`), auth Argon2id/HMAC-SHA256 + CSRF fail-closed, routes métier (`/api/categories`, `/api/ai/*`, `/api/transactions`, `/api/rules`, `/api/budgets`, `/api/aggregates`, `GET/POST /api/sync/delta`, `POST /api/sync/drive`, `GET /api/apk/status`, `GET /api/apk/download`), persistance Drizzle Neon & migrations Expand. | [./apps/api/README.md](./apps/api/README.md) |
+| **`@clairflux/sync-worker`** | Worker isolé Drive (2 dossiers exclusifs) + `pdfjs-dist` en sous-processus + fallback OCR Gemini + moteur batch catégorisation IA 50 opérations (chaîne 3 modèles `x-goog-api-key`) + resolver FX BCE + checkpoints SQL Neon (`backend_net`). | [./apps/sync-worker/README.md](./apps/sync-worker/README.md) |
+| **`@clairflux/web`** | Frontend React 19 + Vite + Recharts + Grand Livre (`Opérations`, `À réviser (IA)`, `Règles`, `Catégories` 2 niveaux) + lanceur rattrapage IA dans `Synchro` + Export CSV sécurisé + `<dialog>` adaptatif Pixel 8 Portrait/Paysage + moteur Offline IndexedDB/Outbox + `ApkDownloadCard` + `capacitor.config.ts`. | [./apps/web/README.md](./apps/web/README.md) |
 
 ---
 

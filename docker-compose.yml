@@ -5,7 +5,7 @@ services:
       dockerfile: apps/web/Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
-        VITE_APP_VERSION: ${VITE_APP_VERSION:-1.1.0-build.1}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-1.1.0-build.2}
     restart: unless-stopped
     ports:
       - "${CLAIRFLUX_WEB_PORT:-8080}:8080"
@@ -36,7 +36,7 @@ services:
       SYNC_WORKER_URL: http://sync-worker:4001
       CLAIRFLUX_WEB_ORIGIN: ${CLAIRFLUX_WEB_ORIGIN:-http://localhost:8080}
       APK_OUTPUT_PATH: /shared-apk/clairflux-release.apk
-      CLAIRFLUX_APP_VERSION: ${VITE_APP_VERSION:-1.1.0-build.1}
+      CLAIRFLUX_APP_VERSION: ${VITE_APP_VERSION:-1.1.0-build.2}
     volumes:
       - apk-artifacts:/shared-apk:ro
     networks:
@@ -96,7 +96,7 @@ services:
     restart: "no"
     environment:
       VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
-      VITE_APP_VERSION: ${VITE_APP_VERSION:-1.1.0-build.1}
+      VITE_APP_VERSION: ${VITE_APP_VERSION:-1.1.0-build.2}
       APK_OUTPUT_DIR: /shared-apk
     volumes:
       - apk-artifacts:/shared-apk

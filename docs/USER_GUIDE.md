@@ -1,4 +1,4 @@
-# Mode d'emploi ClairFlux (`v1.1.0-build.1`)
+# Mode d'emploi ClairFlux (`v1.1.0-build.2`)
 
 Bienvenue dans **ClairFlux**, votre application personnelle de suivi de comptes **BoursoBank** et **Revolut** (en **EUR** et en **USD**), utilisable sur ordinateur (navigateur Web) et sur smartphone Android (application APK), même **sans connexion Internet**.
 
@@ -10,7 +10,8 @@ Bienvenue dans **ClairFlux**, votre application personnelle de suivi de comptes 
 2. [Consulter la Synthèse et les 2 graphiques](#2-consulter-la-synthèse-et-les-2-graphiques)
 3. [Gérer vos Catégories et Sous-catégories (`Transactions > Catégories`)](#3-gérer-vos-catégories-et-sous-catégories)
 4. [Règles automatiques, notes rapides hors-ligne (Outbox) et Export CSV](#4-règles-automatiques-notes-rapides-hors-ligne-et-export-csv)
-5. [Synchroniser Google Drive manuellement et installer l'APK Android](#5-synchroniser-google-drive-manuellement-et-installer-lapk-android)
+5. [Catégorisation hybride IA Gemini, Boîte de révision & Suggestions de règles](#5-catégorisation-hybride-ia-gemini-boîte-de-révision--suggestions-de-règles)
+6. [Synchroniser Google Drive manuellement et installer l'APK Android](#6-synchroniser-google-drive-manuellement-et-installer-lapk-android)
 
 ---
 
@@ -134,7 +135,46 @@ Sur smartphone Android (ou si votre connexion coupe momentanément) :
 
 ---
 
-## 5. Synchroniser Google Drive manuellement et installer l'APK Android
+## 5. Catégorisation hybride IA Gemini, Boîte de révision & Suggestions de règles
+
+ClairFlux combine vos règles gratuites et l'intelligence artificielle **Gemini** pour classer rapidement votre historique sans jamais perdre le contrôle.
+
+### Garantie de sécurité : vos choix ne sont jamais écrasés
+ClairFlux applique un ordre de priorité strict et inviolable :
+**`Manuel > Virement interne > Règle utilisateur > IA Gemini`**
+
+Concrètement :
+- Toute opération que vous avez **classée manuellement** (ou déjà validée) reste verrouillée à jamais.
+- Tous vos **virements internes** (BoursoBank ↔ Revolut, conversions EUR ↔ USD) restent exclus des dépenses.
+- Toutes les opérations déjà couvertes par l'une de **vos règles** sont classées gratuitement sans solliciter l'IA.
+- L'IA ne traite **que** les opérations restantes non classées, et uniquement quand vous le demandez.
+
+### Lancer le rattrapage IA des opérations sans règle depuis `Synchro`
+> **En ligne uniquement** : le lancement et l'annulation du rattrapage IA nécessitent une connexion Internet active (les boutons sont verrouillés hors-ligne).
+
+1. Ouvrez l'onglet **Synchro Drive** (ou **Synchro**).
+2. Dans l'encart dédié au **rattrapage IA des opérations sans règle**, cliquez sur le bouton de lancement manuel.
+3. ClairFlux analyse les opérations restantes par lots de 50 avec une **barre de progression en direct** indiquant combien d'opérations ont été classées automatiquement et combien attendent votre avis.
+4. À tout moment, vous pouvez cliquer sur **Annuler** : le lot en cours se termine proprement et tout le travail déjà validé reste sauvegardé (vous pourrez reprendre plus tard sans recommencer de zéro).
+
+### Lire et traiter la Boîte de révision IA (`Transactions > À réviser (IA)`)
+- **Confiance élevée (`>= 85 %`)** : l'IA classe directement l'opération dans votre grand livre (vous pouvez toujours la modifier ensuite).
+- **Confiance modérée (`< 85 %`)** : par prudence, l'opération apparaît dans **`Transactions > À réviser (IA)`** avec la suggestion de l'IA, son score de confiance et une brève justification.
+
+Sur chaque opération à réviser, vous disposez de 4 gestes simples :
+1. **Valider en 1 clic** : confirme la proposition de l'IA et la verrouille comme choix validé.
+2. **Corriger sur 2 niveaux** : choisissez directement la bonne **Catégorie** et **Sous-catégorie** dans le menu à 2 niveaux.
+3. **Ignorer** : écarte la proposition sans classer l'opération pour l'instant.
+4. **Valider + Créer une règle permanente** : confirme la catégorie **et** enregistre immédiatement une règle automatique pour ce commerçant (vous pouvez aussi traiter plusieurs lignes d'un coup si besoin).
+
+### Accepter les Suggestions de règles gratuites
+Lorsque vous classez ou recevez au moins **3 opérations similaires** d'un même commerçant sans règle existante, ClairFlux vous propose automatiquement une **Suggestion de règle gratuite** en haut de l'écran de révision :
+- Cliquez sur **Accepter** en 1 clic pour transformer ce commerçant en règle permanente (et classer automatiquement l'historique non verrouillé) : **les mois suivants, ce commerçant sera classé instantanément et gratuitement sans jamais appeler l'IA**.
+- Cliquez sur **Ignorer** si vous ne souhaitez pas créer de règle pour ce libellé.
+
+---
+
+## 6. Synchroniser Google Drive manuellement et installer l'APK Android
 
 ### Règle d'or Google Drive : 100 % manuel et limité à 2 dossiers
 Par conception, ClairFlux ne lance **jamais** de synchronisation automatique en arrière-plan et n'accède **qu'à vos deux dossiers dédiés** :
@@ -149,7 +189,7 @@ Par conception, ClairFlux ne lance **jamais** de synchronisation automatique en 
 
 ### Télécharger, vérifier et installer l'application Android (APK)
 1. Sur votre ordinateur ou directement depuis le navigateur de votre Pixel 8 connecté à ClairFlux, ouvrez l'onglet **Synchro Drive** → carte **Application Android (APK)**.
-2. Vérifiez que le statut indique que l'APK est disponible et notez sa version (`v1.1.0-build.1`) ainsi que son **empreinte SHA-256**.
+2. Vérifiez que le statut indique que l'APK est disponible et notez sa version (`v1.1.0-build.2`) ainsi que son **empreinte SHA-256**.
 3. Cliquez sur le bouton de téléchargement pour récupérer `clairflux-release.apk`.
 4. *(Recommandé)* Vérifiez que l'empreinte SHA-256 du fichier téléchargé correspond exactement à celle affichée dans ClairFlux.
 5. Sur votre **Pixel 8** :

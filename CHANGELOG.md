@@ -4,6 +4,28 @@ Toutes les évolutions notables de **ClairFlux** sont consignées dans ce fichie
 
 ---
 
+## [1.1.0-build.2] - 2026-11-26 — Lot 2 : Catégorisation hybride IA Gemini, Boîte de révision & Suggestions de règles
+
+### Base de données additive (Expand) & Contrats partagés
+- **Migration SQL additive `0002_lot2_ai_categorization_expand.sql` & `ensureLot2AiSchema`** : création idempotente des enums `ai_backfill_run_status` / `ai_rule_suggestion_status`, des tables **`ai_categorization_runs`** (index unique partiel garantissant un seul lot actif à la fois) et **`ai_rule_suggestions`** (index unique par `merchant_pattern`), ainsi que d'un index partiel sur la file de révision `transactions(ai_review_status)` — zéro `DROP`/`TRUNCATE`/`DELETE`.
+- **Module partagé `packages/shared/src/ai.ts`** : seuil normatif `AI_AUTO_APPLY_CONFIDENCE_BP = 8500` (`85 %`), taille de lot `AI_BATCH_SIZE = 50`, seuil `AI_RULE_SUGGESTION_MIN_SAMPLES = 3`, défense anti-prompt-injection (`sanitizeBankLabelForAi`), extraction normalisée de motif commerçant (`extractMerchantPatternForRule`) et extension rétrocompatible de `TransactionSchema` / `DeltaSyncResponseSchema`.
+
+### Moteur batch Gemini (`sync-worker`) & API (`/api/ai/*`)
+- **Pipeline IA par lots de 50 opérations (`sync-worker`)** : exécution exclusivement manuelle via la chaîne de repli 3 modèles **`gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.1-flash-lite`** (clé `GEMINI_API_KEY` isolée dans `sync-worker` via en-tête `x-goog-api-key`), respect absolu de la priorité **`Manuel > Virement interne > Règle utilisateur > IA Gemini`**.
+- **Aiguillage intelligent & détection de règles** : application automatique à `>= 85 %`, placement en file de révision (`pending_review`) sous `< 85 %`, et génération automatique de suggestions de règles gratuites dès 3 opérations similaires sans règle.
+- **Routes REST `/api/ai/*`** :
+  - `POST /api/ai/categorize/backfill`, `GET /api/ai/categorize/status`, `POST /api/ai/categorize/cancel` (lancement manuel, suivi temps réel et annulation coopérative),
+  - `GET /api/ai/review-queue`, `POST /api/ai/review-queue/resolve` (résolution unitaire ou par lot : `accept`, `override`, `reject` + option `create_rule`),
+  - `GET /api/ai/rule-suggestions`, `POST /api/ai/rule-suggestions/:id/accept`, `POST /api/ai/rule-suggestions/:id/dismiss`,
+  - Extension rétrocompatible de `GET /api/sync/delta` (`ai_rule_suggestions`, `pending_ai_review_count`).
+
+### Interface Web & Mobile
+- **Sous-onglet `Transactions > À réviser (IA)`** : liste des opérations `< 85 %` avec explication IA et score de confiance, actions rapides (Valider en 1 clic, Corriger sur 2 niveaux, Ignorer, ou Valider + Créer une règle permanente) et encart **Suggestions de règles gratuites** (Accepter / Ignorer en 1 clic).
+- **Panneau de rattrapage IA dans `Synchro`** : lancement manuel sur les opérations sans règle, barre de progression en direct (lots, auto-appliquées, à réviser) et bouton **Annuler** (verrouillé hors-ligne).
+- **Infrastructure & Documentation** : passage de `docker-compose.yml` à `1.1.0-build.2` (aucun ajout requis dans `.env`) et mise à jour de [`README.md`](./README.md), [`CHANGELOG.md`](./CHANGELOG.md) et [`docs/USER_GUIDE.md`](./docs/USER_GUIDE.md).
+
+---
+
 ## [1.1.0-build.1] - 2026-11-26 — Lot 1 : Catégories 2 niveaux & Google Pixel 8 Portrait/Paysage
 
 ### Ajouts fonctionnels & API
