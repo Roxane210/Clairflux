@@ -832,9 +832,673 @@ Relance l'extraction Gemini et le commit atomique **uniquement pour le fichier P
 
 ---
 
-## 8. Contrat d'Isolation Docker Compose & Sécurité APK
+## 8. Contrats API & Delta Sync v2 (Extension Rétrocompatible)
 
-### 8.1 Topologie des Services (`docker-compose.yml` cible)
+- **Statut** : Normatif — Phase Pré-Code EGM v2
+- **Date** : 2026-11-26
+- **Références** :
+  - [DATA_MODEL_DRIZZLE_SPEC.md (Partie II)](file:///d:/Applications/Clairflux/docs/DATA_MODEL_DRIZZLE_SPEC.md)
+  - [ADR 0005 — Catégories hiérarchiques & IA Gemini hybride](file:///d:/Applications/Clairflux/docs/ADR/0005-categories-hierarchy-and-gemini-hybrid-categorization.md)
+  - [ADR 0006 — Budget Monarch, Rollover & Projections](file:///d:/Applications/Clairflux/docs/ADR/0006-monarch-budget-rollover-and-forecasting.md)
+
+> [!IMPORTANT]
+> Toutes les routes v1 des sections 1 à 7 restent intactes et fonctionnelles pendant la transition. Les nouvelles routes v2 d'IA Gemini, de gestion des catégories et de budgets Monarch exigent une connexion réseau active et sont protégées par le middleware d'authentification personnel (`Cookie HttpOnly` + `X-Clairflux-Client: web` + `Origin`, ou `Authorization: Bearer` sur Android).
+
+### 8.1 Extension des Codes d'Erreur Normalisés (`ApiErrorCode`)
+
+| Code HTTP | `error.code` | Signification & Comportement Client Attendu | `retryable` |
+| --- | --- | --- | --- |
+| `400` / `422` | `CATEGORY_REASSIGN_REQUIRED` | Tentative de `DELETE /api/categories/:id` sans `reassign_to_category_id` actif valide. | `false` |
+| `409` | `CATEGORY_HAS_CHILDREN_OR_SYSTEM` | Suppression refusée sur une catégorie système protégée (`Non catégorisé`, `Transfert interne`) ou possédant encore des sous-catégories actives. | `false` |
+| `422` | `CATEGORY_DEPTH_EXCEEDED` | Tentative de rattacher une sous-catégorie à une catégorie qui a déjà un `parent_id` (profondeur max 2 niveaux). | `false` |
+| `409` | `AI_BACKFILL_ALREADY_RUNNING` | `POST /api/ai/categorize/backfill` refusé car un run `'running'` existe (`details.active_run_id`). | `true` |
+| `409` | `AI_BACKFILL_NOT_RUNNING` | `POST /api/ai/categorize/cancel` appelé alors qu'aucun run n'est `'running'`. | `false` |
+| `409` | `RECURRING_AUTO_SERIES_USE_DISMISS` | `DELETE /api/analytics/recurring/:id` appelé sur une série `source = 'auto_detected'` (utiliser `PATCH` avec `status: 'dismissed'` ou `'cancelled'`). | `false` |
+| `503` | `GEMINI_API_NOT_CONFIGURED` | Variable `GEMINI_API_KEY` absente ou invalide pour le rattrapage ou le bilan mensuel. | `false` |
+
+---
+
+### 8.2 CRUD Catégories & Sous-Catégories (`/api/categories`)
+
+#### `GET /api/categories`
+- **Query params optionnels** : `include_archived` (`"true" | "false"`, défaut `"false"`).
+- **Réponse `200 OK`** : retourne la liste structurée des catégories racines (niveau 1) et sous-catégories (niveau 2) avec compteurs d'opérations associées et `latest_revision` :
+```json
+{
+  "categories": [
+    {
+      "id": "c1000000-0000-4000-8000-000000000001",
+      "parent_id": null,
+      "name": "Alimentation",
+      "slug": "alimentation",
+      "budget_group": "variable",
+      "color_token": "emerald",
+      "sort_order": 10,
+      "is_system": true,
+      "is_archived": false,
+      "transaction_count": 142,
+      "revision": 1501,
+      "updated_at": "2026-11-26T10:00:00.000Z"
+    },
+    {
+      "id": "c1000000-0000-4000-8000-000000000002",
+      "parent_id": "c1000000-0000-4000-8000-000000000001",
+      "name": "Courses",
+      "slug": "alimentation-courses",
+      "budget_group": "variable",
+      "color_token": "emerald",
+      "sort_order": 11,
+      "is_system": true,
+      "is_archived": false,
+      "transaction_count": 98,
+      "revision": 1502,
+      "updated_at": "2026-11-26T10:00:00.000Z"
+    }
+  ],
+  "latest_revision": 1502
+}
+```
+
+#### `POST /api/categories`
+- **Requête** :
+```json
+{
+  "parent_id": "c1000000-0000-4000-8000-000000000001",
+  "name": "Marchés & Primeurs",
+  "budget_group": "variable",
+  "color_token": "emerald",
+  "sort_order": 12
+}
+```
+  - Vérifie côté serveur que si `parent_id !== null`, la catégorie parente existe (`deleted_at IS NULL`) et possède `parent_id === null` (sinon `422 CATEGORY_DEPTH_EXCEEDED`).
+- **Réponse `201 Created`** : `{ "category": { ... }, "latest_revision": 1503 }`.
+
+#### `PATCH /api/categories/:id`
+- **Requête** : mise à jour partielle (`name`, `budget_group`, `color_token`, `sort_order`, `is_archived`).
+- **Comportement** : si `name` change, met à jour atomiquement `transactions.category` et `categorization_rules.target_category` sur les lignes liées et leur alloue un nouveau `revision` (phase Expand).
+- **Réponse `200 OK`** : `{ "category": { ... }, "updated_transactions_count": 42, "latest_revision": 1545 }`.
+
+#### `POST /api/categories/:id/merge`
+Fusionne la catégorie source `:id` vers une catégorie cible existante et soft-delete la source.
+- **Requête** : `{ "target_category_id": "<uuid>", "target_subcategory_id": "<uuid> | null" }`.
+- **Comportement transactionnel ACID (`db.transaction`)** :
+  1. Réaffecte toutes les `transactions` (et suggestions/règles `categorization_rules`, `ai_rule_suggestions`, `recurring_series`) pointant sur `:id` vers la cible, et synchronise `transactions.category`.
+  2. Si la source avait une `budget_config` active et que la cible en a déjà une, soft-delete la `budget_config` source (sinon la transfère sur la cible).
+  3. Soft-delete la catégorie source (`deleted_at = now()`, `revision = nextval('sync_revision_seq')`).
+- **Réponse `200 OK`** : `{ "merged_from_id": "...", "target_category_id": "...", "reassigned_transactions_count": 19, "latest_revision": 1560 }`.
+
+#### `DELETE /api/categories/:id`
+- **Requête** : `{ "reassign_to_category_id": "<uuid>", "reassign_to_subcategory_id": "<uuid> | null" }` (réaffectation **obligatoire** ; `400/422 CATEGORY_REASSIGN_REQUIRED` si absent ou égal à `:id`).
+- **Garde-fous** : refuse `409 CATEGORY_HAS_CHILDREN_OR_SYSTEM` si la catégorie est `'Non catégorisé'` / `'Transfert interne'` ou si elle possède encore des sous-catégories actives (`deleted_at IS NULL`).
+- **Réponse `200 OK`** : `{ "deleted_category_id": "...", "reassigned_transactions_count": 12, "latest_revision": 1565 }`.
+
+---
+
+### 8.3 IA Gemini : Rattrapage Manuel, Boîte de Révision & Suggestions de Règles (`/api/ai/*`)
+
+> **Invariant de coût & contrôle** : Aucun appel Gemini ne part en tâche de fond non sollicitée. Le rattrapage par lots de 50 opérations (`gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.1-flash-lite`, header `x-goog-api-key`) démarre uniquement sur clic manuel.
+
+#### `POST /api/ai/categorize/backfill`
+- **Requête** : `{ "batch_size": 50, "only_uncategorized": true }` (`batch_size` borné `10..50`, défaut `50`).
+- **Vérification** : s'il existe une ligne `ai_categorization_runs` avec `status = 'running'`, retourne **`409 AI_BACKFILL_ALREADY_RUNNING`** avec `details.active_run_id`.
+- **Réponse `202 Accepted`** :
+```json
+{
+  "run": {
+    "id": "a1000000-0000-4000-8000-000000000001",
+    "status": "running",
+    "total_target_count": 2940,
+    "processed_count": 0,
+    "auto_applied_count": 0,
+    "queued_review_count": 0,
+    "failed_batches": 0,
+    "started_at": "2026-11-26T12:00:00.000Z"
+  }
+}
+```
+
+#### `GET /api/ai/categorize/status`
+- **Query params optionnels** : `run_id` (`uuid`).
+- **Réponse `200 OK`** :
+```json
+{
+  "run": {
+    "id": "a1000000-0000-4000-8000-000000000001",
+    "status": "running",
+    "cursor_tx_id": "33333333-3333-4333-8333-333333333399",
+    "total_target_count": 2940,
+    "processed_count": 450,
+    "auto_applied_count": 382,
+    "queued_review_count": 68,
+    "failed_batches": 0,
+    "model_used": "gemini-4-hydrogen",
+    "estimated_tokens": 38400,
+    "error_summary": null,
+    "started_at": "2026-11-26T12:00:00.000Z",
+    "finished_at": null
+  },
+  "pending_review_count": 68,
+  "latest_revision": 1820
+}
+```
+
+#### `POST /api/ai/categorize/cancel`
+- **Requête** : `{}`
+- **Comportement** : demande l'arrêt coopératif du run `'running'` après finalisation du lot de 50 en cours (les lots déjà committés sont préservés). Passe `status = 'cancelled'`, `finished_at = now()`.
+- **Réponse `200 OK`** : retourne `{ "run": { ... } }` (`409 AI_BACKFILL_NOT_RUNNING` si aucun run actif).
+
+#### `GET /api/ai/review-queue`
+- **Query params optionnels** : `limit` (`1..100`, défaut `30`), `cursor` (opaque), `min_confidence_bp` (`0..8499`), `category_id` (`uuid`).
+- **Réponse `200 OK`** :
+```json
+{
+  "items": [
+    {
+      "transaction_id": "33333333-3333-4333-8333-333333333401",
+      "booking_date": "2026-11-12",
+      "account_nickname": "Perso BoursoBank",
+      "bank": "boursobank",
+      "clean_label": "Pharmacie Lafayette",
+      "raw_label": "CARTE 12/11 PHARMACIE LAFAYETTE LYON",
+      "amount_cents": -2840,
+      "currency": "EUR",
+      "amount_eur_cents": -2840,
+      "ai_suggested_category_id": "c1000000-0000-4000-8000-000000000030",
+      "ai_suggested_subcategory_id": "c1000000-0000-4000-8000-000000000031",
+      "ai_confidence_bp": 7800,
+      "ai_reason": "Libellé de pharmacie correspondant à Santé > Pharmacie.",
+      "ai_model": "gemini-4-hydrogen"
+    }
+  ],
+  "next_cursor": null,
+  "total_pending": 68,
+  "latest_revision": 1820
+}
+```
+
+#### `POST /api/ai/review-queue/resolve`
+Valide, corrige ou rejette unitaire ou en lot (`1..100` éléments) les propositions en attente, avec option de création immédiate d'une règle durable.
+- **Requête** :
+```json
+{
+  "items": [
+    {
+      "transaction_id": "33333333-3333-4333-8333-333333333401",
+      "action": "accept",
+      "create_rule": {
+        "name": "Pharmacies",
+        "pattern": "PHARMACIE",
+        "match_mode": "contains",
+        "priority": 100
+      }
+    },
+    {
+      "transaction_id": "33333333-3333-4333-8333-333333333402",
+      "action": "override",
+      "category_id": "c1000000-0000-4000-8000-000000000010",
+      "subcategory_id": null
+    }
+  ]
+}
+```
+  - `action` : `"accept" | "override" | "reject"` (`category_id` obligatoire lorsque `action === "override"`).
+- **Comportement** :
+  - `accept` : applique la suggestion IA, passe `category_source = 'ai_validated'`, `is_manual_category = true`, `ai_review_status = 'accepted'`.
+  - `override` : applique `category_id` / `subcategory_id`, passe `category_source = 'manual'`, `is_manual_category = true`, `ai_review_status = 'rejected'`.
+  - `reject` : maintient `'Non catégorisé'`, passe `ai_review_status = 'rejected'`.
+  - Si `create_rule` est fourni : insère la règle dans `categorization_rules` et exécute le recalcul rétroactif respectant `is_manual_category = false`.
+- **Réponse `200 OK`** : `{ "resolved_count": 2, "created_rules_count": 1, "retroactive_updated_count": 14, "latest_revision": 1836 }`.
+
+#### `GET /api/ai/rule-suggestions`
+- **Query params optionnels** : `status` (`"pending" | "accepted" | "dismissed"`, défaut `"pending"`).
+- **Réponse `200 OK`** :
+```json
+{
+  "suggestions": [
+    {
+      "id": "s1000000-0000-4000-8000-000000000001",
+      "suggested_pattern": "CARREFOUR CITY",
+      "match_mode": "contains",
+      "target_category_id": "c1000000-0000-4000-8000-000000000001",
+      "target_subcategory_id": "c1000000-0000-4000-8000-000000000002",
+      "sample_count": 6,
+      "status": "pending",
+      "created_at": "2026-11-26T12:10:00.000Z"
+    }
+  ],
+  "latest_revision": 1836
+}
+```
+
+#### `POST /api/ai/rule-suggestions/:id/accept` & `POST /api/ai/rule-suggestions/:id/dismiss`
+- **`accept`** : corps optionnel `{ "name"?: string, "pattern"?: string, "match_mode"?: RuleMatchMode, "priority"?: number }`. Crée la règle active dans `categorization_rules`, marque la suggestion `'accepted'` avec `accepted_rule_id`, et applique la règle rétroactivement sur l'historique éligible (`is_manual_category = false`). Retourne `200 OK { rule, retroactive_stats, latest_revision }`.
+- **`dismiss`** : corps `{}`. Marque la suggestion `'dismissed'` (`200 OK { id, status: "dismissed", latest_revision }`).
+
+---
+
+### 8.4 Budget Monarch, Rollover & Ajustements Mensuels (`/api/budgets/*`)
+
+> Les routes v1 (`GET/PUT/DELETE /api/budgets`) demeurent opérationnelles en parallèle pendant la phase Expand.
+
+#### `GET /api/budgets/plan`
+- **Query params** :
+  - `month` (`YYYY-MM`, défaut mois courant).
+  - `scope` (`"all_eur"` défaut | `"usd_only"` | `"bank:boursobank"` | `"bank:revolut"` | `"account:<uuid>"`).
+- **Réponse `200 OK`** :
+```json
+{
+  "month": "2026-11",
+  "scope": "all_eur",
+  "display_currency": "EUR",
+  "summary": {
+    "total_budgeted_cents": 245000,
+    "total_carried_rollover_cents": 12500,
+    "total_available_cents": 98200,
+    "total_spent_cents": 159300,
+    "month_income_cents": 385000,
+    "unbudgeted_spent_cents": 18400
+  },
+  "groups": [
+    {
+      "budget_group": "fixed",
+      "budgeted_cents": 120000,
+      "carried_rollover_cents": 0,
+      "spent_cents": 94500,
+      "available_cents": 25500
+    },
+    {
+      "budget_group": "variable",
+      "budgeted_cents": 85000,
+      "carried_rollover_cents": 4500,
+      "spent_cents": 52800,
+      "available_cents": 36700
+    },
+    {
+      "budget_group": "non_monthly",
+      "budgeted_cents": 40000,
+      "carried_rollover_cents": 8000,
+      "spent_cents": 12000,
+      "available_cents": 36000
+    }
+  ],
+  "items": [
+    {
+      "budget_config_id": "b1000000-0000-4000-8000-000000000001",
+      "category_id": "c1000000-0000-4000-8000-000000000001",
+      "parent_id": null,
+      "category_name": "Alimentation",
+      "budget_group": "variable",
+      "currency": "EUR",
+      "monthly_limit_cents": 50000,
+      "override_limit_cents": null,
+      "effective_limit_cents": 50000,
+      "rollover_enabled": true,
+      "rollover_start_month": "2026-09",
+      "rollover_cap_cents": 20000,
+      "carried_rollover_cents": 4500,
+      "rollover_adjustment_cents": 0,
+      "spent_cents": 34200,
+      "available_cents": 20300,
+      "usage_percent": 62.75,
+      "alert_status": "ok",
+      "subcaps_exceed_parent_warning": false,
+      "override_note": null,
+      "revision": 1840
+    }
+  ],
+  "latest_revision": 1840
+}
+```
+
+#### `PUT /api/budgets/configs/:categoryId`
+- **Requête** :
+```json
+{
+  "monthly_limit_cents": 50000,
+  "currency": "EUR",
+  "rollover_enabled": true,
+  "rollover_start_month": "2026-09",
+  "rollover_cap_cents": 20000,
+  "is_active": true
+}
+```
+- **Comportement** : crée ou met à jour l'enveloppe dans `budget_configs` (`deleted_at = null`), vérifie l'absence de double-comptage dans les totaux de groupe, et retourne `subcaps_exceed_parent_warning` si la somme des sous-plafonds dépasse le plafond du parent.
+- **Réponse `200 OK`** : `{ "config": { ... }, "subcaps_exceed_parent_warning": false, "latest_revision": 1841 }`.
+
+#### `DELETE /api/budgets/configs/:categoryId`
+- **Comportement** : soft-delete (`deleted_at = now()`) de `budget_configs` pour `:categoryId`, incrément `revision`.
+- **Réponse `200 OK`** : `{ "deleted_category_id": "...", "latest_revision": 1842 }`.
+
+#### `PUT /api/budgets/overrides/:categoryId/:month`
+- **Requête** :
+```json
+{
+  "override_limit_cents": 65000,
+  "rollover_adjustment_cents": -2500,
+  "note": "Ajustement vacances + remise à zéro partielle"
+}
+```
+  - `month` validé `YYYY-MM`. `override_limit_cents` (`null` ou entier `>= 0`), `rollover_adjustment_cents` (entier signé, défaut `0`).
+- **Réponse `200 OK`** : `{ "override": { ... }, "latest_revision": 1843 }`.
+
+---
+
+### 8.5 Analytique Avancée, Projections, Récurrents & Bilan IA (`/api/analytics/*`, `/api/ai/monthly-brief`)
+
+Toutes les routes analytiques partagent le filtrage `scope` (`all_eur` défaut | `usd_only` | `bank:boursobank` | `bank:revolut` | `account:<uuid>`) et excluent strictement `is_internal_transfer = true`.
+
+#### `GET /api/analytics/categories`
+- **Query params** : `scope`, `from` (`YYYY-MM-DD`), `to` (`YYYY-MM-DD`), `parent_category_id` (`uuid` optionnel pour drill-down sous-catégories).
+- **Réponse `200 OK`** :
+```json
+{
+  "scope": "all_eur",
+  "display_currency": "EUR",
+  "from": "2026-11-01",
+  "to": "2026-11-30",
+  "total_expenses_cents": 194230,
+  "categories": [
+    {
+      "category_id": "c1000000-0000-4000-8000-000000000001",
+      "name": "Alimentation",
+      "budget_group": "variable",
+      "color_token": "emerald",
+      "spent_cents": 48200,
+      "share_bp": 2482,
+      "transaction_count": 19,
+      "avg_3m_cents": 43800,
+      "subcategories": [
+        {
+          "category_id": "c1000000-0000-4000-8000-000000000002",
+          "name": "Courses",
+          "spent_cents": 34200,
+          "share_bp": 1761,
+          "transaction_count": 12
+        }
+      ]
+    }
+  ],
+  "data_revision": 1843
+}
+```
+
+#### `GET /api/analytics/cashflow`
+- **Query params** : `scope`, `from` (`YYYY-MM-DD`), `to` (`YYYY-MM-DD`), `months` (`3..12`, défaut `6`).
+- **Réponse `200 OK`** : expose les séries mensuelles de Cash Flow / Taux d'épargne **et** le graphe orienté **`sankey_nodes`** + **`sankey_links`** (rendu Desktop/tablette `>= 1024 px`, fallback barres empilées sur mobile) :
+```json
+{
+  "scope": "all_eur",
+  "display_currency": "EUR",
+  "period_summary": {
+    "income_cents": 385000,
+    "expenses_cents": 194230,
+    "net_savings_cents": 190770,
+    "savings_rate_bp": 4955
+  },
+  "monthly_cashflow": [
+    {
+      "month": "2026-11",
+      "label": "Nov.",
+      "income_cents": 385000,
+      "expenses_cents": 194230,
+      "net_savings_cents": 190770,
+      "savings_rate_bp": 4955
+    }
+  ],
+  "sankey_nodes": [
+    { "id": "inc:revenus", "label": "Revenus", "kind": "income" },
+    { "id": "pool:total", "label": "Revenus nets", "kind": "pool" },
+    { "id": "grp:fixed", "label": "Fixes", "kind": "budget_group" },
+    { "id": "grp:variable", "label": "Variables", "kind": "budget_group" },
+    { "id": "cat:logement", "label": "Logement & Charges", "kind": "category" },
+    { "id": "cat:alimentation", "label": "Alimentation", "kind": "category" },
+    { "id": "sav:net", "label": "Épargne nette", "kind": "savings" }
+  ],
+  "sankey_links": [
+    { "source": "inc:revenus", "target": "pool:total", "value_cents": 385000 },
+    { "source": "pool:total", "target": "grp:fixed", "value_cents": 94500 },
+    { "source": "pool:total", "target": "grp:variable", "value_cents": 99730 },
+    { "source": "grp:fixed", "target": "cat:logement", "value_cents": 94500 },
+    { "source": "grp:variable", "target": "cat:alimentation", "value_cents": 48200 },
+    { "source": "pool:total", "target": "sav:net", "value_cents": 190770 }
+  ],
+  "data_revision": 1843
+}
+```
+
+#### `GET /api/analytics/forecast`
+- **Query params** : `scope`, `horizon` (`3 | 6 | 12`, défaut `6`), `reference_month` (`YYYY-MM` optionnel).
+- **Réponse `200 OK`** :
+```json
+{
+  "scope": "all_eur",
+  "display_currency": "EUR",
+  "horizon": 6,
+  "starting_balance_cents": 1245080,
+  "assumptions": {
+    "baseline_monthly_income_cents": 385000,
+    "recurring_monthly_expenses_cents": 112000,
+    "variable_monthly_expenses_cents": 82230,
+    "uncertainty_band_bp": 1500
+  },
+  "points": [
+    {
+      "month": "2026-12",
+      "label": "Déc.",
+      "projected_balance_cents": 1435850,
+      "prudent_balance_cents": 1407234,
+      "optimistic_balance_cents": 1464466,
+      "projected_income_cents": 385000,
+      "projected_expenses_cents": 194230
+    }
+  ],
+  "data_revision": 1843
+}
+```
+> *Note Offline* : Le simulateur interactif *« Et si... »* (ajustement revenus/dépenses/épargne via curseurs) recalcule les trajectoires localement en `< 5 ms` dans le Web Worker client à partir de ces bases sans aucun appel réseau.
+
+#### `GET /api/analytics/recurring`, `POST /api/analytics/recurring`, `PATCH /api/analytics/recurring/:id` & `DELETE /api/analytics/recurring/:id`
+
+- **`GET /api/analytics/recurring`** (`?month=YYYY-MM&include_income=true|false&scope=...&status=detected|confirmed|dismissed|cancelled`) :
+  - `month` (`YYYY-MM`, défaut mois calendaire courant) pilote la grille calendrier mensuelle et les compteurs `paid_this_month_cents` / `remaining_this_month_cents`.
+  - `include_income` (`"true" | "false"`, défaut `"false"`) inclut ou exclut les séries `direction === "income"` dans `occurrences[]`, `series[]` et le détail de synthèse.
+  - **Réponse `200 OK`** :
+```json
+{
+  "month": "2026-11",
+  "scope": "all_eur",
+  "display_currency": "EUR",
+  "include_income": false,
+  "summary": {
+    "monthly_smoothed_cents": 128450,
+    "annual_smoothed_part_cents": 18250,
+    "paid_this_month_cents": 94500,
+    "remaining_this_month_cents": 23950
+  },
+  "occurrences": [
+    {
+      "date": "2026-11-05",
+      "status": "paid",
+      "matched_transaction_id": "33333333-3333-4333-8333-333333333335",
+      "series_id": "r1000000-0000-4000-8000-000000000001",
+      "display_name": "Loyer & EDF",
+      "cadence": "monthly",
+      "source": "auto_detected",
+      "direction": "expense",
+      "amount_cents": -94500,
+      "amount_eur_cents": -94500,
+      "currency": "EUR",
+      "price_change_pct_bp": null
+    },
+    {
+      "date": "2026-11-28",
+      "status": "upcoming",
+      "matched_transaction_id": null,
+      "series_id": "r1000000-0000-4000-8000-000000000002",
+      "display_name": "Assurance Habitation",
+      "cadence": "yearly",
+      "source": "manual",
+      "direction": "expense",
+      "amount_cents": -23950,
+      "amount_eur_cents": -23950,
+      "currency": "EUR",
+      "price_change_pct_bp": null
+    }
+  ],
+  "series": [
+    {
+      "id": "r1000000-0000-4000-8000-000000000001",
+      "merchant_key": "loyer edf",
+      "display_name": "Loyer & EDF",
+      "account_id": "11111111-1111-4111-8111-111111111112",
+      "category_id": "c1000000-0000-4000-8000-000000000020",
+      "cadence": "monthly",
+      "source": "auto_detected",
+      "direction": "expense",
+      "expected_amount_cents": -94500,
+      "currency": "EUR",
+      "tolerance_bp": 500,
+      "billing_day": 5,
+      "last_seen_date": "2026-11-05",
+      "next_expected_date": "2026-12-05",
+      "previous_amount_cents": -94500,
+      "price_change_pct_bp": 0,
+      "status": "confirmed",
+      "cancelled_at": null,
+      "notes": null,
+      "revision": 1842
+    }
+  ],
+  "data_revision": 1843
+}
+```
+- **`POST /api/analytics/recurring`** (ajout manuel d'une échéance anticipée) :
+  - **Requête** :
+```json
+{
+  "display_name": "Assurance Habitation",
+  "expected_amount_cents": -23950,
+  "currency": "EUR",
+  "cadence": "yearly",
+  "direction": "expense",
+  "billing_day": 28,
+  "next_expected_date": "2026-11-28",
+  "account_id": "11111111-1111-4111-8111-111111111111",
+  "category_id": "c1000000-0000-4000-8000-000000000020",
+  "tolerance_bp": 500,
+  "notes": "Échéance annuelle MAIF avant premier prélèvement relevé"
+}
+```
+  - **Comportement** : force `source = 'manual'`, `status = 'confirmed'`, normalise `merchant_key` et garantit la cohérence du signe de `expected_amount_cents` avec `direction` (`< 0` pour `'expense'`, `> 0` pour `'income'`), positionne `last_seen_date = next_expected_date` par défaut si aucun prélèvement passé n'existe encore, et alloue un `revision`. Dès l'ingestion d'un relevé réel correspondant, la série est rapprochée sur place sans doublon (cf. `DATA_MODEL_DRIZZLE_SPEC.md` §8.3).
+  - **Réponse `201 Created`** : `{ "series": { ... }, "latest_revision": 1845 }`.
+- **`PATCH /api/analytics/recurring/:id`** :
+  - Corps partiel `{ "status"?: "detected" | "confirmed" | "dismissed" | "cancelled", "display_name"?: string, "billing_day"?: number | null, "cadence"?: "weekly" | "monthly" | "quarterly" | "yearly", "expected_amount_cents"?: number, "next_expected_date"?: string, "category_id"?: uuid | null, "cancelled_at"?: string | null, "notes"?: string | null }`.
+  - Si `status === "cancelled"` et `cancelled_at` est omis, le serveur positionne `cancelled_at` à la date UTC du jour (`YYYY-MM-DD`).
+  - Met à jour la série et incrémente `revision` (`200 OK { series, latest_revision }`).
+- **`DELETE /api/analytics/recurring/:id`** :
+  - Soft-delete (`deleted_at = now()`, `revision = nextval('sync_revision_seq')`) d'une échéance ajoutée manuellement (`source === "manual"`). Retourne `409 RECURRING_AUTO_SERIES_USE_DISMISS` si `source === "auto_detected"`.
+  - **Réponse `200 OK`** : `{ "deleted_series_id": "...", "latest_revision": 1846 }`.
+
+#### `GET /api/analytics/merchants`
+- **Query params** : `scope`, `from`, `to`, `limit` (`1..50`, défaut `15`).
+- **Réponse `200 OK`** :
+```json
+{
+  "scope": "all_eur",
+  "display_currency": "EUR",
+  "merchants": [
+    {
+      "merchant_key": "biocoop",
+      "display_name": "Biocoop",
+      "category_id": "c1000000-0000-4000-8000-000000000001",
+      "category_name": "Alimentation",
+      "total_spent_cents": 68400,
+      "transaction_count": 9,
+      "avg_ticket_cents": 7600,
+      "last_booking_date": "2026-11-14"
+    }
+  ],
+  "data_revision": 1843
+}
+```
+
+#### `POST /api/ai/monthly-brief`
+- **Déclenchement strictement manuel**.
+- **Requête** : `{ "month": "2026-11", "scope": "all_eur", "force_regenerate": false }`.
+- **Comportement** :
+  1. Consulte `ai_monthly_briefs` pour `(month, scope, display_currency)`. Si présent avec `data_revision === latest_revision` et `force_regenerate === false`, renvoie immédiatement le cache SQL (`cached: true`, 0 appel Gemini).
+  2. Sinon, agrège les totaux en centimes anonymisés (catégories, dépassements de budget, variations M-1 vs moyenne 3M, alertes de hausse de récurrents), appelle Gemini (header `x-goog-api-key`), valide le JSON structuré par Zod, enregistre dans `ai_monthly_briefs` avec un nouveau `revision`, et retourne `200 OK` :
+```json
+{
+  "cached": false,
+  "brief": {
+    "id": "m1000000-0000-4000-8000-000000000001",
+    "month": "2026-11",
+    "scope_key": "all_eur",
+    "display_currency": "EUR",
+    "summary_json": {
+      "headline": "Taux d'épargne solide à 49,6 % malgré une hausse sur l'Alimentation.",
+      "highlights": [
+        "Les dépenses hors transferts s'établissent à 1 942,30 € contre 3 850,00 € de revenus.",
+        "L'enveloppe Alimentation conserve 203,00 € de disponible grâce à 45,00 € de rollover."
+      ],
+      "budget_warnings": [
+        "Abonnements SaaS : hausse détectée de +12,5 % sur les séries récurrentes USD."
+      ],
+      "savings_note": "Maintenir le rythme actuel permet d'ajouter ~1 900 € d'épargne nette en décembre."
+    },
+    "model_used": "gemini-4-hydrogen",
+    "data_revision": 1843,
+    "generated_at": "2026-11-26T12:30:00.000Z",
+    "revision": 1844
+  },
+  "latest_revision": 1844
+}
+```
+
+---
+
+### 8.6 Contrat Delta Sync v2 (`CLAIRFLUX_DELTA_SCHEMA_VERSION = '2.0.0'`) & Outbox Existante
+
+#### A. Extension Rétrocompatible de `GET /api/sync/delta`
+
+- **Version de contrat** : `CLAIRFLUX_DELTA_SCHEMA_VERSION` passe de `'1.0.0'` à `'2.0.0'` (exposée via `sync_meta.schema_version` et `schema_version` dans la réponse JSON).
+- **Bootstrap propre sur migration client** : lorsque l'APK Android ou le client Web v2 détecte que son `local_schema_version` est absent ou `< '2.0.0'`, il réinitialise son store local et relance `GET /api/sync/delta?since=0&limit=500`.
+- **Ordre d'intégrité FK sur `since=0`** : dès la première page (`since=0`), le serveur inclut l'intégralité de `categories` et `accounts` avant les pages de `transactions`.
+- **Champs ajoutés dans `GET /api/sync/delta`** (en plus de tous les blocs v1 conservés) :
+  - `schema_version`: `"2.0.0"`
+  - `categories`: `{ upserted: Category[], deleted_ids: CategoryId[] }`
+  - `budget_configs`: `{ upserted: BudgetConfig[], deleted_ids: BudgetConfigId[] }`
+  - `budget_monthly_overrides`: `{ upserted: BudgetMonthlyOverride[], deleted_ids: BudgetOverrideId[] }`
+  - `recurring_series`: `{ upserted: RecurringSeries[], deleted_ids: RecurringSeriesId[] }` *(inclut `source` `'auto_detected' | 'manual'`, `direction` `'expense' | 'income'`, `billing_day`, `status` `'detected' | 'confirmed' | 'dismissed' | 'cancelled'`, `cancelled_at`, `notes` pour permettre le calcul 100 % hors-ligne du calendrier et des 3 compteurs dans `Budget > Récurrents & Calendrier`)*
+  - `ai_review_items`: `{ pending_count: number, upserted: AiReviewQueueItem[], resolved_transaction_ids: TransactionId[] }` *(projection légère pour consultation et tri hors-ligne sur Android ; la résolution reste en ligne uniquement)*
+  - `latest_ai_brief`: `AiMonthlyBrief | null` *(dernier bilan mensuel déjà mis en cache sur `all_eur` pour relecture hors-ligne)*
+  - Sur chaque objet `transactions.upserted[]` : ajout rétrocompatible de `category_id`, `subcategory_id`, `category_source`, `ai_review_status`, `recurring_series_id` (tout en conservant `category` texte).
+  - Sur chaque objet `categorization_rules.upserted[]` : ajout rétrocompatible de `target_category_id`, `target_subcategory_id` (tout en conservant `target_category` texte).
+  - Sur `drive_sync_status.files[]` : ajout des champs d'archivage Drive (`archive_status`, `archive_error_message`, `archived_at`).
+
+#### B. Maintien Réel de `POST /api/sync/delta` + `applied_client_mutations` (Outbox Existante)
+
+Contrairement à la formulation initiale v0 de la section 1.4, l'implémentation réelle en production ([register-routes.ts](file:///d:/Applications/Clairflux/apps/api/src/routes/register-routes.ts), [contracts.ts](file:///d:/Applications/Clairflux/apps/api/src/routes/contracts.ts), [server.ts](file:///d:/Applications/Clairflux/apps/api/src/server.ts)) et le stockage client IndexedDB ([indexedDbStore.ts](file:///d:/Applications/Clairflux/apps/web/src/offline/indexedDbStore.ts)) maintiennent une **outbox locale ciblée exclusivement pour les annotations et la catégorisation rapide d'opérations** :
+
+1. **Côté Client (`indexedDbStore.ts`, base `clairflux_offline_v1`)** :
+   - Le store `outbox_mutations` enregistre uniquement les deux actions locales légères `upsert_note` et `update_category` (`category`, `isInternalTransfer`, `categoryChanged`, `transferOverrideChanged`).
+   - Les fonctionnalités v2 lourdes ou nécessitant le serveur (appels Gemini, Boîte de révision IA, fusion/suppression de catégories, configuration Budget Monarch / Rollover, génération de bilan IA) **n'entrent jamais dans l'outbox** : elles restent strictement en ligne avec mention explicite *« Connexion requise pour modifier »* hors-ligne.
+2. **Côté Serveur (`POST /api/sync/delta` + table `applied_client_mutations`)** :
+   - Reçoit `{ "mutations": [...] }` (1 à 100 mutations par lot) avec les variantes discriminées :
+     - `upsert_note` (`client_mutation_id`, `transaction_id`, `note`)
+     - `set_category` (`client_mutation_id`, `transaction_id`, `category`, plus en v2 optionnellement `category_id?`, `subcategory_id?`)
+     - `set_internal_transfer` (`client_mutation_id`, `transaction_id`, `is_internal_transfer`)
+   - Chaque mutation calcule son SHA-256 canonique `payload_hash` et vérifie `applied_client_mutations` dans la même `db.transaction` :
+     - Déjà présente avec même `payload_hash` → `status: "duplicate"`, retourne le `result_revision` initial sans ré-appliquer.
+     - Déjà présente avec `payload_hash` différent → `status: "rejected"`, `reason: "CONFLICT"`.
+     - Nouvelle mutation appliquée avec succès → met à jour la transaction/note (et synchronise `category_id` / `subcategory_id` / `category_source = 'manual'` pour `set_category` en v2), enregistre dans `applied_client_mutations`, retourne `status: "applied"` et le nouveau `revision`.
+
+---
+
+## 9. Contrat d'Isolation Docker Compose & Sécurité APK
+
+### 9.1 Topologie des Services (`docker-compose.yml` cible)
 
 ```text
 [Navigateur Desktop] ──HTTPS──▶ [ web (Nginx/Caddy, non-root) ]
@@ -856,7 +1520,7 @@ Relance l'extraction Gemini et le commit atomique **uniquement pour le fichier P
 | **`sync-worker`** | Port interne `4001` sur `backend_net` (`internal: true` uniquement) | `node` (UID non-root) | `DATABASE_URL`, `GEMINI_API_KEY`, `GOOGLE_DRIVE_CREDENTIALS` (monté RO `/run/secrets/`), `INTERNAL_WORKER_TOKEN` | `CLAIRFLUX_SESSION_SECRET`, `CLAIRFLUX_ACCESS_SECRET_HASH` | `GET /healthz` interne. `SIGTERM` attend la fin de la `db.transaction` du PDF en cours avant exit propre. |
 | **`postgres-local`** *(profil `dev` seul)* | Port local dev uniquement | `postgres` | Credentials de test local éphémères | Secrets de production Neon | `pg_isready` |
 
-### 8.2 Endpoints Techniques & Internes (`api` ↔ `sync-worker`)
+### 9.2 Endpoints Techniques & Internes (`api` ↔ `sync-worker`)
 
 - **`GET /api/healthz`** (public sans données sensibles) : `{ "status": "ok" }` (`200`).
 - **`GET /api/readyz`** (public sans données sensibles) : teste la connexion Neon (`SELECT 1`) et retourne `200 { "status": "ready", "db": "ok" }` ou `503 { "status": "degraded", "db": "error" }`.
@@ -864,7 +1528,7 @@ Relance l'extraction Gemini et le commit atomique **uniquement pour le fichier P
   - Payload : `{ "run_id": "<uuid>", "mode": "full_scan" | "retry_file", "drive_file_id"?: "<id>" }`.
   - Le `sync-worker` re-valide en dur que seuls `1cO74NPbgA7kp67Z3rkjAOMqFMDe_Ujus` et `1pGDvmcePbmIjxJ-lyKdeBMt974GxEx_h` peuvent être scannés.
 
-### 8.3 Matrice de Sécurité APK Android & Bundle Client
+### 9.3 Matrice de Sécurité APK Android & Bundle Client
 
 1. **Zéro secret dans le client Web et l'APK** :
    - Les variables `VITE_*` autorisées au build sont strictement limitées à `VITE_API_BASE_URL` et `VITE_APP_VERSION`.

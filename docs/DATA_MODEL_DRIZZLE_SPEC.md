@@ -452,3 +452,441 @@ Deux transactions `A` et `B` actives sont appariées en 1-to-1 si :
   - `accounts.current_balance_cents` reflète toujours les soldes réels de chaque poche/compte.
   - Les agrégats de dépenses (`Dépenses M-1 / Moyenne 3M` et KPI *Dépenses hors transferts*) filtrent strictement `WHERE is_internal_transfer = false AND amount_cents < 0 AND deleted_at IS NULL`.
   - Si l'utilisateur corrige manuellement une opération (`PATCH /api/transactions/:id` avec `is_internal_transfer = false`), `is_manual_transfer_override` passe à `true`, `transfer_group_id` est dissocié sur la paire si nécessaire, et la réconciliation automatique ne retouchera jamais cette transaction.
+
+---
+
+## Partie II — Extension v2 : Catégories hiérarchiques, IA Gemini, Budget Monarch & Analytique
+
+- **Statut** : Normatif — Phase Pré-Code EGM v2
+- **Date** : 2026-11-26
+- **Références associées** :
+  - [API_DELTA_SYNC_CONTRACT.md (Section 8)](file:///d:/Applications/Clairflux/docs/API_DELTA_SYNC_CONTRACT.md)
+  - [ADR 0005 — Catégories hiérarchiques & IA Gemini hybride](file:///d:/Applications/Clairflux/docs/ADR/0005-categories-hierarchy-and-gemini-hybrid-categorization.md)
+  - [ADR 0006 — Budget Monarch, Rollover & Projections](file:///d:/Applications/Clairflux/docs/ADR/0006-monarch-budget-rollover-and-forecasting.md)
+
+> [!IMPORTANT]
+> La Partie I ci-dessus demeure intégralement valide. Cette Partie II étend le modèle de données PostgreSQL Neon / Drizzle ORM sans rupture des entités v1 existantes ni perte de données.
+
+---
+
+### 5. État Réel en Production & Plan de Migration SQL Expand/Contract
+
+#### 5.1 Inventaire Réel de Production (`apps/api/src/db/schema.ts`)
+
+Au-delà des tables 3.1 à 3.9 de la spécification initiale v1, deux tables déjà déployées en production dans [schema.ts](file:///d:/Applications/Clairflux/apps/api/src/db/schema.ts) doivent être explicitement préservées durant toute la phase Expand :
+
+1. **`budget_limits` (`budgetLimits`)** — Plafonds budgétaires mensuels v1 par libellé texte :
+   - `id` (`uuid`, PK `defaultRandom()`)
+   - `category` (`varchar(80)`, NOT NULL, `UNIQUE`, `CHECK (char_length(trim(category)) > 0)`)
+   - `limit_cents` (`bigint({ mode: 'number' })`, NOT NULL, `CHECK (limit_cents > 0)`)
+   - `currency` (`currency_enum`, NOT NULL, DEFAULT `'EUR'`)
+   - `revision` (`bigint({ mode: 'number' })`, NOT NULL, DEFAULT `nextval('sync_revision_seq')`, index `idx_budget_limits_revision`)
+   - `updated_at` (`timestamptz`, NOT NULL, DEFAULT `now()`)
+   - *Rôle actuel* : alimentée par `GET/PUT/DELETE /api/budgets` ([register-routes.ts](file:///d:/Applications/Clairflux/apps/api/src/routes/register-routes.ts)) et comptabilisée dans `fetchLatestSyncRevision`.
+
+2. **`applied_client_mutations` (`appliedClientMutations`)** — Journal d'idempotence de l'outbox client :
+   - `client_mutation_id` (`uuid`, PK)
+   - `payload_hash` (`varchar(64)`, NOT NULL, `CHECK (char_length(trim(payload_hash)) > 0)`)
+   - `applied_at` (`timestamptz`, NOT NULL, DEFAULT `now()`, index `idx_applied_client_mutations_applied_at`)
+   - `result_status` (`varchar(24)`, NOT NULL, `CHECK (result_status IN ('applied', 'duplicate', 'rejected'))`)
+   - `result_revision` (`bigint({ mode: 'number' })`, NOT NULL)
+   - *Rôle actuel* : garantit l'idempotence exacte de `POST /api/sync/delta` pour les mutations hors-ligne (`upsert_note`, `set_category`, `set_internal_transfer` issues du store IndexedDB `outbox_mutations` dans [indexedDbStore.ts](file:///d:/Applications/Clairflux/apps/web/src/offline/indexedDbStore.ts)). **Cette table est conservée définitivement en v2** pour garantir la rétrocompatibilité et la continuité de l'outbox existante.
+
+#### 5.2 Stratégie de Migration SQL Versionnée (Expand / Contract)
+
+Conformément à [drizzle.config.ts](file:///d:/Applications/Clairflux/apps/api/drizzle.config.ts) (`out: './src/db/migrations'`, `strict: true`, `sslmode=require`), toute évolution passe exclusivement par `drizzle-kit generate` + `drizzle-kit migrate` (**zéro `drizzle-kit push` destructif en production**) :
+
+| Phase | Opérations SQL | Impact sur la production active |
+| :--- | :--- | :--- |
+| **1. Expand (Non destructif)** | Création des 6 nouveaux `pgEnum`, création des 7 nouvelles tables (`categories`, `ai_categorization_runs`, `ai_rule_suggestions`, `budget_configs`, `budget_monthly_overrides`, `recurring_series`, `ai_monthly_briefs`), ajout de colonnes `NULL` ou avec `DEFAULT` sûr sur `transactions` et `categorization_rules`, création des index partiels et du trigger de profondeur `<= 2`. | Zéro verrouillage long, zéro suppression de colonne, 100 % compatible avec les binaires API/Worker v1 pendant le déploiement. |
+| **2. Backfill Idempotent** | Transaction SQL dédiée : (a) seed du pack de catégories françaises 2 niveaux (`is_system = true`) ; (b) création automatique des éventuelles catégories personnalisées trouvées dans `transactions.category`, `categorization_rules.target_category` ou `budget_limits.category` ; (c) remplissage de `transactions.category_id`, `category_source` (`'manual'` si `is_manual_category = true`, `'rule'` si `matched_rule_id IS NOT NULL`, sinon `'uncategorized'`) et `categorization_rules.target_category_id` ; (d) copie `budget_limits` → `budget_configs` (`rollover_enabled = false`, `ON CONFLICT DO NOTHING`). | Zéro perte d'historique, zéro appel Gemini requis pour le backfill structurel. |
+| **3. Dual-Write & Cohabitation** | Les routes v2 écrivent simultanément `category_id` / `subcategory_id` **et** maintiennent synchronisé le libellé texte `transactions.category` / `categorization_rules.target_category` ainsi que la projection miroir `budget_limits` (pour les budgets racines) tant que des clients v1 (`delta_schema_version = '1.0.0'`) peuvent interroger l'API. | Rétrocompatibilité totale Web/APK v1 et v2, rollback applicatif possible sans perte. |
+| **4. Contract (Jalon ultérieur v2.1+)** | Uniquement après validation PO et bascule à 100 % des clients sur `CLAIRFLUX_DELTA_SCHEMA_VERSION = '2.0.0'` : dépréciation puis suppression planifiée de `budget_limits` dans une migration SQL versionnée distincte. | Aucune suppression prématurée durant les Lots 1 à 4. |
+
+---
+
+### 6. Nouveaux Types Énumérés PostgreSQL v2 (`pgEnum`)
+
+| Nom SQL `pgEnum` | Nom Drizzle | Valeurs exactes | Usage |
+| :--- | :--- | :--- | :--- |
+| `budget_group_enum` | `budgetGroupEnum` | `'fixed'`, `'variable'`, `'non_monthly'`, `'income'`, `'savings'`, `'transfer'` | Classement Monarch des catégories pour la synthèse budgétaire et le Cash Flow / Sankey. |
+| `category_source_enum` | `categorySourceEnum` | `'manual'`, `'rule'`, `'ai_auto'`, `'ai_validated'`, `'uncategorized'` | Traçabilité exacte de l'origine de la catégorie finale sur `transactions`. |
+| `ai_review_status_enum` | `aiReviewStatusEnum` | `'none'`, `'pending_review'`, `'accepted'`, `'rejected'` | Cycle de vie de la Boîte de révision IA sur chaque transaction. |
+| `ai_backfill_run_status_enum` | `aiBackfillRunStatusEnum` | `'running'`, `'completed'`, `'partial_error'`, `'failed'`, `'cancelled'` | État d'avancement d'un rattrapage manuel Gemini par lots de 50 opérations. |
+| `recurring_cadence_enum` | `recurringCadenceEnum` | `'weekly'`, `'monthly'`, `'quarterly'`, `'yearly'` | Périodicité des abonnements, loyers, charges et revenus récurrents. |
+| `recurring_status_enum` | `recurringStatusEnum` | `'detected'`, `'confirmed'`, `'dismissed'`, `'cancelled'` | Statut utilisateur d'une série récurrente dans le Radar & Calendrier (`'cancelled'` = résiliée sans perte d'historique). |
+| `recurring_source_enum` | `recurringSourceEnum` | `'auto_detected'`, `'manual'` | Origine de la série : détectée automatiquement depuis les relevés ou ajoutée manuellement en échéance anticipée. |
+| `recurring_direction_enum` | `recurringDirectionEnum` | `'expense'`, `'income'` | Sens comptable de la série récurrente (`'expense'` = dépense, `'income'` = revenu récurrent). |
+
+---
+
+### 7. Spécification des Nouvelles Tables & Extensions v2
+
+Toutes les entités synchronisables avec l'APK Android (`categories`, `budget_configs`, `budget_monthly_overrides`, `recurring_series`, `ai_monthly_briefs`, ainsi que les mises à jour de `transactions` et `categorization_rules`) portent une colonne `revision` (`bigint({ mode: 'number' }) NOT NULL DEFAULT nextval('sync_revision_seq')`) et un soft-delete `deleted_at` (`timestamptz`) pour la propagation delta incrémentale.
+
+#### 7.1 `categories` — Arbre Libre à 2 Niveaux (Catégorie → Sous-catégorie)
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant stable de la catégorie ou sous-catégorie. |
+| `parent_id` | `uuid` | `uuid('parent_id').references((): AnyPgColumn => categories.id, { onDelete: 'restrict' })` | FK self -> `categories.id`, NULL | `NULL` = Catégorie racine (niveau 1) ; non nul = Sous-catégorie (niveau 2). |
+| `name` | `varchar(64)` | `varchar('name', { length: 64 }).notNull()` | NOT NULL, `CHECK (char_length(trim(name)) > 0)` | Libellé affiché à l'utilisateur (ex. `"Alimentation"`, `"Courses"`). |
+| `slug` | `varchar(80)` | `varchar('slug', { length: 80 }).notNull()` | NOT NULL, `CHECK (char_length(trim(slug)) > 0)` | Identifiant canonique normalisé (ex. `"alimentation"`, `"alimentation-courses"`). |
+| `budget_group` | `budget_group_enum` | `budgetGroupEnum('budget_group').notNull()` | NOT NULL | Groupe Monarch (`'fixed'`, `'variable'`, `'non_monthly'`, `'income'`, `'savings'`, `'transfer'`). |
+| `color_token` | `varchar(32)` | `varchar('color_token', { length: 32 }).notNull().default('slate')` | NOT NULL, `CHECK (char_length(trim(color_token)) > 0)` | Token visuel de la palette UI ClairFlux (ex. `'emerald'`, `'amber'`, `'indigo'`, `'slate'`). |
+| `sort_order` | `integer` | `integer('sort_order').notNull().default(0)` | NOT NULL, `CHECK (sort_order >= 0)` | Ordre d'affichage personnalisable dans l'arbre et le plan budgétaire. |
+| `is_system` | `boolean` | `boolean('is_system').notNull().default(false)` | NOT NULL, DEFAULT `false` | `true` pour les catégories structurelles protégées (`Non catégorisé`, `Transfert interne`) et le pack de départ (seules `Non catégorisé` et `Transfert interne` ne peuvent pas être supprimées). |
+| `is_archived` | `boolean` | `boolean('is_archived').notNull().default(false)` | NOT NULL, DEFAULT `false` | Masque une catégorie des nouveaux choix tout en préservant l'historique comptable. |
+| `revision` | `bigint` | `bigint('revision', { mode: 'number' }).notNull()` | NOT NULL, DEFAULT `nextval('sync_revision_seq')` | Curseur delta sync. |
+| `created_at` | `timestamptz` | `timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de création. |
+| `updated_at` | `timestamptz` | `timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de dernière modification. |
+| `deleted_at` | `timestamptz` | `timestamp('deleted_at', { withTimezone: true, mode: 'date' })` | NULL | Soft-delete pour propagation mobile après fusion/suppression avec réaffectation. |
+
+- **Contraintes `CHECK` & Règle de Profondeur Max 2 Niveaux** :
+  - `chk_categories_name_non_empty` : `CHECK (char_length(trim(name)) > 0)`
+  - `chk_categories_slug_non_empty` : `CHECK (char_length(trim(slug)) > 0)`
+  - `chk_categories_color_non_empty` : `CHECK (char_length(trim(color_token)) > 0)`
+  - `chk_categories_sort_non_negative` : `CHECK (sort_order >= 0)`
+  - `chk_categories_no_self_parent` : `CHECK (parent_id IS NULL OR parent_id <> id)`
+  - **Verrou SQL strict profondeur `<= 2`** (trigger `BEFORE INSERT OR UPDATE` `enforce_category_max_depth_2`) :
+    1. Si `NEW.parent_id IS NOT NULL`, vérifie que la ligne parente existe (`deleted_at IS NULL`) **et** possède `parent_id IS NULL` (interdit le niveau 3).
+    2. Si `NEW.parent_id IS NOT NULL`, vérifie qu'aucune ligne active n'a déjà `parent_id = NEW.id` (empêche de rétrograder une racine ayant déjà des enfants).
+- **Index & Unicité** :
+  - `uq_categories_active_slug` : `UNIQUE INDEX (slug) WHERE deleted_at IS NULL`
+  - `uq_categories_active_sibling_name` : `UNIQUE INDEX (COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), lower(trim(name))) WHERE deleted_at IS NULL`
+  - `idx_categories_parent_sort` : `INDEX (parent_id, sort_order) WHERE deleted_at IS NULL`
+  - `idx_categories_budget_group` : `INDEX (budget_group) WHERE deleted_at IS NULL`
+  - `idx_categories_revision` : `INDEX (revision)`
+
+#### 7.2 `ai_categorization_runs` — Suivi du Rattrapage Manuel Gemini par Lots de 50
+
+Trace chaque rattrapage lancé manuellement par l'utilisateur sur l'historique existant (ex. les ~2 940 opérations non catégorisées) avec reprise sur curseur en cas d'erreur ou d'annulation.
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant unique du run de rattrapage IA. |
+| `cursor_tx_id` | `uuid` | `uuid('cursor_tx_id')` | NULL | Dernier `transactions.id` traité avec succès (curseur de reprise par lots de 50). |
+| `total_target_count` | `integer` | `integer('total_target_count').notNull().default(0)` | NOT NULL, `CHECK >= 0` | Nombre initial de transactions éligibles identifiées au démarrage du run. |
+| `processed_count` | `integer` | `integer('processed_count').notNull().default(0)` | NOT NULL, `CHECK >= 0` | Nombre cumulé d'opérations évaluées par Gemini. |
+| `auto_applied_count` | `integer` | `integer('auto_applied_count').notNull().default(0)` | NOT NULL, `CHECK >= 0` | Opérations classées automatiquement (`ai_confidence_bp >= 8500`). |
+| `queued_review_count` | `integer` | `integer('queued_review_count').notNull().default(0)` | NOT NULL, `CHECK >= 0` | Opérations placées en Boîte de révision (`ai_confidence_bp < 8500`). |
+| `failed_batches` | `integer` | `integer('failed_batches').notNull().default(0)` | NOT NULL, `CHECK >= 0` | Nombre de lots de 50 ayant échoué après épuisement de la chaîne de fallback. |
+| `model_used` | `varchar(64)` | `varchar('model_used', { length: 64 })` | NULL | Dernier modèle ayant répondu (`gemini-4-hydrogen`, `gemini-3.8-flash`, `gemini-3.1-flash-lite`). |
+| `estimated_tokens` | `integer` | `integer('estimated_tokens').notNull().default(0)` | NOT NULL, `CHECK >= 0` | Compteur cumulé de tokens estimés/consommés (suivi coût & plafond de sécurité). |
+| `status` | `ai_backfill_run_status_enum` | `aiBackfillRunStatusEnum('status').notNull().default('running')` | NOT NULL | `'running' \| 'completed' \| 'partial_error' \| 'failed' \| 'cancelled'`. |
+| `error_summary` | `text` | `text('error_summary')` | NULL | Détail lisible des éventuelles erreurs de lot ou d'arrêt. |
+| `started_at` | `timestamptz` | `timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Horodatage de lancement manuel. |
+| `finished_at` | `timestamptz` | `timestamp('finished_at', { withTimezone: true, mode: 'date' })` | NULL | Horodatage de fin (`NULL` tant que `'running'`). |
+
+- **Contraintes & Index** :
+  - `chk_ai_runs_counts_non_negative` : `CHECK (total_target_count >= 0 AND processed_count >= 0 AND auto_applied_count >= 0 AND queued_review_count >= 0 AND failed_batches >= 0 AND estimated_tokens >= 0)`
+  - `chk_ai_runs_sum_bound` : `CHECK (auto_applied_count + queued_review_count <= processed_count)`
+  - `chk_ai_runs_finished_ts` : `CHECK (status = 'running' OR finished_at IS NOT NULL)`
+  - `uq_ai_runs_single_running` : `UNIQUE INDEX ((true)) WHERE status = 'running'` (garantit au niveau SQL qu'un seul rattrapage manuel peut tourner simultanément — sinon `409 Conflict`).
+  - `idx_ai_runs_status_started` : `INDEX (status, started_at DESC)`
+
+#### 7.3 `ai_rule_suggestions` — Suggestions de Règles Déterministes Gratuites
+
+Alimentée lorsqu'un même motif marchand est validé ou corrigé de façon répétée dans la Boîte de révision afin de remplacer à terme les appels Gemini par une règle SQL gratuite.
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant de la suggestion. |
+| `suggested_pattern` | `varchar(200)` | `varchar('suggested_pattern', { length: 200 }).notNull()` | NOT NULL, `CHECK (char_length(trim(suggested_pattern)) > 0)` | Motif marchand normalisé proposé (ex. `"CARREFOUR CITY"`). |
+| `match_mode` | `rule_match_mode_enum` | `ruleMatchModeEnum('match_mode').notNull().default('contains')` | NOT NULL | Mode de correspondance recommandé (`'contains'` ou `'starts_with'`). |
+| `target_category_id` | `uuid` | `uuid('target_category_id').notNull().references(() => categories.id, { onDelete: 'restrict' })` | FK -> `categories.id`, NOT NULL | Catégorie cible proposée. |
+| `target_subcategory_id` | `uuid` | `uuid('target_subcategory_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Sous-catégorie cible optionnelle. |
+| `sample_count` | `integer` | `integer('sample_count').notNull().default(1)` | NOT NULL, `CHECK (sample_count >= 1)` | Nombre d'occurrences concordantes observées. |
+| `status` | `varchar(16)` | `varchar('status', { length: 16 }).notNull().default('pending')` | NOT NULL, `CHECK (status IN ('pending', 'accepted', 'dismissed'))` | État de la suggestion. |
+| `accepted_rule_id` | `uuid` | `uuid('accepted_rule_id').references(() => categorizationRules.id, { onDelete: 'set null' })` | FK -> `categorization_rules.id`, NULL | Référence de la règle créée lors de l'acceptation. |
+| `revision` | `bigint` | `bigint('revision', { mode: 'number' }).notNull()` | NOT NULL, DEFAULT `nextval('sync_revision_seq')` | Curseur de révision. |
+| `created_at` | `timestamptz` | `timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de détection. |
+| `updated_at` | `timestamptz` | `timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de dernière mise à jour. |
+
+- **Contraintes & Index** :
+  - `chk_ai_rule_suggestions_pattern_non_empty` : `CHECK (char_length(trim(suggested_pattern)) > 0)`
+  - `chk_ai_rule_suggestions_sample_min` : `CHECK (sample_count >= 1)`
+  - `chk_ai_rule_suggestions_status` : `CHECK (status IN ('pending', 'accepted', 'dismissed'))`
+  - `chk_ai_rule_suggestions_distinct_subcat` : `CHECK (target_subcategory_id IS NULL OR target_subcategory_id <> target_category_id)`
+  - `uq_ai_rule_suggestions_active` : `UNIQUE INDEX (lower(suggested_pattern), match_mode, target_category_id) WHERE status = 'pending'`
+  - `idx_ai_rule_suggestions_status` : `INDEX (status, sample_count DESC)`
+  - `idx_ai_rule_suggestions_revision` : `INDEX (revision)`
+
+#### 7.4 `budget_configs` — Enveloppes Budgétaires Monarch & Paramètres de Rollover
+
+Remplace/étend `budget_limits` en Expand/Contract. Peut être définie au niveau d'une **Catégorie racine** (`parent_id IS NULL`) et, en option, sur une **Sous-catégorie** (`parent_id IS NOT NULL`) en tant que sous-plafond sans double-comptage parent (cf. §8.1).
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant unique de configuration budgétaire. |
+| `category_id` | `uuid` | `uuid('category_id').notNull().references(() => categories.id, { onDelete: 'restrict' })` | FK -> `categories.id`, NOT NULL | Catégorie ou sous-catégorie budgétée (`UNIQUE` active). |
+| `monthly_limit_cents` | `bigint` | `bigint('monthly_limit_cents', { mode: 'number' }).notNull()` | NOT NULL, `CHECK (monthly_limit_cents > 0)` | Plafond mensuel récurrent en centimes entiers (`> 0`). |
+| `currency` | `currency_enum` | `currencyEnum('currency').notNull().default('EUR')` | NOT NULL, DEFAULT `'EUR'` | Devise de référence de l'enveloppe (`'EUR'` ou `'USD'`). |
+| `rollover_enabled` | `boolean` | `boolean('rollover_enabled').notNull().default(false)` | NOT NULL, DEFAULT `false` | Active le report cumulatif mensuel des excédents/déficits. |
+| `rollover_start_month` | `varchar(7)` | `varchar('rollover_start_month', { length: 7 })` | NULL, `CHECK (~ '^\d{4}-(0[1-9]\|1[0-2])$')` | Mois `YYYY-MM` d'initialisation du cumul de rollover (obligatoire si `rollover_enabled = true`). |
+| `rollover_cap_cents` | `bigint` | `bigint('rollover_cap_cents', { mode: 'number' })` | NULL, `CHECK (rollover_cap_cents IS NULL OR rollover_cap_cents >= 0)` | Plafond maximal optionnel du report positif accumulé (ex. cagnotte vacances). |
+| `is_active` | `boolean` | `boolean('is_active').notNull().default(true)` | NOT NULL, DEFAULT `true` | Permet de mettre en pause une enveloppe sans perdre ses overrides historiques. |
+| `revision` | `bigint` | `bigint('revision', { mode: 'number' }).notNull()` | NOT NULL, DEFAULT `nextval('sync_revision_seq')` | Curseur delta sync. |
+| `created_at` | `timestamptz` | `timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de création. |
+| `updated_at` | `timestamptz` | `timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de dernière modification. |
+| `deleted_at` | `timestamptz` | `timestamp('deleted_at', { withTimezone: true, mode: 'date' })` | NULL | Soft-delete pour propagation delta mobile. |
+
+- **Contraintes & Index** :
+  - `uq_budget_configs_active_category` : `UNIQUE INDEX (category_id) WHERE deleted_at IS NULL`
+  - `chk_budget_configs_limit_positive` : `CHECK (monthly_limit_cents > 0)`
+  - `chk_budget_configs_rollover_cap_non_negative` : `CHECK (rollover_cap_cents IS NULL OR rollover_cap_cents >= 0)`
+  - `chk_budget_configs_rollover_start_format` : `CHECK (rollover_start_month IS NULL OR rollover_start_month ~ '^\d{4}-(0[1-9]|1[0-2])$')`
+  - `chk_budget_configs_rollover_requires_start` : `CHECK (rollover_enabled = false OR rollover_start_month IS NOT NULL)`
+  - `idx_budget_configs_revision` : `INDEX (revision)`
+
+#### 7.5 `budget_monthly_overrides` — Ajustements Ponctuels & Corrections de Rollover
+
+Permet de surcharger le plafond sur un mois donné (ex. mois de décembre ou vacances) ou d'injecter/remettre à zéro manuellement un solde reporté (`rollover_adjustment_cents`).
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant de la surcharge mensuelle. |
+| `budget_config_id` | `uuid` | `uuid('budget_config_id').notNull().references(() => budgetConfigs.id, { onDelete: 'cascade' })` | FK -> `budget_configs.id`, NOT NULL | Enveloppe budgétaire cible. |
+| `budget_month` | `varchar(7)` | `varchar('budget_month', { length: 7 }).notNull()` | NOT NULL, `CHECK (~ '^\d{4}-(0[1-9]\|1[0-2])$')` | Mois calendaire concerné (`YYYY-MM`). |
+| `override_limit_cents` | `bigint` | `bigint('override_limit_cents', { mode: 'number' })` | NULL, `CHECK (override_limit_cents IS NULL OR override_limit_cents >= 0)` | Plafond exceptionnel du mois (si `NULL`, conserve `budget_configs.monthly_limit_cents`). |
+| `rollover_adjustment_cents` | `bigint` | `bigint('rollover_adjustment_cents', { mode: 'number' }).notNull().default(0)` | NOT NULL, DEFAULT `0` | Ajustement manuel **signé** en centimes appliqué au report du mois (`> 0` crédit, `< 0` débit/reset). |
+| `note` | `varchar(300)` | `varchar('note', { length: 300 })` | NULL | Justification libre (ex. `"Budget cadeaux Noël"` ou `"Remise à zéro cagnotte"`). |
+| `revision` | `bigint` | `bigint('revision', { mode: 'number' }).notNull()` | NOT NULL, DEFAULT `nextval('sync_revision_seq')` | Curseur delta sync. |
+| `updated_at` | `timestamptz` | `timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Date de mise à jour. |
+| `deleted_at` | `timestamptz` | `timestamp('deleted_at', { withTimezone: true, mode: 'date' })` | NULL | Soft-delete pour propagation delta mobile. |
+
+- **Contraintes & Index** :
+  - `uq_budget_monthly_overrides_config_month` : `UNIQUE (budget_config_id, budget_month)`
+  - `chk_budget_overrides_month_format` : `CHECK (budget_month ~ '^\d{4}-(0[1-9]|1[0-2])$')`
+  - `chk_budget_overrides_limit_non_negative` : `CHECK (override_limit_cents IS NULL OR override_limit_cents >= 0)`
+  - `idx_budget_overrides_revision` : `INDEX (revision)`
+
+#### 7.6 `recurring_series` — Radar & Calendrier des Abonnements, Charges & Revenus Récurrents
+
+Persiste les séries détectées automatiquement (avec tolérance anti-faux-positifs) ainsi que les échéances anticipées ajoutées manuellement (`source = 'manual'`), et permet leur confirmation, mise à l'écart, résiliation (`cancelled`) ou ajustement ainsi que le suivi des hausses de tarifs.
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant unique de la série récurrente. |
+| `merchant_key` | `varchar(160)` | `varchar('merchant_key', { length: 160 }).notNull()` | NOT NULL, `CHECK (char_length(trim(merchant_key)) > 0)` | Clé marchand normalisée déterministe (ex. `"spotify"`, `"edf"`, `"cursor ai"`). |
+| `display_name` | `varchar(160)` | `varchar('display_name', { length: 160 }).notNull()` | NOT NULL, `CHECK (char_length(trim(display_name)) > 0)` | Libellé lisible affiché dans le Radar & Calendrier Récurrents. |
+| `account_id` | `uuid` | `uuid('account_id').references(() => accounts.id, { onDelete: 'set null' })` | FK -> `accounts.id`, NULL | Compte habituellement débité/crédité. |
+| `category_id` | `uuid` | `uuid('category_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Catégorie associée à la série. |
+| `cadence` | `recurring_cadence_enum` | `recurringCadenceEnum('cadence').notNull()` | NOT NULL | `'weekly' \| 'monthly' \| 'quarterly' \| 'yearly'`. |
+| `source` | `recurring_source_enum` | `recurringSourceEnum('source').notNull().default('auto_detected')` | NOT NULL, DEFAULT `'auto_detected'` | `'auto_detected'` (détecteur) ou `'manual'` (échéance anticipée saisie par l'utilisateur). |
+| `direction` | `recurring_direction_enum` | `recurringDirectionEnum('direction').notNull().default('expense')` | NOT NULL, DEFAULT `'expense'` | `'expense'` (dépense récurrente) ou `'income'` (revenu récurrent). |
+| `expected_amount_cents` | `bigint` | `bigint('expected_amount_cents', { mode: 'number' }).notNull()` | NOT NULL, `CHECK (expected_amount_cents <> 0)` | Montant attendu signé en centimes (`< 0` si `direction = 'expense'`, `> 0` si `direction = 'income'`). |
+| `currency` | `currency_enum` | `currencyEnum('currency').notNull()` | NOT NULL | `'EUR'` ou `'USD'`. |
+| `tolerance_bp` | `integer` | `integer('tolerance_bp').notNull().default(500)` | NOT NULL, `CHECK (tolerance_bp >= 0 AND tolerance_bp <= 5000)` | Tolérance d'écart de montant en basis points (défaut `500` bp = ±5 %, max `5000` bp = ±50 %). |
+| `billing_day` | `integer` | `integer('billing_day')` | NULL, `CHECK (billing_day IS NULL OR (billing_day >= 1 AND billing_day <= 31))` | Jour calendaire théorique d'échéance dans le mois (`1..31`, borné au dernier jour du mois si besoin). |
+| `last_seen_date` | `date` | `date('last_seen_date', { mode: 'string' }).notNull()` | NOT NULL | Date comptable de la dernière occurrence observée (ou date d'ancrage initiale si manuelle avant premier relevé). |
+| `next_expected_date` | `date` | `date('next_expected_date', { mode: 'string' }).notNull()` | NOT NULL | Prochaine échéance estimée pour le calendrier mensuel et les projections. |
+| `previous_amount_cents` | `bigint` | `bigint('previous_amount_cents', { mode: 'number' })` | NULL | Montant de l'avant-dernière occurrence pour détecter une hausse/baisse de tarif. |
+| `price_change_pct_bp` | `integer` | `integer('price_change_pct_bp')` | NULL | Évolution relative en basis points (`+1500` = `+15,00 %`). |
+| `status` | `recurring_status_enum` | `recurringStatusEnum('status').notNull().default('detected')` | NOT NULL | `'detected' \| 'confirmed' \| 'dismissed' \| 'cancelled'`. |
+| `cancelled_at` | `date` | `date('cancelled_at', { mode: 'string' })` | NULL | Date effective de résiliation lorsque `status = 'cancelled'` (aucune échéance future projetée après cette date). |
+| `notes` | `varchar(240)` | `varchar('notes', { length: 240 })` | NULL | Mémo utilisateur libre (ex. `"Engagement jusqu'en juin 2027"`, `"Résilié par LRAR"`). |
+| `revision` | `bigint` | `bigint('revision', { mode: 'number' }).notNull()` | NOT NULL, DEFAULT `nextval('sync_revision_seq')` | Curseur delta sync. |
+| `updated_at` | `timestamptz` | `timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Dernière mise à jour. |
+| `deleted_at` | `timestamptz` | `timestamp('deleted_at', { withTimezone: true, mode: 'date' })` | NULL | Soft-delete pour delta sync mobile. |
+
+- **Contraintes & Index** :
+  - `uq_recurring_series_identity` : `UNIQUE INDEX (merchant_key, currency, cadence, direction) WHERE deleted_at IS NULL`
+  - `chk_recurring_merchant_non_empty` : `CHECK (char_length(trim(merchant_key)) > 0 AND char_length(trim(display_name)) > 0)`
+  - `chk_recurring_amount_nonzero` : `CHECK (expected_amount_cents <> 0)`
+  - `chk_recurring_direction_sign` : `CHECK ((direction = 'expense' AND expected_amount_cents < 0) OR (direction = 'income' AND expected_amount_cents > 0))`
+  - `chk_recurring_tolerance_bp` : `CHECK (tolerance_bp >= 0 AND tolerance_bp <= 5000)`
+  - `chk_recurring_billing_day` : `CHECK (billing_day IS NULL OR (billing_day >= 1 AND billing_day <= 31))`
+  - `chk_recurring_cancelled_date` : `CHECK (status <> 'cancelled' OR cancelled_at IS NOT NULL)`
+  - `idx_recurring_status_next` : `INDEX (status, next_expected_date) WHERE deleted_at IS NULL`
+  - `idx_recurring_source_status` : `INDEX (source, status) WHERE deleted_at IS NULL`
+  - `idx_recurring_revision` : `INDEX (revision)`
+
+#### 7.7 `ai_monthly_briefs` — Cache SQL des Bilans IA Mensuels Manuels
+
+Met en cache le résultat structuré du bilan mensuel généré uniquement sur clic manuel (*« Générer le bilan IA du mois »*) pour éviter tout appel Gemini redondant tant que `data_revision` n'a pas changé et permettre la relecture hors-ligne sur Android.
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `id` | `uuid` | `uuid('id').primaryKey().defaultRandom()` | PK, NOT NULL | Identifiant du bilan mis en cache. |
+| `month` | `varchar(7)` | `varchar('month', { length: 7 }).notNull()` | NOT NULL, `CHECK (~ '^\d{4}-(0[1-9]\|1[0-2])$')` | Mois analysé (`YYYY-MM`). |
+| `scope_key` | `varchar(80)` | `varchar('scope_key', { length: 80 }).notNull()` | NOT NULL, `CHECK (char_length(trim(scope_key)) > 0)` | Périmètre (`'all_eur'`, `'usd_only'`, `'bank:boursobank'`, `'bank:revolut'`, `'account:<uuid>'`). |
+| `display_currency` | `currency_enum` | `currencyEnum('display_currency').notNull()` | NOT NULL | `'EUR'` ou `'USD'`. |
+| `summary_json` | `jsonb` | `jsonb('summary_json').$type<AiMonthlyBriefPayload>().notNull()` | NOT NULL | JSON structuré validé par Zod (zéro HTML brut, texte pur React). |
+| `model_used` | `varchar(64)` | `varchar('model_used', { length: 64 }).notNull()` | NOT NULL | Modèle Gemini ayant produit la synthèse. |
+| `data_revision` | `bigint` | `bigint('data_revision', { mode: 'number' }).notNull()` | NOT NULL | Révision du grand livre au moment de la génération (invalidation douce si de nouvelles opérations arrivent). |
+| `generated_at` | `timestamptz` | `timestamp('generated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow()` | NOT NULL | Horodatage de génération. |
+| `revision` | `bigint` | `bigint('revision', { mode: 'number' }).notNull()` | NOT NULL, DEFAULT `nextval('sync_revision_seq')` | Curseur delta sync. |
+
+- **Contraintes & Index** :
+  - `uq_ai_monthly_briefs_key` : `UNIQUE (month, scope_key, display_currency)`
+  - `chk_ai_briefs_month_format` : `CHECK (month ~ '^\d{4}-(0[1-9]|1[0-2])$')`
+  - `chk_ai_briefs_scope_non_empty` : `CHECK (char_length(trim(scope_key)) > 0)`
+  - `idx_ai_monthly_briefs_revision` : `INDEX (revision)`
+
+#### 7.8 Extensions Non-Destructives des Tables Existantes (`transactions` & `categorization_rules`)
+
+##### A. Colonnes ajoutées à `transactions`
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `category_id` | `uuid` | `uuid('category_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Catégorie racine finale (niveau 1). |
+| `subcategory_id` | `uuid` | `uuid('subcategory_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Sous-catégorie finale optionnelle (niveau 2). |
+| `category_source` | `category_source_enum` | `categorySourceEnum('category_source').notNull().default('uncategorized')` | NOT NULL | Provenance autoritaire (`'manual' \| 'rule' \| 'ai_auto' \| 'ai_validated' \| 'uncategorized'`). |
+| `ai_suggested_category_id` | `uuid` | `uuid('ai_suggested_category_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Catégorie proposée par Gemini (conservée pour audit et Boîte de révision). |
+| `ai_suggested_subcategory_id` | `uuid` | `uuid('ai_suggested_subcategory_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Sous-catégorie proposée par Gemini. |
+| `ai_confidence_bp` | `integer` | `integer('ai_confidence_bp')` | NULL, `CHECK (0..10000)` | Confiance Gemini en basis points (`8500` = `85,00 %`). |
+| `ai_review_status` | `ai_review_status_enum` | `aiReviewStatusEnum('ai_review_status').notNull().default('none')` | NOT NULL | État dans la Boîte de révision (`'none' \| 'pending_review' \| 'accepted' \| 'rejected'`). |
+| `ai_reason` | `varchar(240)` | `varchar('ai_reason', { length: 240 })` | NULL | Justification courte générée par Gemini (affichée en texte pur dans la Boîte de révision). |
+| `ai_model` | `varchar(64)` | `varchar('ai_model', { length: 64 })` | NULL | Nom du modèle Gemini ayant émis la suggestion. |
+| `recurring_series_id` | `uuid` | `uuid('recurring_series_id').references(() => recurringSeries.id, { onDelete: 'set null' })` | FK -> `recurring_series.id`, NULL | Lien optionnel vers la série récurrente détectée. |
+
+- **Règle de compatibilité Expand** : la colonne texte v1 `transactions.category` (`varchar(64)`) est **strictement conservée et maintenue synchronisée** à chaque écriture (contient le libellé de la sous-catégorie si présente, sinon celui de la catégorie racine, sinon `'Transfert interne'` ou `'Non catégorisé'`).
+- **Contraintes `CHECK` & Index ajoutés sur `transactions`** :
+  - `chk_tx_subcat_requires_cat` : `CHECK (subcategory_id IS NULL OR category_id IS NOT NULL)`
+  - `chk_tx_ai_subcat_requires_cat` : `CHECK (ai_suggested_subcategory_id IS NULL OR ai_suggested_category_id IS NOT NULL)`
+  - `chk_tx_ai_confidence_bp_range` : `CHECK (ai_confidence_bp IS NULL OR (ai_confidence_bp >= 0 AND ai_confidence_bp <= 10000))`
+  - `idx_tx_category_booking` : `INDEX (category_id, subcategory_id, booking_date DESC) WHERE deleted_at IS NULL`
+  - `idx_tx_ai_review_queue` : `INDEX (ai_review_status, ai_confidence_bp DESC, booking_date DESC) WHERE ai_review_status = 'pending_review' AND deleted_at IS NULL`
+  - `idx_tx_ai_backfill_cursor` : `INDEX (id) WHERE deleted_at IS NULL AND is_manual_category = false AND is_internal_transfer = false AND matched_rule_id IS NULL AND category_source = 'uncategorized'`
+  - `idx_tx_recurring_series` : `INDEX (recurring_series_id, booking_date DESC) WHERE recurring_series_id IS NOT NULL AND deleted_at IS NULL`
+
+##### B. Colonnes ajoutées à `categorization_rules`
+
+| Colonne SQL | Type SQL | Mapping Drizzle | Contraintes & Défauts | Description fonctionnelle |
+| :--- | :--- | :--- | :--- | :--- |
+| `target_category_id` | `uuid` | `uuid('target_category_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Catégorie racine cible de la règle. |
+| `target_subcategory_id` | `uuid` | `uuid('target_subcategory_id').references(() => categories.id, { onDelete: 'set null' })` | FK -> `categories.id`, NULL | Sous-catégorie cible optionnelle de la règle. |
+
+- **Règle de compatibilité Expand** : `categorization_rules.target_category` (`varchar(64)`) reste renseignée en parallèle lors de toute création/édition de règle.
+- **Contrainte ajoutée** : `chk_rules_subcat_requires_cat` : `CHECK (target_subcategory_id IS NULL OR target_category_id IS NOT NULL)`.
+
+---
+
+### 8. Algorithmes Normatifs v2 en Centimes Entiers
+
+#### 8.1 Calcul Exact du Rollover Cumulatif Monarch & Sous-Plafonds Sans Double-Comptage
+
+Tous les calculs s'exécutent exclusivement en **entiers signés en centimes** (`number` safe integer / `bigint`), jamais en flottant.
+
+##### A. Rollover mensuel cumulatif d'une enveloppe `C` au mois `m` (`YYYY-MM`)
+
+Soit une configuration active `budget_configs` (`monthly_limit_cents > 0`, `currency`, `rollover_enabled`, `rollover_start_month`, `rollover_cap_cents`), la suite des mois calendaires depuis `m_0 = rollover_start_month` jusqu'au mois demandé `m`, et la surcharge éventuelle `budget_monthly_overrides(C.id, k)` pour chaque mois `k` :
+
+1. **Plafond effectif du mois `k`** :
+   ```text
+   effective_limit_cents(k) = COALESCE(override(k).override_limit_cents, C.monthly_limit_cents)
+   ```
+2. **Dépense nette comptabilisée du mois `k`** (`spent_cents(k) >= 0`) :
+   - Somme des débits (`amount < 0`, en valeur absolue) sur `transactions` où `deleted_at IS NULL AND is_internal_transfer = false` et appartenant au périmètre `scope` (dans la devise d'affichage : `amount_eur_cents` en `EUR consolidé`, `amount_cents` en `USD seul`).
+   - Note sur les remboursements éventuels sur une catégorie de dépense : si une catégorie de dépense reçoit un crédit explicitement catégorisé sur elle (remboursement), il réduit `spent_cents(k)` sans descendre sous `0` sauf règle dédiée — comportement borné `max(0, sum_debits - sum_refunds)` ; les virements internes (`is_internal_transfer = true`) sont toujours exclus.
+3. **Calcul du report entrant (`carried_rollover_cents`)** :
+   - Si `C.rollover_enabled = false` ou `m < C.rollover_start_month` :
+     ```text
+     base_carry_cents(m) = 0
+     ```
+   - Si `m = C.rollover_start_month` :
+     ```text
+     base_carry_cents(m_0) = 0
+     ```
+   - Pour tout mois `k > C.rollover_start_month`, à partir du solde disponible de clôture du mois précédent `prev_available = available_cents(k - 1)` :
+     ```text
+     base_carry_cents(k) =
+       IF C.rollover_cap_cents IS NOT NULL AND prev_available > C.rollover_cap_cents
+       THEN C.rollover_cap_cents
+       ELSE prev_available
+     ```
+     *(Le plafond `rollover_cap_cents` borne l'accumulation positive d'excédents, tandis qu'un déficit négatif `prev_available < 0` est reporté intégralement pour ne pas masquer un dépassement réel.)*
+   - Application de l'ajustement manuel éventuel du mois `k` :
+     ```text
+     carried_rollover_cents(k) = base_carry_cents(k) + COALESCE(override(k).rollover_adjustment_cents, 0)
+     ```
+4. **Disponible exact du mois `m`** :
+   ```text
+   available_cents(m) = effective_limit_cents(m) + carried_rollover_cents(m) - spent_cents(m)
+   ```
+   - Exemple vérifiable : plafond `300,00 €` (`30000`), report entrant `+45,00 €` (`4500`), dépensé `210,00 €` (`21000`) → `available_cents = 30000 + 4500 - 21000 = 13500` (`135,00 €`).
+   - Les jauges visuelles utilisent les ratios entiers exacts calculés contre la capacité totale positive `capacity_cents = max(1, effective_limit_cents + carried_rollover_cents)` : `ok` (`< 80 %`), `warning` (`80 % .. 99 %`), `exceeded` (`>= 100 %` ou `available_cents < 0`).
+
+##### B. Gestion des sous-plafonds optionnels sans double-comptage parent
+
+Lorsqu'une catégorie racine `P` (`parent_id IS NULL`) et une ou plusieurs de ses sous-catégories `{S_1, ..., S_n}` (`parent_id = P.id`) coexistent :
+
+1. **Périmètre de dépense d'une ligne budgétaire** :
+   - Si la ligne porte sur une **Catégorie racine `P`** : `spent_cents(P)` somme toutes les opérations dont `transactions.category_id = P.id` (ce qui inclut à la fois les opérations sans sous-catégorie `subcategory_id IS NULL` et celles classées dans `S_1 .. S_n`).
+   - Si la ligne porte sur une **Sous-catégorie `S_i`** : `spent_cents(S_i)` somme uniquement les opérations dont `transactions.subcategory_id = S_i.id`.
+2. **Zéro double-comptage dans le Total Global & Totaux de Groupe Monarch (`fixed` / `variable` / `non_monthly`)** :
+   - Si `P` possède une `budget_config` active, **seul `P` contribue** au total consolidé du plan (`total_budgeted_cents`, `total_carried_rollover_cents`, `total_spent_cents`, `total_available_cents`). Les sous-plafonds `S_i` sont affichés en **vue imbriquée / détaillée sous `P`** comme des garde-fous internes de répartition, mais ne sont **jamais additionnés une deuxième fois** au total de `P` ni au total global.
+   - Si `P` ne possède **pas** de `budget_config` active mais que certaines sous-catégories `S_i` en possèdent une, alors chacune de ces `S_i` contribue de façon disjointe (`subcategory_id = S_i.id`) au total global.
+   - Si `sum(effective_limit_cents(S_i)) > effective_limit_cents(P)`, l'API positionne `subcaps_exceed_parent_warning = true` afin d'alerter l'utilisateur sans bloquer la saisie.
+
+#### 8.2 Hiérarchie Stricte de Catégorisation & Protection Anti-Écrasement
+
+L'attribution finale de `(category_id, subcategory_id, category_source)` sur une transaction respecte l'ordre d'autorité décroissant suivant :
+
+```text
+1. Choix manuel utilisateur (is_manual_category = true)
+   └── category_source IN ('manual', 'ai_validated')
+   └── PRIORITÉ ABSOLUE : jamais écrasé par les transferts auto, ni par les règles, ni par l'IA Gemini.
+   ▼
+2. Transfert interne (is_internal_transfer = true)
+   └── Appariement automatique (transfer_group_id IS NOT NULL) ou forçage manuel (is_manual_transfer_override = true).
+   └── Exclu de tous les lots IA Gemini et exclu de toutes les dépenses budgétaires/analytiques.
+   ▼
+3. Règles déterministes utilisateur (categorization_rules actives par priority ASC, created_at ASC, id ASC)
+   └── category_source = 'rule', matched_rule_id = <rule.id>.
+   └── Gratuit (0 appel Gemini), rejoué rétroactivement dès création/édition/acceptation d'une suggestion.
+   ▼
+4. IA Gemini Auto-appliquée (ai_confidence_bp >= 8500, soit >= 85 %)
+   └── category_source = 'ai_auto', is_manual_category = false, ai_review_status = 'none'.
+   └── Catégorie/sous-catégorie appliquée immédiatement ; reste surclassable si l'utilisateur crée ensuite une règle déterministe ou corrige manuellement.
+   ▼
+5. Boîte de révision IA (ai_confidence_bp < 8500) ou Non catégorisé
+   └── ai_suggested_category_id / ai_suggested_subcategory_id / ai_confidence_bp / ai_reason renseignés.
+   └── category_source reste 'uncategorized' (et category = 'Non catégorisé') tant que non résolu, avec ai_review_status = 'pending_review'.
+   └── Sur résolution utilisateur :
+       - accept   → applique suggestion, category_source = 'ai_validated', is_manual_category = true, ai_review_status = 'accepted'.
+       - override → applique choix manuel, category_source = 'manual', is_manual_category = true, ai_review_status = 'rejected'.
+       - reject   → conserve 'uncategorized', ai_review_status = 'rejected'.
+```
+
+- **Règle d'éligibilité au rattrapage manuel Gemini (`POST /api/ai/categorize/backfill`)** :
+  Ne sélectionne strictement que les transactions actives vérifiant `deleted_at IS NULL AND is_manual_category = false AND is_internal_transfer = false AND matched_rule_id IS NULL AND category_source = 'uncategorized' AND ai_review_status = 'none'`, traitées par curseur déterministe de `50` opérations par lot via la chaîne de modèles `gemini-4-hydrogen` → `gemini-3.8-flash` → `gemini-3.1-flash-lite` (header HTTP `x-goog-api-key`).
+
+#### 8.3 Coût Mensuel Lissé & Rapprochement Automatique des Échéances Récurrentes (`recurring_series`)
+
+##### A. Formule Exacte en Centimes Entiers du Coût Mensuel Lissé
+
+Pour chaque série active (`deleted_at IS NULL` et `status IN ('detected', 'confirmed')`, excluant strictement `'dismissed'` et `'cancelled'`), soit `abs_amount_cents = Math.abs(expected_amount_cents)` (converti en EUR via le dernier taux `fx_rates` si le scope est `all_eur` et la série en `USD`, ou conservé nativement en `USD` si le scope est `usd_only`) :
+
+```text
+monthly_smoothed_cents(series) =
+  - cadence = 'weekly'    -> Math.round((abs_amount_cents * 52) / 12)
+  - cadence = 'monthly'   -> abs_amount_cents
+  - cadence = 'quarterly' -> Math.round(abs_amount_cents / 3)
+  - cadence = 'yearly'    -> Math.round(abs_amount_cents / 12)
+```
+
+- **Compteurs dérivés de `Budget > Récurrents & Calendrier`** :
+  - `monthly_smoothed_cents` : somme de `monthly_smoothed_cents(s)` pour les séries actives de `direction = 'expense'` (et, si le filtre `include_income = true` est activé, les revenus récurrents `direction = 'income'` sont exposés distinctement pour éviter toute ambiguïté).
+  - `annual_smoothed_part_cents` : somme de `monthly_smoothed_cents(s)` restreinte aux séries de cadence `'quarterly'` et `'yearly'` (alimente la mention explicite *« dont XX,XX € lissés d'échéances annuelles/trimestrielles »*).
+  - `paid_this_month_cents` : somme des échéances du mois `YYYY-MM` déjà associées à une transaction réelle (`matched_transaction_id IS NOT NULL`, `status = 'paid'`).
+  - `remaining_this_month_cents` : somme des échéances actives du mois `YYYY-MM` non encore prélevées (`status = 'upcoming'`, excluant toute série avec `cancelled_at <= date_echeance`).
+
+##### B. Rapprochement Automatique d'une Série Manuelle (`source = 'manual'`) sans Doublon
+
+Lors de l'ingestion d'un relevé PDF (`commitParsedStatement`) ou d'une passe de détection récurrente sur les opérations actives (`deleted_at IS NULL AND is_internal_transfer = false AND recurring_series_id IS NULL`) :
+
+1. **Priorité absolue aux séries `source = 'manual'` existantes** : le moteur vérifie d'abord toutes les lignes `recurring_series` où `source = 'manual' AND deleted_at IS NULL AND status IN ('detected', 'confirmed')` avant toute création d'une nouvelle série `auto_detected`.
+2. **Critères d'appariement déterministe** : une transaction `tx` rapproche une série manuelle `S` si et seulement si :
+   - `tx.currency = S.currency` et le sens correspond (`(S.direction = 'expense' AND tx.amount_cents < 0) OR (S.direction = 'income' AND tx.amount_cents > 0)`) ;
+   - si `S.account_id IS NOT NULL`, `tx.account_id = S.account_id` ;
+   - correspondance lexicale entre `normalizeLabel(tx.clean_label)` / `normalizeLabel(tx.raw_label)` et `S.merchant_key` / `normalizeLabel(S.display_name)` ;
+   - écart de montant borné par `S.tolerance_bp` :
+     `Math.abs(Math.abs(tx.amount_cents) - Math.abs(S.expected_amount_cents)) <= Math.max(100, Math.round((Math.abs(S.expected_amount_cents) * S.tolerance_bp) / 10000))` ;
+   - date `tx.booking_date` comprise dans une fenêtre de `±7` jours calendaires autour de `S.next_expected_date` (ou du `S.billing_day` du mois courant).
+3. **Effet transactionnel (zéro doublon)** :
+   - Met à jour `transactions.recurring_series_id = S.id` ;
+   - Enrichit la ligne `S` existante **sur place** (`last_seen_date = tx.booking_date`, `next_expected_date` avancé selon `S.cadence` et `S.billing_day`, `previous_amount_cents` / `price_change_pct_bp` calculés si le montant évolue, `status = 'confirmed'`, `revision = nextval('sync_revision_seq')`) sans créer de seconde ligne dans `recurring_series`.
+
+
