@@ -18,9 +18,18 @@ import {
   SessionTokenPayloadSchema,
   errorResponse,
   resolveRequestId,
+  type AcceptAiRuleSuggestionOutcome,
+  type AcceptAiRuleSuggestionResult,
   type AccountsFilter,
   type AccountsListResult,
   type AccountsRepository,
+  type AiBackfillCancelResult,
+  type AiBackfillDispatchResult,
+  type AiBackfillDispatcher,
+  type AiCategorizationRepository,
+  type AiReviewQueueResult,
+  type AiRuleSuggestionsListResult,
+  type AiStatusResult,
   type AllowedDriveFolderDescriptor,
   type AnalyticsOverviewQuery,
   type AnalyticsOverviewResponse,
@@ -47,6 +56,8 @@ import {
   type DeleteRuleResult,
   type DeltaMutationRepository,
   type DeltaSyncQuery,
+  type DismissAiRuleSuggestionOutcome,
+  type DismissAiRuleSuggestionResult,
   type DriveSyncRunStarted,
   type DriveSyncService,
   type HealthRepository,
@@ -60,6 +71,8 @@ import {
   type ReapplyRulesResult,
   type ReorderRuleItem,
   type ReorderRulesResult,
+  type ResolveAiReviewBatchResult,
+  type ResolveAiReviewOutcome,
   type RetroactiveStats,
   type RuleMutationResult,
   type RuleView,
@@ -90,9 +103,18 @@ export {
 };
 
 export type {
+  AcceptAiRuleSuggestionOutcome,
+  AcceptAiRuleSuggestionResult,
   AccountsFilter,
   AccountsListResult,
   AccountsRepository,
+  AiBackfillCancelResult,
+  AiBackfillDispatchResult,
+  AiBackfillDispatcher,
+  AiCategorizationRepository,
+  AiReviewQueueResult,
+  AiRuleSuggestionsListResult,
+  AiStatusResult,
   AllowedDriveFolderDescriptor,
   AnalyticsOverviewQuery,
   AnalyticsOverviewResponse,
@@ -119,6 +141,8 @@ export type {
   DeleteRuleResult,
   DeltaMutationRepository,
   DeltaSyncQuery,
+  DismissAiRuleSuggestionOutcome,
+  DismissAiRuleSuggestionResult,
   DriveSyncRunStarted,
   DriveSyncService,
   HealthRepository,
@@ -132,6 +156,8 @@ export type {
   ReapplyRulesResult,
   ReorderRuleItem,
   ReorderRulesResult,
+  ResolveAiReviewBatchResult,
+  ResolveAiReviewOutcome,
   RetroactiveStats,
   RuleMutationResult,
   RuleView,
@@ -252,6 +278,8 @@ export interface AppDependencies {
   readonly transactionsRepository?: TransactionsRepository | undefined;
   readonly rulesRepository?: RulesRepository | undefined;
   readonly categoriesRepository?: CategoriesRepository | undefined;
+  readonly aiCategorizationRepository?: AiCategorizationRepository | undefined;
+  readonly aiBackfillDispatcher?: AiBackfillDispatcher | undefined;
   readonly budgetsRepository?: BudgetsRepository | undefined;
   readonly analyticsRepository?: AnalyticsRepository | undefined;
   readonly deltaMutationRepository?: DeltaMutationRepository | undefined;

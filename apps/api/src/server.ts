@@ -7,9 +7,13 @@ import { serve, type ServerType } from '@hono/node-server';
 import { z } from 'zod';
 import {
   ALLOWED_DRIVE_FOLDERS,
+  AiCategorizationRunSchema,
+  AiReviewItemSchema,
+  AiRuleSuggestionSchema,
   CLAIRFLUX_BUILD_VERSION,
   UNCATEGORIZED_CATEGORY_ID,
   convertToEurCents,
+  extractMerchantPatternForRule,
   getBankForDriveFolder,
   isProtectedSystemCategory,
   parseAccountId,
@@ -24,6 +28,9 @@ import {
   validateCategoryParentDepth,
   type Account,
   type AccountId,
+  type AiCategorizationRun,
+  type AiReviewItem,
+  type AiRuleSuggestion,
   type Bank,
   type Category,
   type CategoryId,
@@ -52,9 +59,14 @@ import {
 import { createApp, type AppDependencies } from './app.js';
 import { EnvValidationError, parseApiEnv, type ApiEnv } from './config/env.js';
 import { createNeonClients, type NeonClients } from './db/client.js';
-import { ensureLot1CategoriesSchemaAndSeed } from './db/ensure-v2-schema.js';
+import {
+  ensureLot1CategoriesSchemaAndSeed,
+  ensureLot2AiSchema,
+} from './db/ensure-v2-schema.js';
 import {
   accounts,
+  aiCategorizationRuns,
+  aiRuleSuggestions,
   appliedClientMutations,
   budgetLimits,
   categories,
@@ -72,6 +84,8 @@ import {
   computeBudgetAlert,
   computeRuleReapplication,
   isSafeRegexPattern,
+  type AiBackfillDispatcher,
+  type AiCategorizationRepository,
   type AnalyticsAccountInput,
   type AnalyticsTransactionInput,
   type ApkArtifactRepository,
@@ -143,6 +157,7 @@ async function fetchLatestSyncRevision(clients: NeonClients): Promise<SyncRevisi
       COALESCE((SELECT MAX(revision) FROM transactions), 0),
       COALESCE((SELECT MAX(revision) FROM transaction_notes), 0),
       COALESCE((SELECT MAX(revision) FROM categorization_rules), 0),
+      COALESCE((SELECT MAX(revision) FROM ai_rule_suggestions), 0),
       COALESCE((SELECT MAX(revision) FROM budget_limits), 0),
       COALESCE((SELECT MAX(revision) FROM drive_files), 0),
       COALESCE((SELECT MAX(revision) FROM drive_sync_runs), 0)
@@ -636,6 +651,231 @@ export function createResilientDriveSyncService(options: {
   };
 }
 
+const WorkerAiBackfillAcceptedSchema = z.object({
+  run_id: z.string().uuid(),
+  status: z.literal('running'),
+  accepted_at: z.string().datetime({ offset: true }),
+});
+
+const WorkerAiCancelResponseSchema = z.object({
+  run_id: z.string().uuid(),
+  status: z.enum(['cancelling', 'cancelled']),
+  cancelled_at: z.string().datetime({ offset: true }),
+});
+
+export interface AiBackfillRunStore {
+  findActiveRunningRuns(): Promise<ReadonlyArray<{ readonly id: string; readonly startedAt: Date }>>;
+  markRunFailed(runId: string, summary: string): Promise<void>;
+  markRunCancelled(runId: string): Promise<void>;
+}
+
+export function createHttpAiBackfillDispatcher(options: {
+  readonly syncWorkerUrl: string;
+  readonly internalWorkerToken: string;
+  readonly store?: AiBackfillRunStore | undefined;
+  readonly fetchFn?: typeof fetch | undefined;
+  readonly now?: (() => Date) | undefined;
+}): AiBackfillDispatcher {
+  const fetchFn = options.fetchFn ?? globalThis.fetch;
+  const getNow = options.now ?? (() => new Date());
+
+  async function probeActiveWorkerAiRun(): Promise<
+    { readonly ok: true; readonly activeRunId: string | null } | { readonly ok: false }
+  > {
+    try {
+      const res = await fetchFn(`${options.syncWorkerUrl}/internal/ai/categorize/active`, {
+        method: 'GET',
+        headers: {
+          'X-Internal-Worker-Token': options.internalWorkerToken,
+          Accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(WORKER_CONTROL_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        return { ok: false };
+      }
+      const parsed = WorkerActiveRunResponseSchema.safeParse(await res.json());
+      if (!parsed.success) {
+        return { ok: false };
+      }
+      return { ok: true, activeRunId: parsed.data.active_run_id };
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  return {
+    async triggerBackfill(input) {
+      if (options.store !== undefined) {
+        const runningRows = await options.store.findActiveRunningRuns();
+        const firstActive = runningRows[0];
+        if (firstActive !== undefined) {
+          const probe = await probeActiveWorkerAiRun();
+          const nowMs = getNow().getTime();
+          if (probe.ok) {
+            if (probe.activeRunId !== null) {
+              return {
+                ok: false,
+                reason: 'already_running',
+                activeRunId: probe.activeRunId,
+              };
+            }
+            const inGrace = runningRows.find(
+              (row) => nowMs - row.startedAt.getTime() < ORPHAN_RUN_GRACE_MS,
+            );
+            if (inGrace !== undefined) {
+              return {
+                ok: false,
+                reason: 'already_running',
+                activeRunId: inGrace.id,
+              };
+            }
+            for (const orphan of runningRows) {
+              await options.store.markRunFailed(
+                orphan.id,
+                'Lot IA précédent interrompu (aucun traitement actif dans sync-worker).',
+              );
+            }
+          } else if (nowMs - firstActive.startedAt.getTime() < WORKER_UNREACHABLE_STALE_MS) {
+            return {
+              ok: false,
+              reason: 'already_running',
+              activeRunId: firstActive.id,
+            };
+          } else {
+            return {
+              ok: false,
+              reason: 'worker_unavailable',
+              message: 'Le service sync-worker est injoignable pour lancer le rattrapage IA.',
+            };
+          }
+        }
+      }
+
+      try {
+        const response = await fetchFn(`${options.syncWorkerUrl}/internal/ai/categorize/backfill`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Worker-Token': options.internalWorkerToken,
+          },
+          body: JSON.stringify({
+            triggerSource: 'manual_backfill',
+            ...(input.limit !== undefined ? { limit: input.limit } : {}),
+          }),
+          signal: AbortSignal.timeout(WORKER_CONTROL_TIMEOUT_MS),
+        });
+
+        if (response.status === 409) {
+          let activeRunId = '00000000-0000-4000-8000-000000000000';
+          try {
+            const parsedConflict = WorkerConflictResponseSchema.safeParse(await response.json());
+            if (parsedConflict.success && parsedConflict.data.error?.details?.active_run_id) {
+              activeRunId = parsedConflict.data.error.details.active_run_id;
+            }
+          } catch {
+            // Keep fallback activeRunId
+          }
+          return { ok: false, reason: 'already_running', activeRunId };
+        }
+
+        if (!response.ok) {
+          return {
+            ok: false,
+            reason: 'worker_unavailable',
+            message: `Le sync-worker IA a répondu avec le statut HTTP ${response.status}.`,
+          };
+        }
+
+        const parsedAccepted = WorkerAiBackfillAcceptedSchema.safeParse(await response.json());
+        if (!parsedAccepted.success) {
+          return {
+            ok: false,
+            reason: 'worker_unavailable',
+            message: 'Réponse invalide du sync-worker lors du lancement IA.',
+          };
+        }
+
+        return {
+          ok: true,
+          run_id: parsedAccepted.data.run_id,
+          status: parsedAccepted.data.status,
+          accepted_at: parsedAccepted.data.accepted_at,
+        };
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Erreur de communication avec sync-worker IA.';
+        return {
+          ok: false,
+          reason: 'worker_unavailable',
+          message,
+        };
+      }
+    },
+
+    async cancelBackfill(input) {
+      try {
+        const response = await fetchFn(`${options.syncWorkerUrl}/internal/ai/categorize/cancel`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Worker-Token': options.internalWorkerToken,
+          },
+          body: JSON.stringify({
+            ...(input.run_id !== undefined ? { run_id: input.run_id } : {}),
+          }),
+          signal: AbortSignal.timeout(WORKER_CONTROL_TIMEOUT_MS),
+        });
+
+        if (response.status === 409) {
+          return {
+            ok: false,
+            reason: 'not_running',
+            message: 'Aucun traitement de catégorisation IA actif à annuler.',
+          };
+        }
+
+        if (response.ok) {
+          const parsedCancel = WorkerAiCancelResponseSchema.safeParse(await response.json());
+          if (parsedCancel.success) {
+            return {
+              ok: true,
+              run_id: parsedCancel.data.run_id,
+              status: parsedCancel.data.status,
+              cancelled_at: parsedCancel.data.cancelled_at,
+            };
+          }
+        }
+      } catch {
+        // Fallback to DB cancellation below if store has an active run
+      }
+
+      if (options.store !== undefined) {
+        const activeRuns = await options.store.findActiveRunningRuns();
+        const target =
+          input.run_id !== undefined
+            ? activeRuns.find((row) => row.id === input.run_id)
+            : activeRuns[0];
+        if (target !== undefined) {
+          await options.store.markRunCancelled(target.id);
+          return {
+            ok: true,
+            run_id: target.id,
+            status: 'cancelled',
+            cancelled_at: getNow().toISOString(),
+          };
+        }
+      }
+
+      return {
+        ok: false,
+        reason: 'worker_unavailable',
+        message: 'Le service sync-worker est injoignable pour annuler le traitement IA.',
+      };
+    },
+  };
+}
+
 export function createNeonAppDependencies(
   env: ApiEnv,
   clients: NeonClients,
@@ -1062,6 +1302,7 @@ export function createNeonAppDependencies(
 
   async function runRuleRecalcInTx(
     tx: Parameters<Parameters<NeonClients['poolDb']['transaction']>[0]>[0],
+    options?: { readonly protectInternalTransfers?: boolean | undefined },
   ): Promise<{ updatedCount: number; skippedProtectedCount: number; latestRevision: SyncRevision | null }> {
     const [ruleRows, txRows] = await Promise.all([
       tx
@@ -1112,7 +1353,9 @@ export function createNeonAppDependencies(
       matched_rule_id: t.matchedRuleId !== null ? parseRuleId(t.matchedRuleId) : null,
       is_manual_category: t.isManualCategory,
       is_internal_transfer: t.isInternalTransfer,
-      is_manual_transfer_override: t.isManualTransferOverride,
+      is_manual_transfer_override:
+        t.isManualTransferOverride ||
+        (options?.protectInternalTransfers === true && t.isInternalTransfer),
       transfer_group_id: t.transferGroupId,
       deleted_at: t.deletedAt,
     }));
@@ -2214,6 +2457,540 @@ export function createNeonAppDependencies(
     },
   };
 
+  function mapAiRunRow(row: typeof aiCategorizationRuns.$inferSelect): AiCategorizationRun {
+    const triggerSource = row.triggerSource === 'post_pdf_sync' ? 'post_pdf_sync' : 'manual_backfill';
+    return AiCategorizationRunSchema.parse({
+      id: row.id,
+      status: row.status,
+      trigger_source: triggerSource,
+      model_used: row.modelUsed,
+      total_candidates: row.totalCandidates,
+      processed_count: row.processedCount,
+      auto_applied_count: row.autoAppliedCount,
+      queued_review_count: row.queuedReviewCount,
+      failed_count: row.failedCount,
+      last_error: row.lastError,
+      started_at: row.startedAt.toISOString(),
+      finished_at: row.finishedAt !== null ? row.finishedAt.toISOString() : null,
+      updated_at: row.updatedAt.toISOString(),
+    });
+  }
+
+  function mapAiRuleSuggestionRow(
+    row: typeof aiRuleSuggestions.$inferSelect,
+    catNamesById: ReadonlyMap<string, string>,
+  ): AiRuleSuggestion {
+    const targetCategoryName = catNamesById.get(row.targetCategoryId) ?? 'Non catégorisé';
+    const targetSubcategoryName =
+      row.targetSubcategoryId !== null ? (catNamesById.get(row.targetSubcategoryId) ?? null) : null;
+    return AiRuleSuggestionSchema.parse({
+      id: row.id,
+      merchant_pattern: row.merchantPattern,
+      match_mode: row.matchMode,
+      target_category_id: row.targetCategoryId,
+      target_subcategory_id: row.targetSubcategoryId,
+      target_category_name: targetCategoryName,
+      target_subcategory_name: targetSubcategoryName,
+      sample_count: row.sampleCount,
+      status: row.status,
+      created_at: row.createdAt.toISOString(),
+      updated_at: row.updatedAt.toISOString(),
+      revision: toSyncRevision(row.revision),
+    });
+  }
+
+  const aiCategorizationRepository: AiCategorizationRepository = {
+    async getStatus(options) {
+      const [runRows, pendingRows, eligibleRows] = await Promise.all([
+        options?.run_id !== undefined
+          ? clients.httpDb
+              .select()
+              .from(aiCategorizationRuns)
+              .where(eq(aiCategorizationRuns.id, options.run_id))
+              .limit(1)
+          : clients.httpDb
+              .select()
+              .from(aiCategorizationRuns)
+              .orderBy(desc(aiCategorizationRuns.startedAt))
+              .limit(1),
+        clients.httpDb
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(and(isNull(transactions.deletedAt), eq(transactions.aiReviewStatus, 'pending_review'))),
+        clients.httpDb
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(
+            and(
+              isNull(transactions.deletedAt),
+              eq(transactions.isManualCategory, false),
+              eq(transactions.isInternalTransfer, false),
+              isNull(transactions.matchedRuleId),
+              eq(transactions.categorySource, 'uncategorized'),
+              eq(transactions.aiReviewStatus, 'none'),
+            ),
+          ),
+      ]);
+
+      const runRow = runRows[0];
+      return {
+        run: runRow !== undefined ? mapAiRunRow(runRow) : null,
+        pending_review_count: pendingRows[0]?.count ?? 0,
+        uncategorized_eligible_count: eligibleRows[0]?.count ?? 0,
+      };
+    },
+
+    async getReviewQueue(options) {
+      const [txRows, pendingRows, catRows] = await Promise.all([
+        clients.httpDb
+          .select()
+          .from(transactions)
+          .where(and(isNull(transactions.deletedAt), eq(transactions.aiReviewStatus, 'pending_review')))
+          .orderBy(desc(transactions.bookingDate), desc(transactions.revision))
+          .limit(options.limit)
+          .offset(options.offset),
+        clients.httpDb
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(and(isNull(transactions.deletedAt), eq(transactions.aiReviewStatus, 'pending_review'))),
+        clients.httpDb
+          .select({ id: categories.id, name: categories.name })
+          .from(categories)
+          .where(isNull(categories.deletedAt)),
+      ]);
+
+      const catNamesById = new Map<string, string>(catRows.map((c) => [c.id, c.name]));
+      const items: AiReviewItem[] = txRows.map((tx) => {
+        const suggestedCatId = tx.aiSuggestedCategoryId ?? UNCATEGORIZED_CATEGORY_ID;
+        const suggestedSubId = tx.aiSuggestedSubcategoryId;
+        return AiReviewItemSchema.parse({
+          transaction_id: tx.id,
+          date: tx.bookingDate,
+          clean_label: tx.cleanLabel,
+          amount_cents: tx.amountCents,
+          currency: tx.currency,
+          amount_eur_cents: tx.amountEurCents,
+          account_id: tx.accountId,
+          suggested_category_id: suggestedCatId,
+          suggested_subcategory_id: suggestedSubId,
+          suggested_category_name: catNamesById.get(suggestedCatId) ?? 'Non catégorisé',
+          suggested_subcategory_name:
+            suggestedSubId !== null ? (catNamesById.get(suggestedSubId) ?? null) : null,
+          ai_confidence_bp: tx.aiConfidenceBp ?? 0,
+          ai_reason: tx.aiReason,
+          ai_model: tx.aiModel,
+          ai_review_status: tx.aiReviewStatus,
+          updated_at: tx.updatedAt.toISOString(),
+        });
+      });
+
+      return {
+        items,
+        total_pending: pendingRows[0]?.count ?? 0,
+        limit: options.limit,
+        offset: options.offset,
+      };
+    },
+
+    async resolveReviewDecisions(decisions) {
+      return clients.poolDb.transaction(async (tx) => {
+        const activeCategories = await tx
+          .select()
+          .from(categories)
+          .where(isNull(categories.deletedAt));
+        const catById = new Map(activeCategories.map((c) => [c.id, c]));
+
+        const now = new Date();
+        let resolvedCount = 0;
+        let createdRulesCount = 0;
+        let latestRevision = toSyncRevision(0);
+
+        for (const decision of decisions) {
+          const [txRow] = await tx
+            .select()
+            .from(transactions)
+            .where(and(eq(transactions.id, decision.transaction_id), isNull(transactions.deletedAt)))
+            .limit(1);
+
+          if (txRow === undefined) {
+            return {
+              ok: false,
+              reason: 'not_found',
+              message: `Transaction introuvable : ${decision.transaction_id}.`,
+            } as const;
+          }
+
+          if (decision.action === 'reject') {
+            const rev = await allocateNextRevision(tx);
+            latestRevision = toSyncRevision(Math.max(latestRevision, rev));
+            await tx
+              .update(transactions)
+              .set({
+                category: 'Non catégorisé',
+                categoryId: UNCATEGORIZED_CATEGORY_ID,
+                subcategoryId: null,
+                categorySource: 'uncategorized',
+                aiReviewStatus: 'rejected',
+                revision: rev,
+                updatedAt: now,
+              })
+              .where(eq(transactions.id, txRow.id));
+            resolvedCount += 1;
+            continue;
+          }
+
+          let targetCatId: string | null = null;
+          let targetSubId: string | null = null;
+          let targetLabel = 'Non catégorisé';
+
+          if (decision.action === 'accept') {
+            if (txRow.aiSuggestedCategoryId === null) {
+              return {
+                ok: false,
+                reason: 'invalid_decision',
+                message: `Aucune suggestion IA à accepter pour ${txRow.id}.`,
+              } as const;
+            }
+            const cat = catById.get(txRow.aiSuggestedCategoryId);
+            if (cat === undefined) {
+              return {
+                ok: false,
+                reason: 'invalid_decision',
+                message: 'La catégorie suggérée par l’IA n’est plus active.',
+              } as const;
+            }
+            if (txRow.aiSuggestedSubcategoryId !== null) {
+              const sub = catById.get(txRow.aiSuggestedSubcategoryId);
+              if (sub === undefined || sub.parentId !== cat.id) {
+                return {
+                  ok: false,
+                  reason: 'invalid_decision',
+                  message: 'La sous-catégorie suggérée par l’IA n’est plus valide.',
+                } as const;
+              }
+              targetCatId = cat.id;
+              targetSubId = sub.id;
+              targetLabel = sub.name;
+            } else if (cat.parentId !== null) {
+              targetCatId = cat.parentId;
+              targetSubId = cat.id;
+              targetLabel = cat.name;
+            } else {
+              targetCatId = cat.id;
+              targetSubId = null;
+              targetLabel = cat.name;
+            }
+          } else {
+            // decision.action === 'override'
+            const requestedCatId = decision.category_id;
+            if (requestedCatId === undefined) {
+              return {
+                ok: false,
+                reason: 'invalid_decision',
+                message: 'category_id est requis pour corriger la suggestion.',
+              } as const;
+            }
+            const cat = catById.get(requestedCatId);
+            if (cat === undefined) {
+              return {
+                ok: false,
+                reason: 'invalid_decision',
+                message: `Catégorie cible introuvable : ${requestedCatId}.`,
+              } as const;
+            }
+            const requestedSubId = decision.subcategory_id ?? null;
+            if (requestedSubId !== null) {
+              const sub = catById.get(requestedSubId);
+              if (sub === undefined || sub.parentId !== cat.id) {
+                return {
+                  ok: false,
+                  reason: 'invalid_decision',
+                  message: `Sous-catégorie cible invalide pour ${cat.name}.`,
+                } as const;
+              }
+              targetCatId = cat.id;
+              targetSubId = sub.id;
+              targetLabel = sub.name;
+            } else if (cat.parentId !== null) {
+              targetCatId = cat.parentId;
+              targetSubId = cat.id;
+              targetLabel = cat.name;
+            } else {
+              targetCatId = cat.id;
+              targetSubId = null;
+              targetLabel = cat.name;
+            }
+          }
+
+          const txRev = await allocateNextRevision(tx);
+          latestRevision = toSyncRevision(Math.max(latestRevision, txRev));
+          await tx
+            .update(transactions)
+            .set({
+              category: targetLabel,
+              categoryId: targetCatId,
+              subcategoryId: targetSubId,
+              categorySource: decision.action === 'accept' ? 'ai_validated' : 'manual',
+              isManualCategory: true,
+              matchedRuleId: null,
+              aiReviewStatus: decision.action === 'accept' ? 'accepted' : 'rejected',
+              revision: txRev,
+              updatedAt: now,
+            })
+            .where(eq(transactions.id, txRow.id));
+          resolvedCount += 1;
+
+          if (decision.create_rule === true && targetCatId !== null) {
+            const rawPattern =
+              decision.rule_pattern?.trim() ||
+              extractMerchantPatternForRule(txRow.cleanLabel) ||
+              txRow.cleanLabel.trim();
+            const pattern = rawPattern.slice(0, 200);
+            if (pattern.length > 0) {
+              const ruleRev = await allocateNextRevision(tx);
+              latestRevision = toSyncRevision(Math.max(latestRevision, ruleRev));
+              const [insertedRule] = await tx
+                .insert(categorizationRules)
+                .values({
+                  name: pattern.slice(0, 100),
+                  priority: 100,
+                  bankFilter: null,
+                  accountIdFilter: null,
+                  accountTypeFilter: null,
+                  matchMode: 'contains',
+                  pattern,
+                  targetCategory: targetLabel,
+                  targetCategoryId: targetCatId,
+                  targetSubcategoryId: targetSubId,
+                  markAsInternalTransfer: false,
+                  isActive: true,
+                  revision: ruleRev,
+                  updatedAt: now,
+                })
+                .returning();
+
+              if (insertedRule !== undefined) {
+                createdRulesCount += 1;
+                const sugRev = await allocateNextRevision(tx);
+                latestRevision = toSyncRevision(Math.max(latestRevision, sugRev));
+                await tx
+                  .update(aiRuleSuggestions)
+                  .set({
+                    status: 'accepted',
+                    acceptedRuleId: insertedRule.id,
+                    revision: sugRev,
+                    updatedAt: now,
+                  })
+                  .where(
+                    and(
+                      eq(aiRuleSuggestions.status, 'pending'),
+                      sql`lower(trim(${aiRuleSuggestions.merchantPattern})) = lower(trim(${pattern}))`,
+                    ),
+                  );
+              }
+            }
+          }
+        }
+
+        let retroactiveUpdatedCount = 0;
+        if (createdRulesCount > 0) {
+          const recalc = await runRuleRecalcInTx(tx, { protectInternalTransfers: true });
+          retroactiveUpdatedCount = recalc.updatedCount;
+          if (recalc.latestRevision !== null) {
+            latestRevision = toSyncRevision(Math.max(latestRevision, recalc.latestRevision));
+          }
+        }
+
+        const [pendingRow] = await tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(and(isNull(transactions.deletedAt), eq(transactions.aiReviewStatus, 'pending_review')));
+
+        return {
+          ok: true,
+          data: {
+            resolved_count: resolvedCount,
+            created_rules_count: createdRulesCount,
+            retroactive_updated_count: retroactiveUpdatedCount,
+            current_revision: latestRevision,
+            pending_review_count: pendingRow?.count ?? 0,
+          },
+        } as const;
+      });
+    },
+
+    async listRuleSuggestions(options) {
+      const targetStatus = options?.status ?? 'pending';
+      const [rows, catRows] = await Promise.all([
+        clients.httpDb
+          .select()
+          .from(aiRuleSuggestions)
+          .where(eq(aiRuleSuggestions.status, targetStatus))
+          .orderBy(desc(aiRuleSuggestions.sampleCount), desc(aiRuleSuggestions.updatedAt)),
+        clients.httpDb
+          .select({ id: categories.id, name: categories.name })
+          .from(categories)
+          .where(isNull(categories.deletedAt)),
+      ]);
+
+      const catNamesById = new Map<string, string>(catRows.map((c) => [c.id, c.name]));
+      return {
+        suggestions: rows.map((row) => mapAiRuleSuggestionRow(row, catNamesById)),
+      };
+    },
+
+    async acceptRuleSuggestion(id) {
+      return clients.poolDb.transaction(async (tx) => {
+        const [suggestion] = await tx
+          .select()
+          .from(aiRuleSuggestions)
+          .where(eq(aiRuleSuggestions.id, id))
+          .limit(1);
+
+        if (suggestion === undefined) {
+          return {
+            ok: false,
+            reason: 'not_found',
+            message: 'Suggestion de règle IA introuvable.',
+          } as const;
+        }
+
+        if (suggestion.status !== 'pending') {
+          return {
+            ok: false,
+            reason: 'already_resolved',
+            message: 'Cette suggestion de règle IA a déjà été traitée.',
+          } as const;
+        }
+
+        const activeCats = await tx
+          .select({ id: categories.id, name: categories.name })
+          .from(categories)
+          .where(isNull(categories.deletedAt));
+        const catNamesById = new Map<string, string>(activeCats.map((c) => [c.id, c.name]));
+
+        const targetLabel =
+          (suggestion.targetSubcategoryId !== null
+            ? catNamesById.get(suggestion.targetSubcategoryId)
+            : undefined) ??
+          catNamesById.get(suggestion.targetCategoryId) ??
+          'Non catégorisé';
+
+        const now = new Date();
+        const ruleRev = await allocateNextRevision(tx);
+        const [createdRuleRow] = await tx
+          .insert(categorizationRules)
+          .values({
+            name: suggestion.merchantPattern.slice(0, 100),
+            priority: 100,
+            bankFilter: null,
+            accountIdFilter: null,
+            accountTypeFilter: null,
+            matchMode: suggestion.matchMode,
+            pattern: suggestion.merchantPattern,
+            targetCategory: targetLabel,
+            targetCategoryId: suggestion.targetCategoryId,
+            targetSubcategoryId: suggestion.targetSubcategoryId,
+            markAsInternalTransfer: false,
+            isActive: true,
+            revision: ruleRev,
+            updatedAt: now,
+          })
+          .returning();
+
+        if (createdRuleRow === undefined) {
+          throw new Error('Failed to create categorization rule from AI suggestion');
+        }
+
+        const recalc = await runRuleRecalcInTx(tx, { protectInternalTransfers: true });
+        const sugRev = await allocateNextRevision(tx);
+        const [updatedSuggestion] = await tx
+          .update(aiRuleSuggestions)
+          .set({
+            status: 'accepted',
+            acceptedRuleId: createdRuleRow.id,
+            revision: sugRev,
+            updatedAt: now,
+          })
+          .where(eq(aiRuleSuggestions.id, id))
+          .returning();
+
+        if (updatedSuggestion === undefined) {
+          throw new Error('Failed to update AI rule suggestion');
+        }
+
+        const [matchedCountRow] = await tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(
+            and(eq(transactions.matchedRuleId, createdRuleRow.id), isNull(transactions.deletedAt)),
+          );
+
+        const latestRev = toSyncRevision(
+          Math.max(sugRev, recalc.latestRevision ?? ruleRev),
+        );
+
+        return {
+          ok: true,
+          data: {
+            suggestion: mapAiRuleSuggestionRow(updatedSuggestion, catNamesById),
+            created_rule: mapRuleView(createdRuleRow, matchedCountRow?.count ?? 0),
+            retroactive_updated_count: recalc.updatedCount,
+            current_revision: latestRev,
+          },
+        } as const;
+      });
+    },
+
+    async dismissRuleSuggestion(id) {
+      return clients.poolDb.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(aiRuleSuggestions)
+          .where(eq(aiRuleSuggestions.id, id))
+          .limit(1);
+
+        if (existing === undefined) {
+          return {
+            ok: false,
+            reason: 'not_found',
+            message: 'Suggestion de règle IA introuvable.',
+          } as const;
+        }
+
+        const now = new Date();
+        const rev = await allocateNextRevision(tx);
+        const [updated] = await tx
+          .update(aiRuleSuggestions)
+          .set({ status: 'dismissed', revision: rev, updatedAt: now })
+          .where(eq(aiRuleSuggestions.id, id))
+          .returning();
+
+        if (updated === undefined) {
+          return {
+            ok: false,
+            reason: 'not_found',
+            message: 'Suggestion de règle IA introuvable.',
+          } as const;
+        }
+
+        const catRows = await tx
+          .select({ id: categories.id, name: categories.name })
+          .from(categories)
+          .where(isNull(categories.deletedAt));
+        const catNamesById = new Map<string, string>(catRows.map((c) => [c.id, c.name]));
+
+        return {
+          ok: true,
+          data: {
+            suggestion: mapAiRuleSuggestionRow(updated, catNamesById),
+            current_revision: rev,
+          },
+        } as const;
+      });
+    },
+  };
+
   async function computeMonthlySpentByCategory(
     month: string,
     currency: Currency,
@@ -2461,37 +3238,73 @@ export function createNeonAppDependencies(
           ? or(gt(categories.revision, effectiveSince), gt(categories.updatedAt, sinceDate))
           : gt(categories.revision, effectiveSince);
 
-      const [accRows, txRows, noteRows, ruleRows, categoryRows, latestRunRows, fileRows] =
-        await Promise.all([
-          clients.httpDb.select().from(accounts).where(accountFilter),
-          clients.httpDb
-            .select({ tx: transactions, account: accounts })
-            .from(transactions)
-            .innerJoin(accounts, eq(transactions.accountId, accounts.id))
-            .where(txFilter)
-            .orderBy(asc(transactions.revision))
-            .limit(query.limit + 1),
-          clients.httpDb.select().from(transactionNotes).where(noteFilter),
-          clients.httpDb.select().from(categorizationRules).where(ruleFilter),
-          clients.httpDb
-            .select()
-            .from(categories)
-            .where(categoryFilter)
-            .orderBy(asc(categories.sortOrder), asc(categories.name)),
-          clients.httpDb
-            .select()
-            .from(driveSyncRuns)
-            .orderBy(desc(driveSyncRuns.startedAt))
-            .limit(1),
-          clients.httpDb
-            .select({ file: driveFiles, checkpoint: pdfIngestionCheckpoints })
-            .from(driveFiles)
-            .leftJoin(
-              pdfIngestionCheckpoints,
-              eq(pdfIngestionCheckpoints.driveFileRecordId, driveFiles.id),
+      const aiSuggestionFilter =
+        sinceDate !== null
+          ? or(
+              gt(aiRuleSuggestions.revision, effectiveSince),
+              gt(aiRuleSuggestions.updatedAt, sinceDate),
             )
-            .where(gt(driveFiles.revision, effectiveSince)),
-        ]);
+          : gt(aiRuleSuggestions.revision, effectiveSince);
+
+      const [
+        accRows,
+        txRows,
+        noteRows,
+        ruleRows,
+        categoryRows,
+        allActiveCategoryNames,
+        aiSuggestionRows,
+        pendingReviewRows,
+        latestRunRows,
+        fileRows,
+      ] = await Promise.all([
+        clients.httpDb.select().from(accounts).where(accountFilter),
+        clients.httpDb
+          .select({ tx: transactions, account: accounts })
+          .from(transactions)
+          .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+          .where(txFilter)
+          .orderBy(asc(transactions.revision))
+          .limit(query.limit + 1),
+        clients.httpDb.select().from(transactionNotes).where(noteFilter),
+        clients.httpDb.select().from(categorizationRules).where(ruleFilter),
+        clients.httpDb
+          .select()
+          .from(categories)
+          .where(categoryFilter)
+          .orderBy(asc(categories.sortOrder), asc(categories.name)),
+        clients.httpDb
+          .select({ id: categories.id, name: categories.name })
+          .from(categories)
+          .where(isNull(categories.deletedAt)),
+        clients.httpDb
+          .select()
+          .from(aiRuleSuggestions)
+          .where(aiSuggestionFilter)
+          .orderBy(desc(aiRuleSuggestions.sampleCount)),
+        clients.httpDb
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(
+            and(
+              isNull(transactions.deletedAt),
+              eq(transactions.aiReviewStatus, 'pending_review'),
+            ),
+          ),
+        clients.httpDb
+          .select()
+          .from(driveSyncRuns)
+          .orderBy(desc(driveSyncRuns.startedAt))
+          .limit(1),
+        clients.httpDb
+          .select({ file: driveFiles, checkpoint: pdfIngestionCheckpoints })
+          .from(driveFiles)
+          .leftJoin(
+            pdfIngestionCheckpoints,
+            eq(pdfIngestionCheckpoints.driveFileRecordId, driveFiles.id),
+          )
+          .where(gt(driveFiles.revision, effectiveSince)),
+      ]);
 
       const hasMore = txRows.length > query.limit;
       const pageTxRows = hasMore ? txRows.slice(0, query.limit) : txRows;
@@ -2534,6 +3347,11 @@ export function createNeonAppDependencies(
             subcategory_id: tx.subcategoryId !== null ? parseCategoryId(tx.subcategoryId) : null,
             category_source: tx.categorySource,
             ai_review_status: tx.aiReviewStatus,
+            ai_confidence_bp: tx.aiConfidenceBp,
+            ai_suggested_category_id: tx.aiSuggestedCategoryId,
+            ai_suggested_subcategory_id: tx.aiSuggestedSubcategoryId,
+            ai_reason: tx.aiReason,
+            ai_model: tx.aiModel,
             is_manual_category: tx.isManualCategory,
             matched_rule_id: tx.matchedRuleId !== null ? parseRuleId(tx.matchedRuleId) : null,
             is_internal_transfer: tx.isInternalTransfer,
@@ -2602,6 +3420,16 @@ export function createNeonAppDependencies(
         }
       }
 
+      const catNamesById = new Map<string, string>(
+        allActiveCategoryNames.map((c) => [c.id, c.name]),
+      );
+      const upsertedAiSuggestions: AiRuleSuggestion[] = [];
+      for (const s of aiSuggestionRows) {
+        maxPageRev = Math.max(maxPageRev, s.revision);
+        upsertedAiSuggestions.push(mapAiRuleSuggestionRow(s, catNamesById));
+      }
+      const pendingAiReviewCount = pendingReviewRows[0]?.count ?? 0;
+
       const lastRunRow = latestRunRows[0];
       const filesStatus: DeltaSyncResponse['drive_sync_status']['files'] = [];
       for (const { file, checkpoint } of fileRows) {
@@ -2647,6 +3475,8 @@ export function createNeonAppDependencies(
         },
         categorization_rules: { upserted: upsertedRules, deleted_ids: deletedRuleIds },
         categories: { upserted: upsertedCategories, deleted_ids: deletedCategoryIds },
+        ai_rule_suggestions: upsertedAiSuggestions,
+        pending_ai_review_count: pendingAiReviewCount,
         drive_sync_status: {
           last_run:
             lastRunRow !== undefined
@@ -2818,6 +3648,43 @@ export function createNeonAppDependencies(
     },
   });
 
+  const aiBackfillDispatcher = createHttpAiBackfillDispatcher({
+    syncWorkerUrl: env.SYNC_WORKER_URL,
+    internalWorkerToken,
+    store: {
+      async findActiveRunningRuns() {
+        return clients.httpDb
+          .select({ id: aiCategorizationRuns.id, startedAt: aiCategorizationRuns.startedAt })
+          .from(aiCategorizationRuns)
+          .where(eq(aiCategorizationRuns.status, 'running'))
+          .orderBy(desc(aiCategorizationRuns.startedAt));
+      },
+      async markRunFailed(runId: string, summary: string) {
+        const now = new Date();
+        await clients.poolDb
+          .update(aiCategorizationRuns)
+          .set({
+            status: 'failed',
+            lastError: summary,
+            finishedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(aiCategorizationRuns.id, runId));
+      },
+      async markRunCancelled(runId: string) {
+        const now = new Date();
+        await clients.poolDb
+          .update(aiCategorizationRuns)
+          .set({
+            status: 'cancelled',
+            finishedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(aiCategorizationRuns.id, runId));
+      },
+    },
+  });
+
   return {
     sessionSecret: env.CLAIRFLUX_SESSION_SECRET,
     allowedWebOrigin: env.CLAIRFLUX_WEB_ORIGIN,
@@ -2831,6 +3698,8 @@ export function createNeonAppDependencies(
     transactionsRepository,
     rulesRepository,
     categoriesRepository,
+    aiCategorizationRepository,
+    aiBackfillDispatcher,
     budgetsRepository,
     analyticsRepository,
     deltaMutationRepository,
@@ -2849,9 +3718,12 @@ export function startServer(
   const env = parseApiEnv(rawEnv);
   const internalWorkerToken = parseInternalWorkerToken(rawEnv);
   const clients = createNeonClients(env.DATABASE_URL);
-  void ensureLot1CategoriesSchemaAndSeed(clients).catch((err: unknown) => {
+  void (async () => {
+    await ensureLot1CategoriesSchemaAndSeed(clients);
+    await ensureLot2AiSchema(clients);
+  })().catch((err: unknown) => {
     const errName = err instanceof Error ? err.name : 'UnknownError';
-    console.error(`[api] Échec initialisation schéma Catégories Lot 1 (${errName}).`);
+    console.error(`[api] Échec initialisation schéma Lot 1/2 (${errName}).`);
   });
   const deps = createNeonAppDependencies(env, clients, internalWorkerToken);
   const app = createApp(deps);

@@ -7,6 +7,7 @@ import {
   AccountTypeSchema,
   AggregateKpisSchema,
   AiReviewStatusSchema,
+  AiRuleSuggestionStatusSchema,
   BankSchema,
   BudgetGroupSchema,
   CategoryIdSchema,
@@ -20,6 +21,7 @@ import {
   IsoDateSchema,
   IsoDateTimeSchema,
   IsoMonthSchema,
+  ResolveAiReviewBatchSchema,
   RuleIdSchema,
   RuleMatchModeSchema,
   SyncRevisionSchema,
@@ -29,7 +31,11 @@ import {
   type Account,
   type AccountId,
   type AccountType,
+  type AiCategorizationRun,
+  type AiReviewItem,
   type AiReviewStatus,
+  type AiRuleSuggestion,
+  type AiRuleSuggestionStatus,
   type AllowedDriveFolderId,
   type ApiErrorCode,
   type ApiErrorEnvelope,
@@ -44,6 +50,7 @@ import {
   type DeltaSyncResponse,
   type ExpenseComparisonItem,
   type FxRateMicro,
+  type ResolveAiReviewDecision,
   type RuleId,
   type RuleMatchMode,
   type SyncRevision,
@@ -1671,4 +1678,158 @@ export interface CategoriesRepository {
     id: CategoryId,
     input?: DeleteCategoryInput | undefined,
   ): Promise<DeleteCategoryOutcome>;
+}
+
+// ============================================================================
+// 8. AI Categorization, Review Queue & Rule Suggestions Contracts (Lot 2)
+// ============================================================================
+
+const StrictAiReviewLimitStringSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/, 'Le paramètre limit doit être un entier entre 1 et 100.')
+  .transform((value) => Number(value))
+  .refine(
+    (num) => Number.isSafeInteger(num) && num >= 1 && num <= 100,
+    'Le paramètre limit doit être compris entre 1 et 100.',
+  );
+
+const StrictAiReviewOffsetStringSchema = z
+  .string()
+  .regex(/^(0|[1-9]\d*)$/, 'Le paramètre offset doit être un entier >= 0.')
+  .transform((value) => Number(value))
+  .refine((num) => Number.isSafeInteger(num) && num >= 0, 'Le paramètre offset est hors plage.');
+
+export const AiBackfillBodySchema = z
+  .object({
+    limit: z.number().int().min(1).max(5000).optional(),
+  })
+  .strict();
+export type AiBackfillBody = z.infer<typeof AiBackfillBodySchema>;
+
+export const AiStatusQuerySchema = z.object({
+  run_id: z.string().uuid().optional(),
+});
+
+export const AiCancelBodySchema = z
+  .object({
+    run_id: z.string().uuid().optional(),
+  })
+  .strict();
+export type AiCancelBody = z.infer<typeof AiCancelBodySchema>;
+
+export const AiReviewQueueQuerySchema = z.object({
+  limit: StrictAiReviewLimitStringSchema.optional(),
+  offset: StrictAiReviewOffsetStringSchema.optional(),
+});
+
+export const AiRuleSuggestionsQuerySchema = z.object({
+  status: AiRuleSuggestionStatusSchema.optional(),
+});
+
+export const AiSuggestionIdParamSchema = z.object({
+  id: z.string().uuid(),
+});
+
+export { ResolveAiReviewBatchSchema };
+
+export type AiBackfillDispatchResult =
+  | {
+      readonly ok: true;
+      readonly run_id: string;
+      readonly status: 'running';
+      readonly accepted_at: string;
+    }
+  | { readonly ok: false; readonly reason: 'already_running'; readonly activeRunId: string }
+  | { readonly ok: false; readonly reason: 'worker_unavailable'; readonly message: string };
+
+export type AiBackfillCancelResult =
+  | {
+      readonly ok: true;
+      readonly run_id: string;
+      readonly status: 'cancelling' | 'cancelled';
+      readonly cancelled_at: string;
+    }
+  | { readonly ok: false; readonly reason: 'not_running'; readonly message: string }
+  | { readonly ok: false; readonly reason: 'worker_unavailable'; readonly message: string };
+
+export interface AiBackfillDispatcher {
+  triggerBackfill(input: {
+    readonly limit?: number | undefined;
+  }): Promise<AiBackfillDispatchResult>;
+  cancelBackfill(input: {
+    readonly run_id?: string | undefined;
+  }): Promise<AiBackfillCancelResult>;
+}
+
+export interface AiStatusResult {
+  readonly run: AiCategorizationRun | null;
+  readonly pending_review_count: number;
+  readonly uncategorized_eligible_count: number;
+}
+
+export interface AiReviewQueueResult {
+  readonly items: readonly AiReviewItem[];
+  readonly total_pending: number;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+export interface ResolveAiReviewBatchResult {
+  readonly resolved_count: number;
+  readonly created_rules_count: number;
+  readonly retroactive_updated_count: number;
+  readonly current_revision: SyncRevision;
+  readonly pending_review_count: number;
+}
+
+export type ResolveAiReviewOutcome =
+  | { readonly ok: true; readonly data: ResolveAiReviewBatchResult }
+  | {
+      readonly ok: false;
+      readonly reason: 'not_found' | 'invalid_decision';
+      readonly message: string;
+    };
+
+export interface AiRuleSuggestionsListResult {
+  readonly suggestions: readonly AiRuleSuggestion[];
+}
+
+export interface AcceptAiRuleSuggestionResult {
+  readonly suggestion: AiRuleSuggestion;
+  readonly created_rule: RuleView;
+  readonly retroactive_updated_count: number;
+  readonly current_revision: SyncRevision;
+}
+
+export type AcceptAiRuleSuggestionOutcome =
+  | { readonly ok: true; readonly data: AcceptAiRuleSuggestionResult }
+  | {
+      readonly ok: false;
+      readonly reason: 'not_found' | 'already_resolved';
+      readonly message: string;
+    };
+
+export interface DismissAiRuleSuggestionResult {
+  readonly suggestion: AiRuleSuggestion;
+  readonly current_revision: SyncRevision;
+}
+
+export type DismissAiRuleSuggestionOutcome =
+  | { readonly ok: true; readonly data: DismissAiRuleSuggestionResult }
+  | { readonly ok: false; readonly reason: 'not_found'; readonly message: string };
+
+export interface AiCategorizationRepository {
+  getStatus(options?: { readonly run_id?: string | undefined }): Promise<AiStatusResult>;
+  getReviewQueue(options: {
+    readonly limit: number;
+    readonly offset: number;
+  }): Promise<AiReviewQueueResult>;
+  resolveReviewDecisions(
+    decisions: readonly ResolveAiReviewDecision[],
+  ): Promise<ResolveAiReviewOutcome>;
+  listRuleSuggestions(options?: {
+    readonly status?: AiRuleSuggestionStatus | undefined;
+  }): Promise<AiRuleSuggestionsListResult>;
+  acceptRuleSuggestion(id: string): Promise<AcceptAiRuleSuggestionOutcome>;
+  dismissRuleSuggestion(id: string): Promise<DismissAiRuleSuggestionOutcome>;
 }

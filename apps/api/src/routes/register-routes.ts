@@ -18,6 +18,12 @@ import {
 import { z } from 'zod';
 import {
   AccountsQuerySchema,
+  AiBackfillBodySchema,
+  AiCancelBodySchema,
+  AiReviewQueueQuerySchema,
+  AiRuleSuggestionsQuerySchema,
+  AiStatusQuerySchema,
+  AiSuggestionIdParamSchema,
   AnalyticsOverviewQuerySchema,
   ApkStatusSchema,
   CategoriesQuerySchema,
@@ -35,6 +41,7 @@ import {
   PutBudgetBodySchema,
   ReapplyRulesBodySchema,
   ReorderRulesBodySchema,
+  ResolveAiReviewBatchSchema,
   RuleIdParamSchema,
   TransactionIdParamSchema,
   TransactionsQuerySchema,
@@ -47,6 +54,8 @@ import {
   parseJsonBody,
   type AccountsFilter,
   type AccountsRepository,
+  type AiBackfillDispatcher,
+  type AiCategorizationRepository,
   type AnalyticsOverviewQuery,
   type AnalyticsRepository,
   type ApkArtifactRepository,
@@ -71,6 +80,8 @@ export interface RouteDependencies {
   readonly transactionsRepository?: TransactionsRepository | undefined;
   readonly rulesRepository?: RulesRepository | undefined;
   readonly categoriesRepository?: CategoriesRepository | undefined;
+  readonly aiCategorizationRepository?: AiCategorizationRepository | undefined;
+  readonly aiBackfillDispatcher?: AiBackfillDispatcher | undefined;
   readonly budgetsRepository?: BudgetsRepository | undefined;
   readonly analyticsRepository?: AnalyticsRepository | undefined;
   readonly deltaMutationRepository?: DeltaMutationRepository | undefined;
@@ -503,6 +514,75 @@ function createDefaultCategoriesRepository(getNow: () => Date): CategoriesReposi
   };
 }
 
+function createDefaultAiCategorizationRepository(): AiCategorizationRepository {
+  return {
+    async getStatus() {
+      return {
+        run: null,
+        pending_review_count: 0,
+        uncategorized_eligible_count: 0,
+      };
+    },
+    async getReviewQueue(options) {
+      return {
+        items: [],
+        total_pending: 0,
+        limit: options.limit,
+        offset: options.offset,
+      };
+    },
+    async resolveReviewDecisions() {
+      return {
+        ok: true,
+        data: {
+          resolved_count: 0,
+          created_rules_count: 0,
+          retroactive_updated_count: 0,
+          current_revision: toSyncRevision(0),
+          pending_review_count: 0,
+        },
+      };
+    },
+    async listRuleSuggestions() {
+      return { suggestions: [] };
+    },
+    async acceptRuleSuggestion() {
+      return {
+        ok: false,
+        reason: 'not_found',
+        message: 'Suggestion de règle IA introuvable.',
+      };
+    },
+    async dismissRuleSuggestion() {
+      return {
+        ok: false,
+        reason: 'not_found',
+        message: 'Suggestion de règle IA introuvable.',
+      };
+    },
+  };
+}
+
+function createDefaultAiBackfillDispatcher(getNow: () => Date): AiBackfillDispatcher {
+  return {
+    async triggerBackfill() {
+      return {
+        ok: true,
+        run_id: randomUUID(),
+        status: 'running',
+        accepted_at: getNow().toISOString(),
+      };
+    },
+    async cancelBackfill() {
+      return {
+        ok: false,
+        reason: 'not_running',
+        message: 'Aucun traitement de catégorisation IA actif à annuler.',
+      };
+    },
+  };
+}
+
 export function registerDomainRoutes(
   app: Hono<AppEnv>,
   deps: RouteDependencies,
@@ -513,6 +593,10 @@ export function registerDomainRoutes(
   const rulesRepo = deps.rulesRepository ?? createDefaultRulesRepository(getNow);
   const categoriesRepo =
     deps.categoriesRepository ?? createDefaultCategoriesRepository(getNow);
+  const aiRepo =
+    deps.aiCategorizationRepository ?? createDefaultAiCategorizationRepository();
+  const aiDispatcher =
+    deps.aiBackfillDispatcher ?? createDefaultAiBackfillDispatcher(getNow);
   const budgetsRepo = deps.budgetsRepository ?? createDefaultBudgetsRepository(getNow);
   const analyticsRepo =
     deps.analyticsRepository ?? createDefaultAnalyticsRepository(getNow);
@@ -1309,5 +1393,248 @@ export function registerDomainRoutes(
       'Content-Length': String(artifact.sizeBytes),
       'Cache-Control': 'no-store',
     });
+  });
+
+  // ==========================================================================
+  // 8. AI Categorization, Review Queue & Rule Suggestions (/api/ai/*)
+  // ==========================================================================
+  app.post('/api/ai/categorize/backfill', async (c) => {
+    let limit: number | undefined;
+    const rawBody = await c.req.text();
+    if (rawBody.trim().length > 0) {
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(rawBody);
+      } catch {
+        return errorResponse(c, 400, 'BAD_REQUEST', 'Corps JSON malformé.');
+      }
+      const parsedBody = AiBackfillBodySchema.safeParse(parsedJson);
+      if (!parsedBody.success) {
+        return errorResponse(
+          c,
+          400,
+          'BAD_REQUEST',
+          'Paramètres de rattrapage IA invalides.',
+          { details: formatZodIssues(parsedBody.error) },
+        );
+      }
+      limit = parsedBody.data.limit;
+    }
+
+    const result = await aiDispatcher.triggerBackfill({ limit });
+    if (result.ok) {
+      return c.json(
+        {
+          run_id: result.run_id,
+          status: result.status,
+          accepted_at: result.accepted_at,
+        },
+        202,
+      );
+    }
+
+    switch (result.reason) {
+      case 'already_running':
+        return errorResponse(
+          c,
+          409,
+          'AI_BACKFILL_ALREADY_RUNNING',
+          'Une catégorisation IA par lots est déjà en cours.',
+          {
+            retryable: true,
+            details: { active_run_id: result.activeRunId },
+          },
+        );
+      case 'worker_unavailable':
+        return errorResponse(c, 502, 'AI_WORKER_UNAVAILABLE', result.message, {
+          retryable: true,
+        });
+      default:
+        return assertNever(result);
+    }
+  });
+
+  app.get('/api/ai/categorize/status', async (c) => {
+    const parsedQuery = AiStatusQuerySchema.safeParse({
+      run_id: c.req.query('run_id'),
+    });
+    if (!parsedQuery.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de statut IA invalides.',
+        { details: formatZodIssues(parsedQuery.error) },
+      );
+    }
+
+    const status = await aiRepo.getStatus({
+      ...(parsedQuery.data.run_id !== undefined ? { run_id: parsedQuery.data.run_id } : {}),
+    });
+    return c.json(status, 200);
+  });
+
+  app.post('/api/ai/categorize/cancel', async (c) => {
+    let runId: string | undefined;
+    const rawBody = await c.req.text();
+    if (rawBody.trim().length > 0) {
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(rawBody);
+      } catch {
+        return errorResponse(c, 400, 'BAD_REQUEST', 'Corps JSON malformé.');
+      }
+      const parsedBody = AiCancelBodySchema.safeParse(parsedJson);
+      if (!parsedBody.success) {
+        return errorResponse(
+          c,
+          400,
+          'BAD_REQUEST',
+          'Paramètres d’annulation IA invalides.',
+          { details: formatZodIssues(parsedBody.error) },
+        );
+      }
+      runId = parsedBody.data.run_id;
+    }
+
+    const result = await aiDispatcher.cancelBackfill({ run_id: runId });
+    if (result.ok) {
+      return c.json(
+        {
+          run_id: result.run_id,
+          status: result.status,
+          cancelled_at: result.cancelled_at,
+        },
+        200,
+      );
+    }
+
+    switch (result.reason) {
+      case 'not_running':
+        return errorResponse(c, 409, 'AI_BACKFILL_NOT_RUNNING', result.message);
+      case 'worker_unavailable':
+        return errorResponse(c, 502, 'AI_WORKER_UNAVAILABLE', result.message, {
+          retryable: true,
+        });
+      default:
+        return assertNever(result);
+    }
+  });
+
+  app.get('/api/ai/review-queue', async (c) => {
+    const parsedQuery = AiReviewQueueQuerySchema.safeParse({
+      limit: c.req.query('limit'),
+      offset: c.req.query('offset'),
+    });
+    if (!parsedQuery.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de boîte de révision IA invalides.',
+        { details: formatZodIssues(parsedQuery.error) },
+      );
+    }
+
+    const result = await aiRepo.getReviewQueue({
+      limit: parsedQuery.data.limit ?? 50,
+      offset: parsedQuery.data.offset ?? 0,
+    });
+    return c.json(result, 200);
+  });
+
+  app.post('/api/ai/review-queue/resolve', async (c) => {
+    const jsonBody = await parseJsonBody(c);
+    if (!jsonBody.ok) {
+      return jsonBody.response;
+    }
+
+    const parsedBody = ResolveAiReviewBatchSchema.safeParse(jsonBody.data);
+    if (!parsedBody.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Décisions de révision IA invalides.',
+        { details: formatZodIssues(parsedBody.error) },
+      );
+    }
+
+    const outcome = await aiRepo.resolveReviewDecisions(parsedBody.data.decisions);
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case 'not_found':
+          return errorResponse(c, 404, 'RESOURCE_NOT_FOUND', outcome.message);
+        case 'invalid_decision':
+          return errorResponse(c, 422, 'AI_INVALID_DECISION', outcome.message);
+      }
+    }
+
+    return c.json(outcome.data, 200);
+  });
+
+  app.get('/api/ai/rule-suggestions', async (c) => {
+    const parsedQuery = AiRuleSuggestionsQuerySchema.safeParse({
+      status: c.req.query('status'),
+    });
+    if (!parsedQuery.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de filtrage des suggestions de règles invalides.',
+        { details: formatZodIssues(parsedQuery.error) },
+      );
+    }
+
+    const result = await aiRepo.listRuleSuggestions({
+      ...(parsedQuery.data.status !== undefined ? { status: parsedQuery.data.status } : {}),
+    });
+    return c.json(result, 200);
+  });
+
+  app.post('/api/ai/rule-suggestions/:id/accept', async (c) => {
+    const parsedParam = AiSuggestionIdParamSchema.safeParse({ id: c.req.param('id') });
+    if (!parsedParam.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Identifiant de suggestion de règle invalide.',
+        { details: formatZodIssues(parsedParam.error) },
+      );
+    }
+
+    const outcome = await aiRepo.acceptRuleSuggestion(parsedParam.data.id);
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case 'not_found':
+          return errorResponse(c, 404, 'AI_SUGGESTION_NOT_FOUND', outcome.message);
+        case 'already_resolved':
+          return errorResponse(c, 409, 'AI_INVALID_DECISION', outcome.message);
+      }
+    }
+
+    return c.json(outcome.data, 200);
+  });
+
+  app.post('/api/ai/rule-suggestions/:id/dismiss', async (c) => {
+    const parsedParam = AiSuggestionIdParamSchema.safeParse({ id: c.req.param('id') });
+    if (!parsedParam.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Identifiant de suggestion de règle invalide.',
+        { details: formatZodIssues(parsedParam.error) },
+      );
+    }
+
+    const outcome = await aiRepo.dismissRuleSuggestion(parsedParam.data.id);
+    if (!outcome.ok) {
+      return errorResponse(c, 404, 'AI_SUGGESTION_NOT_FOUND', outcome.message);
+    }
+
+    return c.json(outcome.data, 200);
   });
 }
