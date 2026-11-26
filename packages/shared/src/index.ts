@@ -1,11 +1,16 @@
 import { z } from 'zod';
 import {
+  AI_MAX_REASON_LENGTH,
+  AiRuleSuggestionSchema,
+} from './ai.js';
+import {
   AiReviewStatusSchema,
   CategoryIdSchema,
   CategorySchema,
   CategorySourceSchema,
 } from './categories.js';
 
+export * from './ai.js';
 export * from './categories.js';
 
 // ============================================================================
@@ -155,6 +160,11 @@ export const ApiErrorCodeSchema = z.enum([
   'CATEGORY_REASSIGN_REQUIRED',
   'CATEGORY_CONFLICT',
   'CATEGORY_HAS_CHILDREN_OR_SYSTEM',
+  'AI_BACKFILL_ALREADY_RUNNING',
+  'AI_BACKFILL_NOT_RUNNING',
+  'AI_SUGGESTION_NOT_FOUND',
+  'AI_WORKER_UNAVAILABLE',
+  'AI_INVALID_DECISION',
   'RATE_LIMITED',
   'UPSTREAM_DRIVE_ERROR',
   'UPSTREAM_GEMINI_ERROR',
@@ -178,7 +188,7 @@ export const AllowedDriveFolderIdSchema = z.enum([
 
 export const EUR_FX_RATE_MICRO: FxRateMicro = toFxRateMicro(1_000_000);
 export const CLAIRFLUX_DELTA_SCHEMA_VERSION = '1.0.0' as const;
-export const CLAIRFLUX_BUILD_VERSION = '1.1.0-build.1' as const;
+export const CLAIRFLUX_BUILD_VERSION = '1.1.0-build.2' as const;
 
 export function isAllowedDriveFolderId(
   folderId: string,
@@ -249,6 +259,11 @@ export const TransactionSchema = z.object({
   subcategory_id: CategoryIdSchema.nullable().optional(),
   category_source: CategorySourceSchema.optional(),
   ai_review_status: AiReviewStatusSchema.optional(),
+  ai_confidence_bp: z.number().int().min(0).max(10000).nullable().optional(),
+  ai_suggested_category_id: z.string().uuid().nullable().optional(),
+  ai_suggested_subcategory_id: z.string().uuid().nullable().optional(),
+  ai_reason: z.string().max(AI_MAX_REASON_LENGTH).nullable().optional(),
+  ai_model: z.string().max(80).nullable().optional(),
   is_manual_category: z.boolean(),
   matched_rule_id: RuleIdSchema.nullable(),
   is_internal_transfer: z.boolean(),
@@ -391,6 +406,8 @@ export const DeltaSyncResponseSchema = z.object({
       deleted_ids: z.array(CategoryIdSchema),
     })
     .optional(),
+  ai_rule_suggestions: z.array(AiRuleSuggestionSchema).optional(),
+  pending_ai_review_count: z.number().int().min(0).optional(),
   drive_sync_status: DriveSyncStatusSchema,
   aggregates_snapshot: AggregatesSnapshotSchema.nullable(),
 });

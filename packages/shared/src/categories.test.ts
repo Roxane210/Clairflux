@@ -111,8 +111,8 @@ describe('Category schemas & branded primitives', () => {
     ).toBe(false);
   });
 
-  it('exposes new Lot 1 error codes, version 1.1.0-build.1, and backward-compatible v1/v2 schemas', () => {
-    expect(CLAIRFLUX_BUILD_VERSION).toBe('1.1.0-build.1');
+  it('exposes new Lot 1 error codes, valid build version, and backward-compatible v1/v2 schemas', () => {
+    expect(CLAIRFLUX_BUILD_VERSION).toMatch(/^\d+\.\d+\.\d+-build\.\d+$/);
     expect(ApiErrorCodeSchema.parse('CATEGORY_DEPTH_EXCEEDED')).toBe('CATEGORY_DEPTH_EXCEEDED');
     expect(ApiErrorCodeSchema.parse('CATEGORY_REASSIGN_REQUIRED')).toBe(
       'CATEGORY_REASSIGN_REQUIRED',

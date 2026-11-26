@@ -1,7 +1,9 @@
 import {
   ALLOWED_DRIVE_FOLDERS,
   AccountTypeSchema,
+  AiBackfillRunStatusSchema,
   AiReviewStatusSchema,
+  AiRuleSuggestionStatusSchema,
   BankSchema,
   BudgetGroupSchema,
   CategorySourceSchema,
@@ -38,7 +40,9 @@ import {
 export {
   ALLOWED_DRIVE_FOLDERS,
   AccountTypeSchema,
+  AiBackfillRunStatusSchema,
   AiReviewStatusSchema,
+  AiRuleSuggestionStatusSchema,
   BankSchema,
   BudgetGroupSchema,
   CategorySourceSchema,
@@ -131,6 +135,20 @@ export const aiReviewStatusEnum = pgEnum('ai_review_status_enum', [
   'pending_review',
   'accepted',
   'rejected',
+]);
+
+export const aiBackfillRunStatusEnum = pgEnum('ai_backfill_run_status', [
+  'running',
+  'completed',
+  'partial_error',
+  'failed',
+  'cancelled',
+]);
+
+export const aiRuleSuggestionStatusEnum = pgEnum('ai_rule_suggestion_status', [
+  'pending',
+  'accepted',
+  'dismissed',
 ]);
 
 const nextRevisionDefault = sql`nextval('sync_revision_seq')`;
@@ -458,6 +476,9 @@ export const transactions = pgTable(
     index('idx_tx_ai_review_queue')
       .on(t.aiReviewStatus, t.aiConfidenceBp.desc(), t.bookingDate.desc())
       .where(sql`ai_review_status = 'pending_review' AND deleted_at IS NULL`),
+    index('idx_tx_ai_review_status_pending')
+      .on(t.aiReviewStatus)
+      .where(sql`ai_review_status = 'pending_review' AND deleted_at IS NULL`),
     index('idx_tx_transfer_group')
       .on(t.transferGroupId)
       .where(sql`transfer_group_id IS NOT NULL AND deleted_at IS NULL`),
@@ -541,6 +562,79 @@ export const appliedClientMutations = pgTable(
       sql`result_status IN ('applied', 'duplicate', 'rejected')`,
     ),
     index('idx_applied_client_mutations_applied_at').on(t.appliedAt.desc()),
+  ],
+);
+
+export const aiCategorizationRuns = pgTable(
+  'ai_categorization_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    status: aiBackfillRunStatusEnum('status').notNull().default('running'),
+    triggerSource: varchar('trigger_source', { length: 32 }).notNull().default('manual_backfill'),
+    cursorTxId: uuid('cursor_tx_id'),
+    modelUsed: varchar('model_used', { length: 80 }),
+    totalCandidates: integer('total_candidates').notNull().default(0),
+    processedCount: integer('processed_count').notNull().default(0),
+    autoAppliedCount: integer('auto_applied_count').notNull().default(0),
+    queuedReviewCount: integer('queued_review_count').notNull().default(0),
+    failedCount: integer('failed_count').notNull().default(0),
+    estimatedTokens: integer('estimated_tokens').notNull().default(0),
+    lastError: text('last_error'),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    finishedAt: timestamp('finished_at', { withTimezone: true, mode: 'date' }),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+  },
+  (t) => [
+    check(
+      'chk_ai_runs_counts_non_negative',
+      sql`total_candidates >= 0 AND processed_count >= 0 AND auto_applied_count >= 0 AND queued_review_count >= 0 AND failed_count >= 0 AND estimated_tokens >= 0`,
+    ),
+    check(
+      'chk_ai_runs_trigger_source',
+      sql`trigger_source IN ('manual_backfill', 'post_pdf_sync')`,
+    ),
+    check('chk_ai_runs_finished_ts', sql`status = 'running' OR finished_at IS NOT NULL`),
+    uniqueIndex('uq_ai_runs_single_running')
+      .on(t.status)
+      .where(sql`status = 'running'`),
+    index('idx_ai_runs_status_started').on(t.status, t.startedAt.desc()),
+  ],
+);
+
+export const aiRuleSuggestions = pgTable(
+  'ai_rule_suggestions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    merchantPattern: varchar('merchant_pattern', { length: 200 }).notNull(),
+    matchMode: ruleMatchModeEnum('match_mode').notNull().default('contains'),
+    targetCategoryId: uuid('target_category_id')
+      .notNull()
+      .references(() => categories.id, { onDelete: 'restrict' }),
+    targetSubcategoryId: uuid('target_subcategory_id').references(() => categories.id, {
+      onDelete: 'set null',
+    }),
+    sampleCount: integer('sample_count').notNull().default(1),
+    status: aiRuleSuggestionStatusEnum('status').notNull().default('pending'),
+    acceptedRuleId: uuid('accepted_rule_id').references(() => categorizationRules.id, {
+      onDelete: 'set null',
+    }),
+    revision: bigint('revision', { mode: 'number' }).notNull().default(nextRevisionDefault),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+  },
+  (t) => [
+    check(
+      'chk_ai_rule_suggestions_pattern_non_empty',
+      sql`char_length(trim(merchant_pattern)) > 0`,
+    ),
+    check('chk_ai_rule_suggestions_sample_min', sql`sample_count >= 1`),
+    check(
+      'chk_ai_rule_suggestions_distinct_subcat',
+      sql`target_subcategory_id IS NULL OR target_subcategory_id <> target_category_id`,
+    ),
+    uniqueIndex('uq_ai_rule_suggestions_merchant_pattern').on(t.merchantPattern),
+    index('idx_ai_rule_suggestions_status').on(t.status, t.sampleCount.desc()),
+    index('idx_ai_rule_suggestions_revision').on(t.revision),
   ],
 );
 
@@ -656,6 +750,23 @@ export const transactionNotesRelations = relations(transactionNotes, ({ one }) =
   }),
 }));
 
+export const aiRuleSuggestionsRelations = relations(aiRuleSuggestions, ({ one }) => ({
+  targetCategoryRef: one(categories, {
+    fields: [aiRuleSuggestions.targetCategoryId],
+    references: [categories.id],
+    relationName: 'ai_suggestion_target_category',
+  }),
+  targetSubcategoryRef: one(categories, {
+    fields: [aiRuleSuggestions.targetSubcategoryId],
+    references: [categories.id],
+    relationName: 'ai_suggestion_target_subcategory',
+  }),
+  acceptedRule: one(categorizationRules, {
+    fields: [aiRuleSuggestions.acceptedRuleId],
+    references: [categorizationRules.id],
+  }),
+}));
+
 // ============================================================================
 // Single Source of Truth Inferred Row Types
 // ============================================================================
@@ -696,6 +807,12 @@ export type NewBudgetLimitRow = typeof budgetLimits.$inferInsert;
 export type AppliedClientMutationRow = typeof appliedClientMutations.$inferSelect;
 export type NewAppliedClientMutationRow = typeof appliedClientMutations.$inferInsert;
 
+export type AiCategorizationRunRow = typeof aiCategorizationRuns.$inferSelect;
+export type NewAiCategorizationRunRow = typeof aiCategorizationRuns.$inferInsert;
+
+export type AiRuleSuggestionRow = typeof aiRuleSuggestions.$inferSelect;
+export type NewAiRuleSuggestionRow = typeof aiRuleSuggestions.$inferInsert;
+
 export const schema = {
   syncRevisionSeq,
   bankEnum,
@@ -709,6 +826,8 @@ export const schema = {
   budgetGroupEnum,
   categorySourceEnum,
   aiReviewStatusEnum,
+  aiBackfillRunStatusEnum,
+  aiRuleSuggestionStatusEnum,
   accounts,
   fxRates,
   driveSyncRuns,
@@ -721,6 +840,8 @@ export const schema = {
   syncMeta,
   budgetLimits,
   appliedClientMutations,
+  aiCategorizationRuns,
+  aiRuleSuggestions,
   accountsRelations,
   driveSyncRunsRelations,
   driveFilesRelations,
@@ -729,4 +850,5 @@ export const schema = {
   categorizationRulesRelations,
   transactionsRelations,
   transactionNotesRelations,
+  aiRuleSuggestionsRelations,
 } as const;
