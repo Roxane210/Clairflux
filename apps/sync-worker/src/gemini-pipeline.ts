@@ -4,6 +4,7 @@ import { serve } from '@hono/node-server';
 import { Pool, neon } from '@neondatabase/serverless';
 import {
   AccountTypeSchema,
+  AiTriggerSourceSchema,
   BankSchema,
   CLAIRFLUX_BUILD_VERSION,
   CentsSchema,
@@ -20,6 +21,7 @@ import {
   toCents,
   toFxRateMicro,
   type AccountType,
+  type AiTriggerSource,
   type AllowedDriveFolderId,
   type Bank,
   type Cents,
@@ -67,6 +69,14 @@ import {
   type PdfTextExtractor,
   type PreparedPdfStatement,
 } from './drive-pdf.js';
+import {
+  NeonAiCategorizationStore,
+  createHttpGeminiCategorizerClient,
+  runAiCategorizationBackfill,
+  type AiCategorizationRunResult,
+  type CancelAiBackfillResult,
+  type TriggerAiBackfillResult,
+} from './ai-categorizer.js';
 
 // ============================================================================
 // Constants & Canonical Error Types
@@ -3003,12 +3013,31 @@ export async function runIngestionPipeline(
 // Internal HTTP Server (createWorkerApp) & Graceful Shutdown Entrypoint
 // ============================================================================
 
+export type {
+  AiCategorizationRunResult,
+  CancelAiBackfillResult,
+  TriggerAiBackfillResult,
+} from './ai-categorizer.js';
+
 const InternalRunRequestSchema = z
   .object({
     run_id: z.string().uuid().optional(),
     drive_file_id: z.string().trim().min(1).max(128).optional(),
   })
   .strict();
+
+const InternalAiBackfillRequestSchema = z.object({
+  run_id: z.string().uuid().optional(),
+  runId: z.string().uuid().optional(),
+  limit: z.number().int().min(1).max(10_000).optional(),
+  trigger_source: AiTriggerSourceSchema.optional(),
+  triggerSource: AiTriggerSourceSchema.optional(),
+});
+
+const InternalAiCancelRequestSchema = z.object({
+  run_id: z.string().uuid().optional(),
+  runId: z.string().uuid().optional(),
+});
 
 export type TriggerWorkerRunResult =
   | { readonly ok: true; readonly runId: string; readonly acceptedAt: string }
@@ -3023,6 +3052,17 @@ export interface WorkerAppDependencies {
     readonly runId?: string | undefined;
     readonly driveFileId?: string | undefined;
   }) => Promise<TriggerWorkerRunResult>;
+  readonly getActiveAiRunId?: (() => string | null) | undefined;
+  readonly triggerAiBackfill?:
+    | ((input: {
+        readonly runId?: string | undefined;
+        readonly limit?: number | undefined;
+        readonly triggerSource?: AiTriggerSource | undefined;
+      }) => Promise<TriggerAiBackfillResult>)
+    | undefined;
+  readonly cancelAiBackfill?:
+    | ((input: { readonly runId?: string | undefined }) => Promise<CancelAiBackfillResult>)
+    | undefined;
 }
 
 function verifyInternalWorkerToken(provided: string, expected: string): boolean {
@@ -3208,6 +3248,221 @@ export function createWorkerApp(deps: WorkerAppDependencies): Hono {
     }
   });
 
+  app.get('/internal/ai/categorize/active', (c) => {
+    if (!isAuthorizedInternalRequest(c, deps.internalWorkerToken)) {
+      return c.json(
+        {
+          error: {
+            code: 'UNAUTHORIZED' as const,
+            message: 'Jeton interne sync-worker absent ou invalide.',
+          },
+        },
+        401,
+      );
+    }
+
+    return c.json(
+      {
+        active_run_id: deps.getActiveAiRunId?.() ?? null,
+      },
+      200,
+    );
+  });
+
+  app.post('/internal/ai/categorize/backfill', async (c) => {
+    if (!isAuthorizedInternalRequest(c, deps.internalWorkerToken)) {
+      return c.json(
+        {
+          error: {
+            code: 'UNAUTHORIZED' as const,
+            message: 'Jeton interne sync-worker absent ou invalide.',
+          },
+        },
+        401,
+      );
+    }
+
+    const rawText = await c.req.text();
+    let parsedJson: unknown = {};
+    if (rawText.trim().length > 0) {
+      try {
+        parsedJson = JSON.parse(rawText);
+      } catch {
+        return c.json(
+          {
+            error: {
+              code: 'BAD_REQUEST' as const,
+              message: 'Corps JSON malformé.',
+            },
+          },
+          400,
+        );
+      }
+    }
+
+    const validated = InternalAiBackfillRequestSchema.safeParse(parsedJson);
+    if (!validated.success) {
+      return c.json(
+        {
+          error: {
+            code: 'VALIDATION_ERROR' as const,
+            message: 'Paramètres de lancement de catégorisation IA invalides.',
+            details: {
+              issues: validated.error.issues.map((issue) => ({
+                path: issue.path.join('.'),
+                message: issue.message,
+              })),
+            },
+          },
+        },
+        422,
+      );
+    }
+
+    if (deps.triggerAiBackfill === undefined) {
+      return c.json(
+        {
+          error: {
+            code: 'AI_WORKER_UNAVAILABLE' as const,
+            message: 'Le moteur de catégorisation IA n’est pas activé sur ce sync-worker.',
+          },
+        },
+        502,
+      );
+    }
+
+    const result = await deps.triggerAiBackfill({
+      runId: validated.data.run_id ?? validated.data.runId,
+      limit: validated.data.limit,
+      triggerSource: validated.data.trigger_source ?? validated.data.triggerSource,
+    });
+
+    if (result.ok) {
+      return c.json(
+        {
+          run_id: result.runId,
+          status: 'running' as const,
+          accepted_at: result.acceptedAt ?? getNow().toISOString(),
+        },
+        202,
+      );
+    }
+
+    switch (result.reason) {
+      case 'already_running':
+        return c.json(
+          {
+            error: {
+              code: 'AI_BACKFILL_ALREADY_RUNNING' as const,
+              message: 'Une catégorisation IA est déjà en cours dans le sync-worker.',
+              details: { active_run_id: result.activeRunId },
+            },
+          },
+          409,
+        );
+      case 'upstream_error':
+        return c.json(
+          {
+            error: {
+              code: 'AI_WORKER_UNAVAILABLE' as const,
+              message: result.message,
+            },
+          },
+          502,
+        );
+      default:
+        return assertNever(result);
+    }
+  });
+
+  app.post('/internal/ai/categorize/cancel', async (c) => {
+    if (!isAuthorizedInternalRequest(c, deps.internalWorkerToken)) {
+      return c.json(
+        {
+          error: {
+            code: 'UNAUTHORIZED' as const,
+            message: 'Jeton interne sync-worker absent ou invalide.',
+          },
+        },
+        401,
+      );
+    }
+
+    const rawText = await c.req.text();
+    let parsedJson: unknown = {};
+    if (rawText.trim().length > 0) {
+      try {
+        parsedJson = JSON.parse(rawText);
+      } catch {
+        return c.json(
+          {
+            error: {
+              code: 'BAD_REQUEST' as const,
+              message: 'Corps JSON malformé.',
+            },
+          },
+          400,
+        );
+      }
+    }
+
+    const validated = InternalAiCancelRequestSchema.safeParse(parsedJson);
+    if (!validated.success) {
+      return c.json(
+        {
+          error: {
+            code: 'VALIDATION_ERROR' as const,
+            message: 'Paramètres d’annulation de catégorisation IA invalides.',
+            details: {
+              issues: validated.error.issues.map((issue) => ({
+                path: issue.path.join('.'),
+                message: issue.message,
+              })),
+            },
+          },
+        },
+        422,
+      );
+    }
+
+    if (deps.cancelAiBackfill === undefined) {
+      return c.json(
+        {
+          error: {
+            code: 'AI_BACKFILL_NOT_RUNNING' as const,
+            message: 'Aucune catégorisation IA en cours.',
+          },
+        },
+        409,
+      );
+    }
+
+    const result = await deps.cancelAiBackfill({
+      runId: validated.data.run_id ?? validated.data.runId,
+    });
+
+    if (result.ok) {
+      return c.json(
+        {
+          run_id: result.runId,
+          status: result.status,
+          cancelled_at: result.cancelledAt ?? getNow().toISOString(),
+        },
+        200,
+      );
+    }
+
+    return c.json(
+      {
+        error: {
+          code: 'AI_BACKFILL_NOT_RUNNING' as const,
+          message: result.message,
+        },
+      },
+      409,
+    );
+  });
+
   app.notFound((c) => {
     return c.json(
       {
@@ -3235,6 +3490,7 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
 } {
   const env = parseWorkerEnv(rawEnv);
   const store = new NeonCheckpointStore(env.DATABASE_URL);
+  const aiStore = new NeonAiCategorizationStore(env.DATABASE_URL);
   const driveClient = createGoogleDriveClient({
     getAccessToken: createDriveAccessTokenProvider({
       credentialsPath: env.GOOGLE_DRIVE_CREDENTIALS_PATH,
@@ -3244,34 +3500,138 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
   const geminiClient = createHttpGeminiClient({
     apiKey: env.GEMINI_API_KEY,
   });
+  const aiGeminiClient = createHttpGeminiCategorizerClient({
+    apiKey: env.GEMINI_API_KEY,
+  });
   const fxRateService = createFxRateService({
     store,
     fetchReferenceRate: createEcbReferenceFxFetcher(),
     maxLookbackDays: FX_MAX_LOOKBACK_DAYS,
   });
 
-  const startupReconcilePromise = store
-    .reconcileOrphanedRuns('Synchronisation interrompue (redémarrage du service sync-worker).')
-    .then((count) => {
-      console.info(
-        `[sync-worker] v${CLAIRFLUX_BUILD_VERSION} prêt sur le port ${env.PORT} (${count} run(s) orphelin(s) réconcilié(s)).`,
-      );
-      return count;
-    })
-    .catch((err: unknown) => {
-      console.error('[sync-worker] Échec réconciliation des runs orphelins au démarrage:', err);
-      console.info(
-        `[sync-worker] v${CLAIRFLUX_BUILD_VERSION} prêt sur le port ${env.PORT} (réconciliation échouée).`,
-      );
-      return 0;
-    });
+  const startupReconcilePromise = Promise.all([
+    store
+      .reconcileOrphanedRuns('Synchronisation interrompue (redémarrage du service sync-worker).')
+      .catch((err: unknown) => {
+        console.error('[sync-worker] Échec réconciliation des runs Drive orphelins au démarrage:', err);
+        return 0;
+      }),
+    aiStore
+      .reconcileOrphanedRuns(
+        'Catégorisation IA interrompue (redémarrage du service sync-worker).',
+      )
+      .catch((err: unknown) => {
+        console.error('[sync-worker] Échec réconciliation des runs IA orphelins au démarrage:', err);
+        return 0;
+      }),
+  ]).then(([driveCount, aiCount]) => {
+    console.info(
+      `[sync-worker] v${CLAIRFLUX_BUILD_VERSION} prêt sur le port ${env.PORT} (${driveCount} run(s) Drive et ${aiCount} run(s) IA orphelin(s) réconcilié(s)).`,
+    );
+    return driveCount + aiCount;
+  });
 
   let activeRunId: string | null = null;
   let activePromise: Promise<SyncRunResult> | null = null;
 
+  let activeAiRunId: string | null = null;
+  let activeAiCancelRequested = false;
+  let activeAiPromise: Promise<AiCategorizationRunResult> | null = null;
+
+  const triggerAiBackfill = async (input: {
+    readonly runId?: string | undefined;
+    readonly limit?: number | undefined;
+    readonly triggerSource?: AiTriggerSource | undefined;
+  }): Promise<TriggerAiBackfillResult> => {
+    await startupReconcilePromise;
+
+    if (activeAiRunId !== null) {
+      return {
+        ok: false,
+        reason: 'already_running',
+        activeRunId: activeAiRunId,
+      };
+    }
+
+    const triggerSource: AiTriggerSource = input.triggerSource ?? 'manual_backfill';
+    const runId = input.runId ?? randomUUID();
+
+    try {
+      await aiStore.ensureRun({
+        runId,
+        triggerSource,
+        totalCandidates: 0,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        reason: 'upstream_error',
+        message: `Impossible d’initialiser le run de catégorisation IA : ${message}`,
+      };
+    }
+
+    activeAiRunId = runId;
+    activeAiCancelRequested = false;
+
+    const promise = runAiCategorizationBackfill(
+      {
+        store: aiStore,
+        geminiClient: aiGeminiClient,
+        isCancelRequested: () => activeAiCancelRequested,
+      },
+      {
+        runId,
+        limit: input.limit,
+        triggerSource,
+      },
+    ).finally(() => {
+      activeAiRunId = null;
+      activeAiCancelRequested = false;
+      activeAiPromise = null;
+    });
+
+    activeAiPromise = promise;
+    void promise.catch((err: unknown) => {
+      console.error(`[sync-worker] Erreur fatale sur le run IA ${runId}:`, err);
+    });
+
+    return {
+      ok: true,
+      runId,
+      acceptedAt: new Date().toISOString(),
+    };
+  };
+
+  const cancelAiBackfill = async (input: {
+    readonly runId?: string | undefined;
+  }): Promise<CancelAiBackfillResult> => {
+    if (
+      activeAiRunId === null ||
+      (input.runId !== undefined && input.runId !== activeAiRunId)
+    ) {
+      return {
+        ok: false,
+        reason: 'not_running',
+        message: 'Aucune catégorisation IA en cours.',
+      };
+    }
+
+    activeAiCancelRequested = true;
+    return {
+      ok: true,
+      runId: activeAiRunId,
+      status: 'cancelling',
+      cancelledAt: new Date().toISOString(),
+    };
+  };
+
   const app = createWorkerApp({
     internalWorkerToken: env.INTERNAL_WORKER_TOKEN,
     getActiveRunId: () => activeRunId,
+    getActiveAiRunId: () => activeAiRunId,
+    triggerAiBackfill,
+    cancelAiBackfill,
     async triggerSync(input): Promise<TriggerWorkerRunResult> {
       await startupReconcilePromise;
 
@@ -3298,10 +3658,34 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
           runId,
           targetDriveFileId: input.driveFileId,
         },
-      ).finally(() => {
-        activeRunId = null;
-        activePromise = null;
-      });
+      )
+        .then((syncResult) => {
+          const totalInsertedTx = syncResult.fileResults.reduce(
+            (acc, fileRes) => acc + fileRes.insertedTxCount,
+            0,
+          );
+          if (totalInsertedTx > 0 && activeAiRunId === null) {
+            void aiStore
+              .countEligibleCandidates()
+              .then((eligibleCount) => {
+                if (eligibleCount > 0 && activeAiRunId === null) {
+                  return triggerAiBackfill({ triggerSource: 'post_pdf_sync' });
+                }
+                return undefined;
+              })
+              .catch((aiErr: unknown) => {
+                console.error(
+                  '[sync-worker] Échec non-bloquant du passage IA post-PDF:',
+                  aiErr,
+                );
+              });
+          }
+          return syncResult;
+        })
+        .finally(() => {
+          activeRunId = null;
+          activePromise = null;
+        });
 
       activePromise = promise;
       void promise.catch((err: unknown) => {
@@ -3327,13 +3711,17 @@ export function startWorkerRuntime(rawEnv: Readonly<Record<string, string | unde
       return;
     }
     shuttingDown = true;
+    activeAiCancelRequested = true;
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
     if (activePromise !== null) {
       await activePromise.catch(() => undefined);
     }
-    await store.close();
+    if (activeAiPromise !== null) {
+      await activeAiPromise.catch(() => undefined);
+    }
+    await Promise.all([store.close(), aiStore.close()]);
   };
 
   const handleSignal = (signal: NodeJS.Signals): void => {
