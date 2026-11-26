@@ -31,8 +31,18 @@ import {
   type BudgetUpsertResult,
   type BudgetsListResult,
   type BudgetsRepository,
+  type CategoriesListResult,
+  type CategoriesRepository,
+  type CategoryDeleteResult,
+  type CategoryMergeResult,
+  type CategoryMutationResult,
+  type CategoryView,
   type ClientKind,
+  type CreateCategoryInput,
+  type CreateCategoryOutcome,
   type CreateRuleInput,
+  type DeleteCategoryInput,
+  type DeleteCategoryOutcome,
   type DeleteRuleOutcome,
   type DeleteRuleResult,
   type DeltaMutationRepository,
@@ -40,6 +50,8 @@ import {
   type DriveSyncRunStarted,
   type DriveSyncService,
   type HealthRepository,
+  type MergeCategoryInput,
+  type MergeCategoryOutcome,
   type OutboxMutation,
   type OutboxMutationOutcome,
   type PatchTransactionResult,
@@ -62,6 +74,8 @@ import {
   type TransactionsListResult,
   type TransactionsRepository,
   type TriggerDriveSyncResult,
+  type UpdateCategoryInput,
+  type UpdateCategoryOutcome,
   type UpdateRuleInput,
   type UpdateRuleResult,
 } from './routes/contracts.js';
@@ -89,8 +103,18 @@ export type {
   BudgetUpsertResult,
   BudgetsListResult,
   BudgetsRepository,
+  CategoriesListResult,
+  CategoriesRepository,
+  CategoryDeleteResult,
+  CategoryMergeResult,
+  CategoryMutationResult,
+  CategoryView,
   ClientKind,
+  CreateCategoryInput,
+  CreateCategoryOutcome,
   CreateRuleInput,
+  DeleteCategoryInput,
+  DeleteCategoryOutcome,
   DeleteRuleOutcome,
   DeleteRuleResult,
   DeltaMutationRepository,
@@ -98,6 +122,8 @@ export type {
   DriveSyncRunStarted,
   DriveSyncService,
   HealthRepository,
+  MergeCategoryInput,
+  MergeCategoryOutcome,
   OutboxMutation,
   OutboxMutationOutcome,
   PatchTransactionResult,
@@ -120,6 +146,8 @@ export type {
   TransactionsListResult,
   TransactionsRepository,
   TriggerDriveSyncResult,
+  UpdateCategoryInput,
+  UpdateCategoryOutcome,
   UpdateRuleInput,
   UpdateRuleResult,
 };
@@ -223,6 +251,7 @@ export interface AppDependencies {
   readonly driveSyncService: DriveSyncService;
   readonly transactionsRepository?: TransactionsRepository | undefined;
   readonly rulesRepository?: RulesRepository | undefined;
+  readonly categoriesRepository?: CategoriesRepository | undefined;
   readonly budgetsRepository?: BudgetsRepository | undefined;
   readonly analyticsRepository?: AnalyticsRepository | undefined;
   readonly deltaMutationRepository?: DeltaMutationRepository | undefined;

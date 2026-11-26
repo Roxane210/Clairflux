@@ -1,10 +1,17 @@
+import { randomUUID } from 'node:crypto';
 import type { Hono } from 'hono';
 import {
+  DEFAULT_FRENCH_CATEGORY_PACK,
   assertNever,
   isAllowedDriveFolderId,
+  isProtectedSystemCategory,
+  parseCategoryId,
   parseRuleId,
+  slugifyCategoryName,
   toCents,
   toSyncRevision,
+  validateCategoryParentDepth,
+  type CategoryId,
   type Currency,
   type DeltaSyncResponse,
 } from '@clairflux/shared';
@@ -13,11 +20,16 @@ import {
   AccountsQuerySchema,
   AnalyticsOverviewQuerySchema,
   ApkStatusSchema,
+  CategoriesQuerySchema,
+  CategoryIdParamSchema,
+  CreateCategoryBodySchema,
   CreateRuleBodySchema,
   DeleteBudgetSchema,
+  DeleteCategoryBodySchema,
   DeltaSyncQuerySchema,
   EXCLUSIVE_DRIVE_FOLDERS,
   GetBudgetsQuerySchema,
+  MergeCategoryBodySchema,
   PatchTransactionBodySchema,
   PostSyncDeltaBodySchema,
   PutBudgetBodySchema,
@@ -26,6 +38,7 @@ import {
   RuleIdParamSchema,
   TransactionIdParamSchema,
   TransactionsQuerySchema,
+  UpdateCategoryBodySchema,
   UpdateRuleBodySchema,
   computeAnalyticsOverview,
   computeBudgetAlert,
@@ -39,6 +52,8 @@ import {
   type ApkArtifactRepository,
   type AppEnv,
   type BudgetsRepository,
+  type CategoriesRepository,
+  type CategoryView,
   type DeltaMutationRepository,
   type DeltaSyncQuery,
   type DriveSyncService,
@@ -55,6 +70,7 @@ export interface RouteDependencies {
   readonly driveSyncService: DriveSyncService;
   readonly transactionsRepository?: TransactionsRepository | undefined;
   readonly rulesRepository?: RulesRepository | undefined;
+  readonly categoriesRepository?: CategoriesRepository | undefined;
   readonly budgetsRepository?: BudgetsRepository | undefined;
   readonly analyticsRepository?: AnalyticsRepository | undefined;
   readonly deltaMutationRepository?: DeltaMutationRepository | undefined;
@@ -104,6 +120,12 @@ function createDefaultRulesRepository(getNow: () => Date): RulesRepository {
           match_mode: input.match_mode,
           pattern: input.pattern,
           target_category: input.target_category,
+          ...(input.target_category_id !== undefined
+            ? { target_category_id: input.target_category_id }
+            : {}),
+          ...(input.target_subcategory_id !== undefined
+            ? { target_subcategory_id: input.target_subcategory_id }
+            : {}),
           mark_as_internal_transfer: input.mark_as_internal_transfer,
           is_active: input.is_active,
           matched_transactions_count: 0,
@@ -215,6 +237,272 @@ function createDefaultApkRepository(): ApkArtifactRepository {
   };
 }
 
+function createDefaultCategoriesRepository(getNow: () => Date): CategoriesRepository {
+  let revCounter = 100;
+  const store = new Map<CategoryId, CategoryView & { deleted_at: string | null }>();
+
+  for (const cat of DEFAULT_FRENCH_CATEGORY_PACK) {
+    store.set(cat.id, {
+      ...cat,
+      transaction_count: 0,
+      deleted_at: null,
+    });
+  }
+
+  const nextRev = () => {
+    revCounter += 1;
+    return toSyncRevision(revCounter);
+  };
+
+  const toView = (entry: CategoryView & { deleted_at: string | null }): CategoryView => {
+    const { deleted_at: _deleted, ...view } = entry;
+    return view;
+  };
+
+  return {
+    async listCategories(options) {
+      const includeArchived = options?.include_archived ?? false;
+      const items = [...store.values()]
+        .filter((item) => item.deleted_at === null && (includeArchived || !item.is_archived))
+        .sort((a, b) => (a.sort_order !== b.sort_order ? a.sort_order - b.sort_order : a.name.localeCompare(b.name, 'fr')))
+        .map(toView);
+      return {
+        categories: items,
+        latest_revision: toSyncRevision(revCounter),
+      };
+    },
+
+    async createCategory(input) {
+      const parent = input.parent_id !== null ? store.get(input.parent_id) : undefined;
+      if (input.parent_id !== null && (parent === undefined || parent.deleted_at !== null)) {
+        return { ok: false, reason: 'parent_not_found', message: 'Catégorie parente introuvable.' };
+      }
+
+      const depthValidation = validateCategoryParentDepth(parent ?? null);
+      if (!depthValidation.ok) {
+        return { ok: false, reason: 'depth_exceeded', message: depthValidation.message };
+      }
+
+      const normalizedName = input.name.trim().toLowerCase();
+      const slug = slugifyCategoryName(input.name, parent?.slug);
+      for (const existing of store.values()) {
+        if (existing.deleted_at !== null) continue;
+        if (
+          (existing.parent_id === input.parent_id &&
+            existing.name.trim().toLowerCase() === normalizedName) ||
+          existing.slug === slug
+        ) {
+          return {
+            ok: false,
+            reason: 'conflict',
+            message: 'Une catégorie avec ce nom existe déjà à ce niveau.',
+          };
+        }
+      }
+
+      const rev = nextRev();
+      const id = parseCategoryId(randomUUID());
+      const created: CategoryView & { deleted_at: string | null } = {
+        id,
+        parent_id: input.parent_id,
+        name: input.name,
+        slug,
+        budget_group: input.budget_group,
+        color_token: input.color_token,
+        sort_order: input.sort_order,
+        is_system: false,
+        is_archived: false,
+        transaction_count: 0,
+        revision: rev,
+        updated_at: getNow().toISOString(),
+        deleted_at: null,
+      };
+      store.set(id, created);
+      return {
+        ok: true,
+        data: {
+          category: toView(created),
+          latest_revision: rev,
+        },
+      };
+    },
+
+    async updateCategory(id, input) {
+      const existing = store.get(id);
+      if (existing === undefined || existing.deleted_at !== null) {
+        return { ok: false, reason: 'not_found', message: 'Catégorie introuvable.' };
+      }
+
+      let nextSlug = existing.slug;
+      if (input.name !== undefined && input.name.trim().toLowerCase() !== existing.name.trim().toLowerCase()) {
+        const parent = existing.parent_id !== null ? store.get(existing.parent_id) : undefined;
+        const candidateSlug = existing.is_system
+          ? existing.slug
+          : slugifyCategoryName(input.name, parent?.slug);
+        const normalized = input.name.trim().toLowerCase();
+        for (const other of store.values()) {
+          if (other.deleted_at !== null || other.id === id) continue;
+          if (
+            (other.parent_id === existing.parent_id &&
+              other.name.trim().toLowerCase() === normalized) ||
+            (!existing.is_system && other.slug === candidateSlug)
+          ) {
+            return {
+              ok: false,
+              reason: 'conflict',
+              message: 'Une catégorie avec ce nom existe déjà à ce niveau.',
+            };
+          }
+        }
+        nextSlug = candidateSlug;
+      }
+
+      const rev = nextRev();
+      const updated: CategoryView & { deleted_at: string | null } = {
+        ...existing,
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        slug: nextSlug,
+        ...(input.budget_group !== undefined ? { budget_group: input.budget_group } : {}),
+        ...(input.color_token !== undefined ? { color_token: input.color_token } : {}),
+        ...(input.sort_order !== undefined ? { sort_order: input.sort_order } : {}),
+        ...(input.is_archived !== undefined ? { is_archived: input.is_archived } : {}),
+        revision: rev,
+        updated_at: getNow().toISOString(),
+      };
+      store.set(id, updated);
+      return {
+        ok: true,
+        data: {
+          category: toView(updated),
+          updated_transactions_count: 0,
+          latest_revision: rev,
+        },
+      };
+    },
+
+    async mergeCategory(id, input) {
+      if (id === input.target_category_id) {
+        return {
+          ok: false,
+          reason: 'same_category',
+          message: 'La catégorie cible doit être différente de la catégorie source.',
+        };
+      }
+      const source = store.get(id);
+      if (source === undefined || source.deleted_at !== null) {
+        return { ok: false, reason: 'source_not_found', message: 'Catégorie source introuvable.' };
+      }
+      if (isProtectedSystemCategory(source)) {
+        return {
+          ok: false,
+          reason: 'protected_or_has_children',
+          message: 'Impossible de fusionner une catégorie système protégée.',
+        };
+      }
+      const target = store.get(input.target_category_id);
+      if (target === undefined || target.deleted_at !== null) {
+        return { ok: false, reason: 'target_not_found', message: 'Catégorie cible introuvable.' };
+      }
+
+      const activeChildren = [...store.values()].filter(
+        (item) => item.deleted_at === null && item.parent_id === id,
+      );
+      if (activeChildren.length > 0 && target.parent_id !== null) {
+        return {
+          ok: false,
+          reason: 'depth_exceeded',
+          message: 'Impossible de rattacher des sous-catégories sous une sous-catégorie.',
+        };
+      }
+
+      const nowIso = getNow().toISOString();
+      for (const child of activeChildren) {
+        const childRev = nextRev();
+        store.set(child.id, {
+          ...child,
+          parent_id: target.id,
+          slug: slugifyCategoryName(child.name, target.slug),
+          revision: childRev,
+          updated_at: nowIso,
+        });
+      }
+
+      const delRev = nextRev();
+      store.set(id, { ...source, deleted_at: nowIso, revision: delRev, updated_at: nowIso });
+      return {
+        ok: true,
+        data: {
+          merged_from_id: id,
+          target_category_id: input.target_category_id,
+          reassigned_transactions_count: 0,
+          latest_revision: delRev,
+        },
+      };
+    },
+
+    async deleteCategory(id, input) {
+      const source = store.get(id);
+      if (source === undefined || source.deleted_at !== null) {
+        return { ok: false, reason: 'not_found', message: 'Catégorie introuvable.' };
+      }
+      if (isProtectedSystemCategory(source)) {
+        return {
+          ok: false,
+          reason: 'has_children_or_system',
+          message: 'Impossible de supprimer une catégorie système protégée.',
+        };
+      }
+      const hasChildren = [...store.values()].some(
+        (item) => item.deleted_at === null && item.parent_id === id,
+      );
+      if (hasChildren) {
+        return {
+          ok: false,
+          reason: 'has_children_or_system',
+          message: 'Impossible de supprimer une catégorie possédant des sous-catégories actives.',
+        };
+      }
+      const reassignTargetId = input?.reassign_to_category_id;
+      if (reassignTargetId === id) {
+        return {
+          ok: false,
+          reason: 'reassign_required',
+          message: 'La catégorie de réaffectation doit être différente de la catégorie supprimée.',
+        };
+      }
+      if (source.transaction_count > 0 && reassignTargetId === undefined) {
+        return {
+          ok: false,
+          reason: 'reassign_required',
+          message: 'Cette catégorie est référencée : fournissez reassign_to_category_id.',
+        };
+      }
+      if (reassignTargetId !== undefined) {
+        const target = store.get(reassignTargetId);
+        if (target === undefined || target.deleted_at !== null) {
+          return {
+            ok: false,
+            reason: 'target_not_found',
+            message: 'Catégorie de réaffectation introuvable.',
+          };
+        }
+      }
+
+      const delRev = nextRev();
+      const nowIso = getNow().toISOString();
+      store.set(id, { ...source, deleted_at: nowIso, revision: delRev, updated_at: nowIso });
+      return {
+        ok: true,
+        data: {
+          deleted_category_id: id,
+          reassigned_transactions_count: 0,
+          latest_revision: delRev,
+        },
+      };
+    },
+  };
+}
+
 export function registerDomainRoutes(
   app: Hono<AppEnv>,
   deps: RouteDependencies,
@@ -223,6 +511,8 @@ export function registerDomainRoutes(
   const transactionsRepo =
     deps.transactionsRepository ?? createDefaultTransactionsRepository();
   const rulesRepo = deps.rulesRepository ?? createDefaultRulesRepository(getNow);
+  const categoriesRepo =
+    deps.categoriesRepository ?? createDefaultCategoriesRepository(getNow);
   const budgetsRepo = deps.budgetsRepository ?? createDefaultBudgetsRepository(getNow);
   const analyticsRepo =
     deps.analyticsRepository ?? createDefaultAnalyticsRepository(getNow);
@@ -337,6 +627,12 @@ export function registerDomainRoutes(
     const patchInput: TransactionPatchInput = {
       ...(parsedBody.data.note !== undefined ? { note: parsedBody.data.note } : {}),
       ...(parsedBody.data.category !== undefined ? { category: parsedBody.data.category } : {}),
+      ...(parsedBody.data.category_id !== undefined
+        ? { category_id: parsedBody.data.category_id }
+        : {}),
+      ...(parsedBody.data.subcategory_id !== undefined
+        ? { subcategory_id: parsedBody.data.subcategory_id }
+        : {}),
       ...(parsedBody.data.is_manual_category !== undefined
         ? { is_manual_category: parsedBody.data.is_manual_category }
         : {}),
@@ -493,6 +789,219 @@ export function registerDomainRoutes(
     const outcome = await rulesRepo.deleteRule(parsedParam.data.id);
     if (!outcome.ok) {
       return errorResponse(c, 404, 'RESOURCE_NOT_FOUND', 'Règle introuvable.');
+    }
+
+    return c.json(outcome.data, 200);
+  });
+
+  // ==========================================================================
+  // 2bis. Categories & Subcategories: GET/POST/PATCH/MERGE/DELETE
+  // ==========================================================================
+  app.get('/api/categories', async (c) => {
+    const parsedQuery = CategoriesQuerySchema.safeParse({
+      include_archived: c.req.query('include_archived'),
+    });
+    if (!parsedQuery.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de consultation des catégories invalides.',
+        { details: formatZodIssues(parsedQuery.error) },
+      );
+    }
+
+    const result = await categoriesRepo.listCategories({
+      ...(parsedQuery.data.include_archived !== undefined
+        ? { include_archived: parsedQuery.data.include_archived }
+        : {}),
+    });
+    return c.json(result, 200);
+  });
+
+  app.post('/api/categories', async (c) => {
+    const jsonBody = await parseJsonBody(c);
+    if (!jsonBody.ok) {
+      return jsonBody.response;
+    }
+
+    const parsedBody = CreateCategoryBodySchema.safeParse(jsonBody.data);
+    if (!parsedBody.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de création de catégorie invalides.',
+        { details: formatZodIssues(parsedBody.error) },
+      );
+    }
+
+    const outcome = await categoriesRepo.createCategory(parsedBody.data);
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case 'parent_not_found':
+          return errorResponse(c, 404, 'RESOURCE_NOT_FOUND', outcome.message);
+        case 'depth_exceeded':
+          return errorResponse(c, 422, 'CATEGORY_DEPTH_EXCEEDED', outcome.message);
+        case 'conflict':
+          return errorResponse(c, 409, 'CATEGORY_CONFLICT', outcome.message);
+      }
+    }
+
+    return c.json(outcome.data, 201);
+  });
+
+  app.patch('/api/categories/:id', async (c) => {
+    const parsedParam = CategoryIdParamSchema.safeParse({ id: c.req.param('id') });
+    if (!parsedParam.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Identifiant de catégorie invalide.',
+        { details: formatZodIssues(parsedParam.error) },
+      );
+    }
+
+    const jsonBody = await parseJsonBody(c);
+    if (!jsonBody.ok) {
+      return jsonBody.response;
+    }
+
+    const parsedBody = UpdateCategoryBodySchema.safeParse(jsonBody.data);
+    if (!parsedBody.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Corps de mise à jour de catégorie invalide.',
+        { details: formatZodIssues(parsedBody.error) },
+      );
+    }
+
+    const outcome = await categoriesRepo.updateCategory(parsedParam.data.id, parsedBody.data);
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case 'not_found':
+          return errorResponse(c, 404, 'RESOURCE_NOT_FOUND', outcome.message);
+        case 'conflict':
+          return errorResponse(c, 409, 'CATEGORY_CONFLICT', outcome.message);
+      }
+    }
+
+    return c.json(outcome.data, 200);
+  });
+
+  app.post('/api/categories/:id/merge', async (c) => {
+    const parsedParam = CategoryIdParamSchema.safeParse({ id: c.req.param('id') });
+    if (!parsedParam.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Identifiant de catégorie source invalide.',
+        { details: formatZodIssues(parsedParam.error) },
+      );
+    }
+
+    const jsonBody = await parseJsonBody(c);
+    if (!jsonBody.ok) {
+      return jsonBody.response;
+    }
+
+    const parsedBody = MergeCategoryBodySchema.safeParse(jsonBody.data);
+    if (!parsedBody.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de fusion de catégorie invalides.',
+        { details: formatZodIssues(parsedBody.error) },
+      );
+    }
+
+    const outcome = await categoriesRepo.mergeCategory(parsedParam.data.id, parsedBody.data);
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case 'source_not_found':
+        case 'target_not_found':
+          return errorResponse(c, 404, 'RESOURCE_NOT_FOUND', outcome.message);
+        case 'same_category':
+          return errorResponse(c, 422, 'VALIDATION_ERROR', outcome.message);
+        case 'depth_exceeded':
+          return errorResponse(c, 422, 'CATEGORY_DEPTH_EXCEEDED', outcome.message);
+        case 'protected_or_has_children':
+          return errorResponse(c, 409, 'CATEGORY_HAS_CHILDREN_OR_SYSTEM', outcome.message);
+      }
+    }
+
+    return c.json(outcome.data, 200);
+  });
+
+  app.delete('/api/categories/:id', async (c) => {
+    const parsedParam = CategoryIdParamSchema.safeParse({ id: c.req.param('id') });
+    if (!parsedParam.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Identifiant de catégorie invalide.',
+        { details: formatZodIssues(parsedParam.error) },
+      );
+    }
+
+    const queryReassign = c.req.query('reassign_to_category_id');
+    const queryReassignSub = c.req.query('reassign_to_subcategory_id');
+    const rawBody = await c.req.text();
+    let candidate: Record<string, unknown> = {};
+
+    if (rawBody.trim().length > 0) {
+      let parsedJson: unknown;
+      try {
+        parsedJson = JSON.parse(rawBody);
+      } catch {
+        return errorResponse(c, 400, 'BAD_REQUEST', 'Corps JSON malformé.');
+      }
+      if (!isPlainRecord(parsedJson)) {
+        return errorResponse(
+          c,
+          400,
+          'BAD_REQUEST',
+          'Corps de suppression de catégorie invalide.',
+        );
+      }
+      candidate = { ...parsedJson };
+    }
+
+    if (queryReassign !== undefined && candidate['reassign_to_category_id'] === undefined) {
+      candidate['reassign_to_category_id'] = queryReassign;
+    }
+    if (queryReassignSub !== undefined && candidate['reassign_to_subcategory_id'] === undefined) {
+      candidate['reassign_to_subcategory_id'] = queryReassignSub;
+    }
+
+    const parsedBody = DeleteCategoryBodySchema.safeParse(candidate);
+    if (!parsedBody.success) {
+      return errorResponse(
+        c,
+        400,
+        'BAD_REQUEST',
+        'Paramètres de suppression de catégorie invalides.',
+        { details: formatZodIssues(parsedBody.error) },
+      );
+    }
+
+    const outcome = await categoriesRepo.deleteCategory(parsedParam.data.id, parsedBody.data);
+    if (!outcome.ok) {
+      switch (outcome.reason) {
+        case 'not_found':
+        case 'target_not_found':
+          return errorResponse(c, 404, 'RESOURCE_NOT_FOUND', outcome.message);
+        case 'reassign_required':
+          return errorResponse(c, 422, 'CATEGORY_REASSIGN_REQUIRED', outcome.message);
+        case 'has_children_or_system':
+          return errorResponse(c, 409, 'CATEGORY_HAS_CHILDREN_OR_SYSTEM', outcome.message);
+      }
     }
 
     return c.json(outcome.data, 200);

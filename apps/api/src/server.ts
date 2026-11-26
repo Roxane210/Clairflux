@@ -8,18 +8,25 @@ import { z } from 'zod';
 import {
   ALLOWED_DRIVE_FOLDERS,
   CLAIRFLUX_BUILD_VERSION,
+  UNCATEGORIZED_CATEGORY_ID,
   convertToEurCents,
   getBankForDriveFolder,
+  isProtectedSystemCategory,
   parseAccountId,
+  parseCategoryId,
   parseDriveFileId,
   parseRuleId,
   parseTransactionId,
+  slugifyCategoryName,
   toCents,
   toFxRateMicro,
   toSyncRevision,
+  validateCategoryParentDepth,
   type Account,
   type AccountId,
   type Bank,
+  type Category,
+  type CategoryId,
   type Currency,
   type DeltaSyncResponse,
   type RuleId,
@@ -34,19 +41,23 @@ import {
   gt,
   gte,
   ilike,
+  inArray,
   isNotNull,
   isNull,
   lte,
+  ne,
   or,
   sql,
 } from 'drizzle-orm';
 import { createApp, type AppDependencies } from './app.js';
 import { EnvValidationError, parseApiEnv, type ApiEnv } from './config/env.js';
 import { createNeonClients, type NeonClients } from './db/client.js';
+import { ensureLot1CategoriesSchemaAndSeed } from './db/ensure-v2-schema.js';
 import {
   accounts,
   appliedClientMutations,
   budgetLimits,
+  categories,
   categorizationRules,
   driveFiles,
   driveSyncRuns,
@@ -66,6 +77,8 @@ import {
   type ApkArtifactRepository,
   type ApkStatus,
   type BudgetItem,
+  type CategoriesRepository,
+  type CategoryView,
   type DeltaMutationRepository,
   type OutboxMutation,
   type OutboxMutationOutcome,
@@ -126,6 +139,7 @@ async function fetchLatestSyncRevision(clients: NeonClients): Promise<SyncRevisi
   const rows = await clients.httpDb.execute(
     sql`SELECT GREATEST(
       COALESCE((SELECT MAX(revision) FROM accounts), 0),
+      COALESCE((SELECT MAX(revision) FROM categories), 0),
       COALESCE((SELECT MAX(revision) FROM transactions), 0),
       COALESCE((SELECT MAX(revision) FROM transaction_notes), 0),
       COALESCE((SELECT MAX(revision) FROM categorization_rules), 0),
@@ -188,6 +202,10 @@ export function computeCanonicalMutationPayloadHash(mutation: OutboxMutation): s
           kind: mutation.kind,
           transaction_id: mutation.transaction_id,
           category: mutation.category,
+          ...(mutation.category_id !== undefined ? { category_id: mutation.category_id } : {}),
+          ...(mutation.subcategory_id !== undefined
+            ? { subcategory_id: mutation.subcategory_id }
+            : {}),
         };
       case 'set_internal_transfer':
         return {
@@ -662,6 +680,113 @@ export function createNeonAppDependencies(
     },
   };
 
+  async function resolveCategoryDualWriteInTx(
+    tx: NeonTx,
+    input: {
+      readonly categoryId?: CategoryId | null | undefined;
+      readonly subcategoryId?: CategoryId | null | undefined;
+      readonly categoryLabel?: string | undefined;
+    },
+  ): Promise<{
+    readonly categoryId: CategoryId | null;
+    readonly subcategoryId: CategoryId | null;
+    readonly label: string;
+  }> {
+    if (input.subcategoryId !== undefined && input.subcategoryId !== null) {
+      const subRows = await tx
+        .select()
+        .from(categories)
+        .where(and(eq(categories.id, input.subcategoryId), isNull(categories.deletedAt)))
+        .limit(1);
+      const sub = subRows[0];
+      if (sub !== undefined) {
+        const resolvedCatId =
+          sub.parentId !== null
+            ? parseCategoryId(sub.parentId)
+            : input.categoryId !== undefined && input.categoryId !== null
+              ? input.categoryId
+              : parseCategoryId(sub.id);
+        return {
+          categoryId: resolvedCatId,
+          subcategoryId: sub.parentId !== null ? parseCategoryId(sub.id) : null,
+          label: input.categoryLabel?.trim() || sub.name,
+        };
+      }
+    }
+
+    if (input.categoryId !== undefined && input.categoryId !== null) {
+      const catRows = await tx
+        .select()
+        .from(categories)
+        .where(and(eq(categories.id, input.categoryId), isNull(categories.deletedAt)))
+        .limit(1);
+      const cat = catRows[0];
+      if (cat !== undefined) {
+        if (cat.parentId !== null) {
+          return {
+            categoryId: parseCategoryId(cat.parentId),
+            subcategoryId: parseCategoryId(cat.id),
+            label: input.categoryLabel?.trim() || cat.name,
+          };
+        }
+        return {
+          categoryId: parseCategoryId(cat.id),
+          subcategoryId: null,
+          label: input.categoryLabel?.trim() || cat.name,
+        };
+      }
+    }
+
+    if (input.categoryId === null) {
+      return {
+        categoryId: null,
+        subcategoryId: null,
+        label: input.categoryLabel?.trim() || 'Non catégorisé',
+      };
+    }
+
+    const trimmedLabel = input.categoryLabel?.trim();
+    if (trimmedLabel !== undefined && trimmedLabel.length > 0) {
+      const matchingRows = await tx
+        .select()
+        .from(categories)
+        .where(
+          and(
+            isNull(categories.deletedAt),
+            sql`lower(trim(${categories.name})) = lower(trim(${trimmedLabel}))`,
+          ),
+        )
+        .orderBy(asc(categories.sortOrder))
+        .limit(5);
+      const match = matchingRows.find((r) => r.parentId === null) ?? matchingRows[0];
+      if (match !== undefined) {
+        if (match.parentId !== null) {
+          return {
+            categoryId: parseCategoryId(match.parentId),
+            subcategoryId: parseCategoryId(match.id),
+            label: trimmedLabel,
+          };
+        }
+        return {
+          categoryId: parseCategoryId(match.id),
+          subcategoryId: null,
+          label: trimmedLabel,
+        };
+      }
+      return {
+        categoryId: null,
+        subcategoryId: null,
+        label: trimmedLabel,
+      };
+    }
+
+    return {
+      categoryId: UNCATEGORIZED_CATEGORY_ID,
+      subcategoryId: null,
+      label: 'Non catégorisé',
+    };
+  }
+
   async function patchTransactionInTx(
     tx: NeonTx,
     id: TransactionId,
@@ -690,8 +815,20 @@ export function createNeonAppDependencies(
       revision: highestRevision,
     };
 
-    if (patch.category !== undefined) {
-      updatePayload.category = patch.category;
+    if (
+      patch.category !== undefined ||
+      patch.category_id !== undefined ||
+      patch.subcategory_id !== undefined
+    ) {
+      const resolved = await resolveCategoryDualWriteInTx(tx, {
+        categoryId: patch.category_id,
+        subcategoryId: patch.subcategory_id,
+        categoryLabel: patch.category,
+      });
+      updatePayload.category = resolved.label;
+      updatePayload.categoryId = resolved.categoryId;
+      updatePayload.subcategoryId = resolved.subcategoryId;
+      updatePayload.categorySource = 'manual';
       updatePayload.isManualCategory = true;
       updatePayload.matchedRuleId = null;
     } else if (patch.is_manual_category !== undefined) {
@@ -784,6 +921,11 @@ export function createNeonAppDependencies(
       fx_rate_micro: toFxRateMicro(updatedTx.fxRateMicro),
       amount_eur_cents: toCents(updatedTx.amountEurCents),
       category: updatedTx.category,
+      category_id: updatedTx.categoryId !== null ? parseCategoryId(updatedTx.categoryId) : null,
+      subcategory_id:
+        updatedTx.subcategoryId !== null ? parseCategoryId(updatedTx.subcategoryId) : null,
+      category_source: updatedTx.categorySource,
+      ai_review_status: updatedTx.aiReviewStatus,
       is_manual_category: updatedTx.isManualCategory,
       matched_rule_id:
         updatedTx.matchedRuleId !== null ? parseRuleId(updatedTx.matchedRuleId) : null,
@@ -888,6 +1030,10 @@ export function createNeonAppDependencies(
         fx_rate_micro: toFxRateMicro(tx.fxRateMicro),
         amount_eur_cents: toCents(tx.amountEurCents),
         category: tx.category,
+        category_id: tx.categoryId !== null ? parseCategoryId(tx.categoryId) : null,
+        subcategory_id: tx.subcategoryId !== null ? parseCategoryId(tx.subcategoryId) : null,
+        category_source: tx.categorySource,
+        ai_review_status: tx.aiReviewStatus,
         is_manual_category: tx.isManualCategory,
         matched_rule_id: tx.matchedRuleId !== null ? parseRuleId(tx.matchedRuleId) : null,
         is_internal_transfer: tx.isInternalTransfer,
@@ -946,6 +1092,9 @@ export function createNeonAppDependencies(
       match_mode: r.matchMode,
       pattern: r.pattern,
       target_category: r.targetCategory,
+      target_category_id: r.targetCategoryId !== null ? parseCategoryId(r.targetCategoryId) : null,
+      target_subcategory_id:
+        r.targetSubcategoryId !== null ? parseCategoryId(r.targetSubcategoryId) : null,
       mark_as_internal_transfer: r.markAsInternalTransfer,
       is_active: r.isActive,
       deleted_at: r.deletedAt,
@@ -975,10 +1124,19 @@ export function createNeonAppDependencies(
     for (const change of plan.changes) {
       const nextRev = await allocateNextRevision(tx);
       latestRevision = nextRev;
+      const nextCategoryId =
+        change.nextMatchedRuleId !== null
+          ? (change.nextTargetCategoryId ?? null)
+          : UNCATEGORIZED_CATEGORY_ID;
+      const nextSubcategoryId =
+        change.nextMatchedRuleId !== null ? (change.nextTargetSubcategoryId ?? null) : null;
       await tx
         .update(transactions)
         .set({
           category: change.nextCategory,
+          categoryId: nextCategoryId,
+          subcategoryId: nextSubcategoryId,
+          categorySource: change.nextMatchedRuleId !== null ? 'rule' : 'uncategorized',
           matchedRuleId: change.nextMatchedRuleId,
           isInternalTransfer: change.nextIsInternalTransfer,
           revision: nextRev,
@@ -1008,6 +1166,10 @@ export function createNeonAppDependencies(
       match_mode: row.matchMode,
       pattern: row.pattern,
       target_category: row.targetCategory,
+      target_category_id:
+        row.targetCategoryId !== null ? parseCategoryId(row.targetCategoryId) : null,
+      target_subcategory_id:
+        row.targetSubcategoryId !== null ? parseCategoryId(row.targetSubcategoryId) : null,
       mark_as_internal_transfer: row.markAsInternalTransfer,
       is_active: row.isActive,
       matched_transactions_count: matchedCount,
@@ -1056,6 +1218,11 @@ export function createNeonAppDependencies(
       return clients.poolDb.transaction(async (tx) => {
         const ruleRev = await allocateNextRevision(tx);
         const now = new Date();
+        const resolvedTarget = await resolveCategoryDualWriteInTx(tx, {
+          categoryId: input.target_category_id,
+          subcategoryId: input.target_subcategory_id,
+          categoryLabel: input.target_category,
+        });
         const [inserted] = await tx
           .insert(categorizationRules)
           .values({
@@ -1066,7 +1233,9 @@ export function createNeonAppDependencies(
             accountTypeFilter: input.account_type_filter,
             matchMode: input.match_mode,
             pattern: input.pattern,
-            targetCategory: input.target_category,
+            targetCategory: resolvedTarget.label,
+            targetCategoryId: resolvedTarget.categoryId,
+            targetSubcategoryId: resolvedTarget.subcategoryId,
             markAsInternalTransfer: input.mark_as_internal_transfer,
             isActive: input.is_active,
             revision: ruleRev,
@@ -1129,7 +1298,30 @@ export function createNeonAppDependencies(
         if (input.account_type_filter !== undefined) updateSet.accountTypeFilter = input.account_type_filter;
         if (input.match_mode !== undefined) updateSet.matchMode = input.match_mode;
         if (input.pattern !== undefined) updateSet.pattern = input.pattern;
-        if (input.target_category !== undefined) updateSet.targetCategory = input.target_category;
+        if (
+          input.target_category !== undefined ||
+          input.target_category_id !== undefined ||
+          input.target_subcategory_id !== undefined
+        ) {
+          const resolvedTarget = await resolveCategoryDualWriteInTx(tx, {
+            categoryId:
+              input.target_category_id !== undefined
+                ? input.target_category_id
+                : existing.targetCategoryId !== null
+                  ? parseCategoryId(existing.targetCategoryId)
+                  : undefined,
+            subcategoryId:
+              input.target_subcategory_id !== undefined
+                ? input.target_subcategory_id
+                : existing.targetSubcategoryId !== null
+                  ? parseCategoryId(existing.targetSubcategoryId)
+                  : undefined,
+            categoryLabel: input.target_category,
+          });
+          updateSet.targetCategory = resolvedTarget.label;
+          updateSet.targetCategoryId = resolvedTarget.categoryId;
+          updateSet.targetSubcategoryId = resolvedTarget.subcategoryId;
+        }
         if (input.mark_as_internal_transfer !== undefined) {
           updateSet.markAsInternalTransfer = input.mark_as_internal_transfer;
         }
@@ -1256,6 +1448,768 @@ export function createNeonAppDependencies(
           },
           latest_revision: latestRevision,
         };
+      });
+    },
+  };
+
+  function mapCategoryRow(row: typeof categories.$inferSelect): Category {
+    return {
+      id: parseCategoryId(row.id),
+      parent_id: row.parentId !== null ? parseCategoryId(row.parentId) : null,
+      name: row.name,
+      slug: row.slug,
+      budget_group: row.budgetGroup,
+      color_token: row.colorToken,
+      sort_order: row.sortOrder,
+      is_system: row.isSystem,
+      is_archived: row.isArchived,
+      revision: toSyncRevision(row.revision),
+      updated_at: row.updatedAt.toISOString(),
+    };
+  }
+
+  function mapCategoryView(
+    row: typeof categories.$inferSelect,
+    transactionCount: number,
+  ): CategoryView {
+    return {
+      ...mapCategoryRow(row),
+      transaction_count: transactionCount,
+    };
+  }
+
+  async function resolveCategoryTargetInTx(
+    tx: NeonTx,
+    targetCategoryId: CategoryId,
+    targetSubcategoryId: CategoryId | null | undefined,
+  ): Promise<
+    | {
+        readonly ok: true;
+        readonly categoryId: CategoryId;
+        readonly subcategoryId: CategoryId | null;
+        readonly label: string;
+      }
+    | { readonly ok: false }
+  > {
+    const [target] = await tx
+      .select()
+      .from(categories)
+      .where(and(eq(categories.id, targetCategoryId), isNull(categories.deletedAt)))
+      .limit(1);
+
+    if (target === undefined) {
+      return { ok: false };
+    }
+
+    if (targetSubcategoryId !== undefined && targetSubcategoryId !== null) {
+      const [sub] = await tx
+        .select()
+        .from(categories)
+        .where(
+          and(
+            eq(categories.id, targetSubcategoryId),
+            eq(categories.parentId, target.id),
+            isNull(categories.deletedAt),
+          ),
+        )
+        .limit(1);
+      if (sub === undefined) {
+        return { ok: false };
+      }
+      return {
+        ok: true,
+        categoryId: parseCategoryId(target.id),
+        subcategoryId: parseCategoryId(sub.id),
+        label: sub.name,
+      };
+    }
+
+    if (target.parentId !== null) {
+      return {
+        ok: true,
+        categoryId: parseCategoryId(target.parentId),
+        subcategoryId: parseCategoryId(target.id),
+        label: target.name,
+      };
+    }
+
+    return {
+      ok: true,
+      categoryId: parseCategoryId(target.id),
+      subcategoryId: null,
+      label: target.name,
+    };
+  }
+
+  async function reassignCategoryReferencesInTx(
+    tx: NeonTx,
+    sourceIds: readonly string[],
+    target: {
+      readonly categoryId: CategoryId;
+      readonly subcategoryId: CategoryId | null;
+      readonly label: string;
+    },
+    now: Date,
+  ): Promise<number> {
+    if (sourceIds.length === 0) {
+      return 0;
+    }
+
+    const txCond = and(
+      isNull(transactions.deletedAt),
+      or(
+        inArray(transactions.categoryId, [...sourceIds]),
+        inArray(transactions.subcategoryId, [...sourceIds]),
+      ),
+    );
+    const matchingTxs = await tx
+      .select({ id: transactions.id })
+      .from(transactions)
+      .where(txCond);
+
+    if (matchingTxs.length > 0) {
+      const txRev = await allocateNextRevision(tx);
+      await tx
+        .update(transactions)
+        .set({
+          category: target.label,
+          categoryId: target.categoryId,
+          subcategoryId: target.subcategoryId,
+          revision: txRev,
+          updatedAt: now,
+        })
+        .where(txCond);
+    }
+
+    await tx
+      .update(transactions)
+      .set({
+        aiSuggestedCategoryId: null,
+        aiSuggestedSubcategoryId: null,
+      })
+      .where(
+        and(
+          isNull(transactions.deletedAt),
+          or(
+            inArray(transactions.aiSuggestedCategoryId, [...sourceIds]),
+            inArray(transactions.aiSuggestedSubcategoryId, [...sourceIds]),
+          ),
+        ),
+      );
+
+    const ruleCond = and(
+      isNull(categorizationRules.deletedAt),
+      or(
+        inArray(categorizationRules.targetCategoryId, [...sourceIds]),
+        inArray(categorizationRules.targetSubcategoryId, [...sourceIds]),
+      ),
+    );
+    const matchingRules = await tx
+      .select({ id: categorizationRules.id })
+      .from(categorizationRules)
+      .where(ruleCond);
+
+    if (matchingRules.length > 0) {
+      const ruleRev = await allocateNextRevision(tx);
+      await tx
+        .update(categorizationRules)
+        .set({
+          targetCategory: target.label,
+          targetCategoryId: target.categoryId,
+          targetSubcategoryId: target.subcategoryId,
+          revision: ruleRev,
+          updatedAt: now,
+        })
+        .where(ruleCond);
+    }
+
+    return matchingTxs.length;
+  }
+
+  const categoriesRepository: CategoriesRepository = {
+    async listCategories(options) {
+      const includeArchived = options?.include_archived ?? false;
+      const catConditions = [isNull(categories.deletedAt)];
+      if (!includeArchived) {
+        catConditions.push(eq(categories.isArchived, false));
+      }
+
+      const [rows, txCountRows, latestRevision] = await Promise.all([
+        clients.httpDb
+          .select()
+          .from(categories)
+          .where(and(...catConditions))
+          .orderBy(asc(categories.sortOrder), asc(categories.name)),
+        clients.httpDb
+          .select({
+            categoryId: transactions.categoryId,
+            subcategoryId: transactions.subcategoryId,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(transactions)
+          .where(isNull(transactions.deletedAt))
+          .groupBy(transactions.categoryId, transactions.subcategoryId),
+        fetchLatestSyncRevision(clients),
+      ]);
+
+      const rootCounts = new Map<string, number>();
+      const subCounts = new Map<string, number>();
+      for (const row of txCountRows) {
+        if (row.categoryId !== null) {
+          rootCounts.set(row.categoryId, (rootCounts.get(row.categoryId) ?? 0) + row.count);
+        }
+        if (row.subcategoryId !== null) {
+          subCounts.set(row.subcategoryId, (subCounts.get(row.subcategoryId) ?? 0) + row.count);
+        }
+      }
+
+      return {
+        categories: rows.map((row) =>
+          mapCategoryView(
+            row,
+            row.parentId === null ? (rootCounts.get(row.id) ?? 0) : (subCounts.get(row.id) ?? 0),
+          ),
+        ),
+        latest_revision: latestRevision,
+      };
+    },
+
+    async createCategory(input) {
+      return clients.poolDb.transaction(async (tx) => {
+        let parentSlug: string | undefined;
+        if (input.parent_id !== null) {
+          const [parent] = await tx
+            .select()
+            .from(categories)
+            .where(and(eq(categories.id, input.parent_id), isNull(categories.deletedAt)))
+            .limit(1);
+
+          if (parent === undefined) {
+            return {
+              ok: false,
+              reason: 'parent_not_found',
+              message: 'Catégorie parente introuvable.',
+            } as const;
+          }
+
+          const depthCheck = validateCategoryParentDepth({ parent_id: parent.parentId });
+          if (!depthCheck.ok) {
+            return {
+              ok: false,
+              reason: 'depth_exceeded',
+              message: depthCheck.message,
+            } as const;
+          }
+          parentSlug = parent.slug;
+        }
+
+        const slug = slugifyCategoryName(input.name, parentSlug);
+        const siblingCond =
+          input.parent_id === null
+            ? isNull(categories.parentId)
+            : eq(categories.parentId, input.parent_id);
+
+        const conflicts = await tx
+          .select({ id: categories.id })
+          .from(categories)
+          .where(
+            and(
+              isNull(categories.deletedAt),
+              or(
+                eq(categories.slug, slug),
+                and(
+                  siblingCond,
+                  sql`lower(trim(${categories.name})) = lower(trim(${input.name}))`,
+                ),
+              ),
+            ),
+          )
+          .limit(1);
+
+        if (conflicts.length > 0) {
+          return {
+            ok: false,
+            reason: 'conflict',
+            message: 'Une catégorie avec ce nom ou ce slug existe déjà à ce niveau.',
+          } as const;
+        }
+
+        const rev = await allocateNextRevision(tx);
+        const now = new Date();
+        const [inserted] = await tx
+          .insert(categories)
+          .values({
+            parentId: input.parent_id,
+            name: input.name,
+            slug,
+            budgetGroup: input.budget_group,
+            colorToken: input.color_token,
+            sortOrder: input.sort_order,
+            isSystem: false,
+            isArchived: false,
+            revision: rev,
+            updatedAt: now,
+          })
+          .returning();
+
+        if (inserted === undefined) {
+          throw new Error('Failed to insert category');
+        }
+
+        return {
+          ok: true,
+          data: {
+            category: mapCategoryView(inserted, 0),
+            latest_revision: rev,
+          },
+        } as const;
+      });
+    },
+
+    async updateCategory(id, input) {
+      return clients.poolDb.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(categories)
+          .where(and(eq(categories.id, id), isNull(categories.deletedAt)))
+          .limit(1);
+
+        if (existing === undefined) {
+          return {
+            ok: false,
+            reason: 'not_found',
+            message: 'Catégorie introuvable.',
+          } as const;
+        }
+
+        const now = new Date();
+        const updateSet: Partial<typeof categories.$inferInsert> = {
+          updatedAt: now,
+        };
+
+        if (input.name !== undefined) {
+          let nextSlug = existing.slug;
+          if (!existing.isSystem) {
+            let parentSlug: string | undefined;
+            if (existing.parentId !== null) {
+              const [parent] = await tx
+                .select({ slug: categories.slug })
+                .from(categories)
+                .where(eq(categories.id, existing.parentId))
+                .limit(1);
+              parentSlug = parent?.slug;
+            }
+            nextSlug = slugifyCategoryName(input.name, parentSlug);
+          }
+
+          const siblingCond =
+            existing.parentId === null
+              ? isNull(categories.parentId)
+              : eq(categories.parentId, existing.parentId);
+
+          const conflicts = await tx
+            .select({ id: categories.id })
+            .from(categories)
+            .where(
+              and(
+                isNull(categories.deletedAt),
+                ne(categories.id, id),
+                or(
+                  ...(!existing.isSystem ? [eq(categories.slug, nextSlug)] : []),
+                  and(
+                    siblingCond,
+                    sql`lower(trim(${categories.name})) = lower(trim(${input.name}))`,
+                  ),
+                ),
+              ),
+            )
+            .limit(1);
+
+          if (conflicts.length > 0) {
+            return {
+              ok: false,
+              reason: 'conflict',
+              message: 'Une catégorie avec ce nom ou ce slug existe déjà à ce niveau.',
+            } as const;
+          }
+
+          updateSet.name = input.name;
+          updateSet.slug = nextSlug;
+        }
+
+        if (input.budget_group !== undefined) updateSet.budgetGroup = input.budget_group;
+        if (input.color_token !== undefined) updateSet.colorToken = input.color_token;
+        if (input.sort_order !== undefined) updateSet.sortOrder = input.sort_order;
+        if (input.is_archived !== undefined) updateSet.isArchived = input.is_archived;
+
+        const catRev = await allocateNextRevision(tx);
+        updateSet.revision = catRev;
+
+        const [updated] = await tx
+          .update(categories)
+          .set(updateSet)
+          .where(eq(categories.id, id))
+          .returning();
+
+        if (updated === undefined) {
+          return {
+            ok: false,
+            reason: 'not_found',
+            message: 'Catégorie introuvable.',
+          } as const;
+        }
+
+        let updatedTxCount = 0;
+        let latestRevision = catRev;
+
+        if (input.name !== undefined && updated.name !== existing.name) {
+          const txCond =
+            updated.parentId === null
+              ? and(
+                  isNull(transactions.deletedAt),
+                  eq(transactions.categoryId, id),
+                  isNull(transactions.subcategoryId),
+                )
+              : and(isNull(transactions.deletedAt), eq(transactions.subcategoryId, id));
+
+          const matchingTxs = await tx
+            .select({ id: transactions.id })
+            .from(transactions)
+            .where(txCond);
+
+          if (matchingTxs.length > 0) {
+            const txRev = await allocateNextRevision(tx);
+            latestRevision = txRev;
+            await tx
+              .update(transactions)
+              .set({ category: updated.name, revision: txRev, updatedAt: now })
+              .where(txCond);
+            updatedTxCount = matchingTxs.length;
+          }
+
+          const ruleCond =
+            updated.parentId === null
+              ? and(
+                  isNull(categorizationRules.deletedAt),
+                  eq(categorizationRules.targetCategoryId, id),
+                  isNull(categorizationRules.targetSubcategoryId),
+                )
+              : and(
+                  isNull(categorizationRules.deletedAt),
+                  eq(categorizationRules.targetSubcategoryId, id),
+                );
+
+          const matchingRules = await tx
+            .select({ id: categorizationRules.id })
+            .from(categorizationRules)
+            .where(ruleCond);
+
+          if (matchingRules.length > 0) {
+            const ruleRev = await allocateNextRevision(tx);
+            latestRevision = ruleRev;
+            await tx
+              .update(categorizationRules)
+              .set({ targetCategory: updated.name, revision: ruleRev, updatedAt: now })
+              .where(ruleCond);
+          }
+        }
+
+        const countWhere =
+          updated.parentId === null
+            ? and(isNull(transactions.deletedAt), eq(transactions.categoryId, id))
+            : and(isNull(transactions.deletedAt), eq(transactions.subcategoryId, id));
+        const [countRow] = await tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(transactions)
+          .where(countWhere);
+
+        return {
+          ok: true,
+          data: {
+            category: mapCategoryView(updated, countRow?.count ?? 0),
+            updated_transactions_count: updatedTxCount,
+            latest_revision: latestRevision,
+          },
+        } as const;
+      });
+    },
+
+    async mergeCategory(id, input) {
+      if (id === input.target_category_id) {
+        return {
+          ok: false,
+          reason: 'same_category',
+          message: 'La catégorie cible doit être différente de la catégorie source.',
+        } as const;
+      }
+
+      return clients.poolDb.transaction(async (tx) => {
+        const [source] = await tx
+          .select()
+          .from(categories)
+          .where(and(eq(categories.id, id), isNull(categories.deletedAt)))
+          .limit(1);
+
+        if (source === undefined) {
+          return {
+            ok: false,
+            reason: 'source_not_found',
+            message: 'Catégorie source introuvable.',
+          } as const;
+        }
+
+        if (isProtectedSystemCategory(source)) {
+          return {
+            ok: false,
+            reason: 'protected_or_has_children',
+            message: 'Impossible de fusionner une catégorie système protégée.',
+          } as const;
+        }
+
+        const resolvedTarget = await resolveCategoryTargetInTx(
+          tx,
+          input.target_category_id,
+          input.target_subcategory_id,
+        );
+        if (!resolvedTarget.ok) {
+          return {
+            ok: false,
+            reason: 'target_not_found',
+            message: 'Catégorie cible introuvable.',
+          } as const;
+        }
+
+        const activeChildren = await tx
+          .select()
+          .from(categories)
+          .where(and(eq(categories.parentId, id), isNull(categories.deletedAt)));
+
+        const now = new Date();
+        const extraReassignIds: string[] = [];
+
+        if (activeChildren.length > 0) {
+          if (resolvedTarget.subcategoryId !== null) {
+            return {
+              ok: false,
+              reason: 'depth_exceeded',
+              message: 'Impossible de fusionner une catégorie parente avec sous-catégories vers une sous-catégorie.',
+            } as const;
+          }
+
+          const [targetRoot] = await tx
+            .select()
+            .from(categories)
+            .where(eq(categories.id, resolvedTarget.categoryId))
+            .limit(1);
+          const targetChildren = await tx
+            .select()
+            .from(categories)
+            .where(
+              and(
+                eq(categories.parentId, resolvedTarget.categoryId),
+                isNull(categories.deletedAt),
+              ),
+            );
+          const targetChildrenByLowerName = new Map(
+            targetChildren.map((c) => [c.name.trim().toLowerCase(), c]),
+          );
+
+          for (const child of activeChildren) {
+            const colliding = targetChildrenByLowerName.get(child.name.trim().toLowerCase());
+            if (colliding !== undefined) {
+              await reassignCategoryReferencesInTx(
+                tx,
+                [child.id],
+                {
+                  categoryId: resolvedTarget.categoryId,
+                  subcategoryId: parseCategoryId(colliding.id),
+                  label: colliding.name,
+                },
+                now,
+              );
+              const childDelRev = await allocateNextRevision(tx);
+              await tx
+                .update(categories)
+                .set({ deletedAt: now, updatedAt: now, revision: childDelRev })
+                .where(eq(categories.id, child.id));
+            } else {
+              const reparentRev = await allocateNextRevision(tx);
+              const nextChildSlug = slugifyCategoryName(child.name, targetRoot?.slug);
+              await tx
+                .update(categories)
+                .set({
+                  parentId: resolvedTarget.categoryId,
+                  slug: nextChildSlug,
+                  revision: reparentRev,
+                  updatedAt: now,
+                })
+                .where(eq(categories.id, child.id));
+              // Also keep parent category_id aligned on transactions belonging to reparented child
+              await tx
+                .update(transactions)
+                .set({
+                  categoryId: resolvedTarget.categoryId,
+                  revision: reparentRev,
+                  updatedAt: now,
+                })
+                .where(and(isNull(transactions.deletedAt), eq(transactions.subcategoryId, child.id)));
+              await tx
+                .update(categorizationRules)
+                .set({
+                  targetCategoryId: resolvedTarget.categoryId,
+                  revision: reparentRev,
+                  updatedAt: now,
+                })
+                .where(
+                  and(
+                    isNull(categorizationRules.deletedAt),
+                    eq(categorizationRules.targetSubcategoryId, child.id),
+                  ),
+                );
+            }
+          }
+        }
+
+        const reassignedCount = await reassignCategoryReferencesInTx(
+          tx,
+          [source.id, ...extraReassignIds],
+          resolvedTarget,
+          now,
+        );
+
+        const delRev = await allocateNextRevision(tx);
+        await tx
+          .update(categories)
+          .set({ deletedAt: now, updatedAt: now, revision: delRev })
+          .where(eq(categories.id, id));
+
+        return {
+          ok: true,
+          data: {
+            merged_from_id: id,
+            target_category_id: input.target_category_id,
+            reassigned_transactions_count: reassignedCount,
+            latest_revision: delRev,
+          },
+        } as const;
+      });
+    },
+
+    async deleteCategory(id, input) {
+      return clients.poolDb.transaction(async (tx) => {
+        const [source] = await tx
+          .select()
+          .from(categories)
+          .where(and(eq(categories.id, id), isNull(categories.deletedAt)))
+          .limit(1);
+
+        if (source === undefined) {
+          return {
+            ok: false,
+            reason: 'not_found',
+            message: 'Catégorie introuvable.',
+          } as const;
+        }
+
+        if (isProtectedSystemCategory(source)) {
+          return {
+            ok: false,
+            reason: 'has_children_or_system',
+            message: 'Impossible de supprimer une catégorie système protégée.',
+          } as const;
+        }
+
+        const activeChildren = await tx
+          .select({ id: categories.id })
+          .from(categories)
+          .where(and(eq(categories.parentId, id), isNull(categories.deletedAt)))
+          .limit(1);
+
+        if (activeChildren.length > 0) {
+          return {
+            ok: false,
+            reason: 'has_children_or_system',
+            message: 'Impossible de supprimer une catégorie possédant des sous-catégories actives.',
+          } as const;
+        }
+
+        const [txRefRows, ruleRefRows] = await Promise.all([
+          tx
+            .select({ count: sql<number>`count(*)::int` })
+            .from(transactions)
+            .where(
+              and(
+                isNull(transactions.deletedAt),
+                or(eq(transactions.categoryId, id), eq(transactions.subcategoryId, id)),
+              ),
+            ),
+          tx
+            .select({ count: sql<number>`count(*)::int` })
+            .from(categorizationRules)
+            .where(
+              and(
+                isNull(categorizationRules.deletedAt),
+                or(
+                  eq(categorizationRules.targetCategoryId, id),
+                  eq(categorizationRules.targetSubcategoryId, id),
+                ),
+              ),
+            ),
+        ]);
+
+        const hasReferences =
+          (txRefRows[0]?.count ?? 0) > 0 || (ruleRefRows[0]?.count ?? 0) > 0;
+        const reassignTargetId = input?.reassign_to_category_id;
+
+        if (reassignTargetId === id) {
+          return {
+            ok: false,
+            reason: 'reassign_required',
+            message: 'La catégorie de réaffectation doit être différente de la catégorie supprimée.',
+          } as const;
+        }
+
+        if (hasReferences && reassignTargetId === undefined) {
+          return {
+            ok: false,
+            reason: 'reassign_required',
+            message: 'Cette catégorie est référencée : fournissez reassign_to_category_id.',
+          } as const;
+        }
+
+        const now = new Date();
+        let reassignedCount = 0;
+
+        if (reassignTargetId !== undefined) {
+          const resolvedTarget = await resolveCategoryTargetInTx(
+            tx,
+            reassignTargetId,
+            input?.reassign_to_subcategory_id,
+          );
+          if (!resolvedTarget.ok) {
+            return {
+              ok: false,
+              reason: 'target_not_found',
+              message: 'Catégorie de réaffectation introuvable.',
+            } as const;
+          }
+          reassignedCount = await reassignCategoryReferencesInTx(tx, [id], resolvedTarget, now);
+        }
+
+        const delRev = await allocateNextRevision(tx);
+        await tx
+          .update(categories)
+          .set({ deletedAt: now, updatedAt: now, revision: delRev })
+          .where(eq(categories.id, id));
+
+        return {
+          ok: true,
+          data: {
+            deleted_category_id: id,
+            reassigned_transactions_count: reassignedCount,
+            latest_revision: delRev,
+          },
+        } as const;
       });
     },
   };
@@ -1502,31 +2456,42 @@ export function createNeonAppDependencies(
             )
           : gt(categorizationRules.revision, effectiveSince);
 
-      const [accRows, txRows, noteRows, ruleRows, latestRunRows, fileRows] = await Promise.all([
-        clients.httpDb.select().from(accounts).where(accountFilter),
-        clients.httpDb
-          .select({ tx: transactions, account: accounts })
-          .from(transactions)
-          .innerJoin(accounts, eq(transactions.accountId, accounts.id))
-          .where(txFilter)
-          .orderBy(asc(transactions.revision))
-          .limit(query.limit + 1),
-        clients.httpDb.select().from(transactionNotes).where(noteFilter),
-        clients.httpDb.select().from(categorizationRules).where(ruleFilter),
-        clients.httpDb
-          .select()
-          .from(driveSyncRuns)
-          .orderBy(desc(driveSyncRuns.startedAt))
-          .limit(1),
-        clients.httpDb
-          .select({ file: driveFiles, checkpoint: pdfIngestionCheckpoints })
-          .from(driveFiles)
-          .leftJoin(
-            pdfIngestionCheckpoints,
-            eq(pdfIngestionCheckpoints.driveFileRecordId, driveFiles.id),
-          )
-          .where(gt(driveFiles.revision, effectiveSince)),
-      ]);
+      const categoryFilter =
+        sinceDate !== null
+          ? or(gt(categories.revision, effectiveSince), gt(categories.updatedAt, sinceDate))
+          : gt(categories.revision, effectiveSince);
+
+      const [accRows, txRows, noteRows, ruleRows, categoryRows, latestRunRows, fileRows] =
+        await Promise.all([
+          clients.httpDb.select().from(accounts).where(accountFilter),
+          clients.httpDb
+            .select({ tx: transactions, account: accounts })
+            .from(transactions)
+            .innerJoin(accounts, eq(transactions.accountId, accounts.id))
+            .where(txFilter)
+            .orderBy(asc(transactions.revision))
+            .limit(query.limit + 1),
+          clients.httpDb.select().from(transactionNotes).where(noteFilter),
+          clients.httpDb.select().from(categorizationRules).where(ruleFilter),
+          clients.httpDb
+            .select()
+            .from(categories)
+            .where(categoryFilter)
+            .orderBy(asc(categories.sortOrder), asc(categories.name)),
+          clients.httpDb
+            .select()
+            .from(driveSyncRuns)
+            .orderBy(desc(driveSyncRuns.startedAt))
+            .limit(1),
+          clients.httpDb
+            .select({ file: driveFiles, checkpoint: pdfIngestionCheckpoints })
+            .from(driveFiles)
+            .leftJoin(
+              pdfIngestionCheckpoints,
+              eq(pdfIngestionCheckpoints.driveFileRecordId, driveFiles.id),
+            )
+            .where(gt(driveFiles.revision, effectiveSince)),
+        ]);
 
       const hasMore = txRows.length > query.limit;
       const pageTxRows = hasMore ? txRows.slice(0, query.limit) : txRows;
@@ -1565,6 +2530,10 @@ export function createNeonAppDependencies(
             fx_rate_micro: toFxRateMicro(tx.fxRateMicro),
             amount_eur_cents: toCents(tx.amountEurCents),
             category: tx.category,
+            category_id: tx.categoryId !== null ? parseCategoryId(tx.categoryId) : null,
+            subcategory_id: tx.subcategoryId !== null ? parseCategoryId(tx.subcategoryId) : null,
+            category_source: tx.categorySource,
+            ai_review_status: tx.aiReviewStatus,
             is_manual_category: tx.isManualCategory,
             matched_rule_id: tx.matchedRuleId !== null ? parseRuleId(tx.matchedRuleId) : null,
             is_internal_transfer: tx.isInternalTransfer,
@@ -1610,11 +2579,26 @@ export function createNeonAppDependencies(
             match_mode: r.matchMode,
             pattern: r.pattern,
             target_category: r.targetCategory,
+            target_category_id:
+              r.targetCategoryId !== null ? parseCategoryId(r.targetCategoryId) : null,
+            target_subcategory_id:
+              r.targetSubcategoryId !== null ? parseCategoryId(r.targetSubcategoryId) : null,
             mark_as_internal_transfer: r.markAsInternalTransfer,
             is_active: r.isActive,
             revision: toSyncRevision(r.revision),
             updated_at: r.updatedAt.toISOString(),
           });
+        }
+      }
+
+      const upsertedCategories: Category[] = [];
+      const deletedCategoryIds: CategoryId[] = [];
+      for (const cat of categoryRows) {
+        maxPageRev = Math.max(maxPageRev, cat.revision);
+        if (cat.deletedAt !== null) {
+          deletedCategoryIds.push(parseCategoryId(cat.id));
+        } else {
+          upsertedCategories.push(mapCategoryRow(cat));
         }
       }
 
@@ -1662,6 +2646,7 @@ export function createNeonAppDependencies(
           deleted_transaction_ids: deletedNoteTxIds,
         },
         categorization_rules: { upserted: upsertedRules, deleted_ids: deletedRuleIds },
+        categories: { upserted: upsertedCategories, deleted_ids: deletedCategoryIds },
         drive_sync_status: {
           last_run:
             lastRunRow !== undefined
@@ -1714,7 +2699,15 @@ export function createNeonAppDependencies(
     async applyAndRecordMutation({ mutation, payloadHash }) {
       const patch: TransactionPatchInput = {
         ...(mutation.kind === 'upsert_note' ? { note: mutation.note } : {}),
-        ...(mutation.kind === 'set_category' ? { category: mutation.category } : {}),
+        ...(mutation.kind === 'set_category'
+          ? {
+              category: mutation.category,
+              ...(mutation.category_id !== undefined ? { category_id: mutation.category_id } : {}),
+              ...(mutation.subcategory_id !== undefined
+                ? { subcategory_id: mutation.subcategory_id }
+                : {}),
+            }
+          : {}),
         ...(mutation.kind === 'set_internal_transfer'
           ? { is_internal_transfer: mutation.is_internal_transfer }
           : {}),
@@ -1837,6 +2830,7 @@ export function createNeonAppDependencies(
     driveSyncService,
     transactionsRepository,
     rulesRepository,
+    categoriesRepository,
     budgetsRepository,
     analyticsRepository,
     deltaMutationRepository,
@@ -1855,6 +2849,10 @@ export function startServer(
   const env = parseApiEnv(rawEnv);
   const internalWorkerToken = parseInternalWorkerToken(rawEnv);
   const clients = createNeonClients(env.DATABASE_URL);
+  void ensureLot1CategoriesSchemaAndSeed(clients).catch((err: unknown) => {
+    const errName = err instanceof Error ? err.name : 'UnknownError';
+    console.error(`[api] Échec initialisation schéma Catégories Lot 1 (${errName}).`);
+  });
   const deps = createNeonAppDependencies(env, clients, internalWorkerToken);
   const app = createApp(deps);
 

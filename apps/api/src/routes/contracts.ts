@@ -6,7 +6,12 @@ import {
   AccountIdSchema,
   AccountTypeSchema,
   AggregateKpisSchema,
+  AiReviewStatusSchema,
   BankSchema,
+  BudgetGroupSchema,
+  CategoryIdSchema,
+  CategorySchema,
+  CategorySourceSchema,
   CentsSchema,
   CumulativeBalancePointSchema,
   CurrencySchema,
@@ -24,10 +29,15 @@ import {
   type Account,
   type AccountId,
   type AccountType,
+  type AiReviewStatus,
   type AllowedDriveFolderId,
   type ApiErrorCode,
   type ApiErrorEnvelope,
   type Bank,
+  type BudgetGroup,
+  type Category,
+  type CategoryId,
+  type CategorySource,
   type Cents,
   type CumulativeBalancePoint,
   type Currency,
@@ -262,6 +272,8 @@ export const OutboxMutationSchema = z.discriminatedUnion('kind', [
     kind: z.literal('set_category'),
     transaction_id: TransactionIdSchema,
     category: z.string().trim().min(1).max(64),
+    category_id: CategoryIdSchema.nullable().optional(),
+    subcategory_id: CategoryIdSchema.nullable().optional(),
     client_updated_at: IsoDateTimeSchema.optional(),
   }),
   z.object({
@@ -367,6 +379,8 @@ export const PatchTransactionBodySchema = z
   .object({
     note: z.string().trim().min(1).max(2000).nullable().optional(),
     category: z.string().trim().min(1).max(64).optional(),
+    category_id: CategoryIdSchema.nullable().optional(),
+    subcategory_id: CategoryIdSchema.nullable().optional(),
     is_manual_category: z.boolean().optional(),
     is_internal_transfer: z.boolean().optional(),
   })
@@ -375,10 +389,25 @@ export const PatchTransactionBodySchema = z
     (body) =>
       body.note !== undefined ||
       body.category !== undefined ||
+      body.category_id !== undefined ||
+      body.subcategory_id !== undefined ||
       body.is_manual_category !== undefined ||
       body.is_internal_transfer !== undefined,
     {
-      message: 'Au moins un champ (note, category, is_manual_category, is_internal_transfer) doit être fourni.',
+      message:
+        'Au moins un champ (note, category, category_id, subcategory_id, is_manual_category, is_internal_transfer) doit être fourni.',
+    },
+  )
+  .refine(
+    (body) =>
+      !(
+        body.subcategory_id !== undefined &&
+        body.subcategory_id !== null &&
+        body.category_id === null
+      ),
+    {
+      message: 'subcategory_id nécessite un category_id non nul.',
+      path: ['subcategory_id'],
     },
   );
 
@@ -400,6 +429,10 @@ export const TransactionDetailSchema = z.object({
   fx_rate_micro: FxRateMicroSchema,
   amount_eur_cents: CentsSchema,
   category: z.string().trim().min(1).max(64),
+  category_id: CategoryIdSchema.nullable().optional(),
+  subcategory_id: CategoryIdSchema.nullable().optional(),
+  category_source: CategorySourceSchema.optional(),
+  ai_review_status: AiReviewStatusSchema.optional(),
   is_manual_category: z.boolean(),
   matched_rule_id: RuleIdSchema.nullable(),
   is_internal_transfer: z.boolean(),
@@ -437,6 +470,8 @@ export interface TransactionsListResult {
 export interface TransactionPatchInput {
   readonly note?: string | null;
   readonly category?: string;
+  readonly category_id?: CategoryId | null;
+  readonly subcategory_id?: CategoryId | null;
   readonly is_manual_category?: boolean;
   readonly is_internal_transfer?: boolean;
 }
@@ -498,11 +533,24 @@ export const CreateRuleBodySchema = z
     match_mode: RuleMatchModeSchema.default('contains'),
     pattern: z.string().trim().min(1).max(200),
     target_category: z.string().trim().min(1).max(64),
+    target_category_id: CategoryIdSchema.nullable().optional(),
+    target_subcategory_id: CategoryIdSchema.nullable().optional(),
     mark_as_internal_transfer: z.boolean().default(false),
     is_active: z.boolean().default(true),
   })
   .strict()
   .superRefine((data, ctx) => {
+    if (
+      data.target_subcategory_id !== undefined &&
+      data.target_subcategory_id !== null &&
+      data.target_category_id === null
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['target_subcategory_id'],
+        message: 'target_subcategory_id nécessite un target_category_id non nul.',
+      });
+    }
     if (data.match_mode === 'regex' && !isSafeRegexPattern(data.pattern)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -523,6 +571,8 @@ export const UpdateRuleBodySchema = z
     match_mode: RuleMatchModeSchema.optional(),
     pattern: z.string().trim().min(1).max(200).optional(),
     target_category: z.string().trim().min(1).max(64).optional(),
+    target_category_id: CategoryIdSchema.nullable().optional(),
+    target_subcategory_id: CategoryIdSchema.nullable().optional(),
     mark_as_internal_transfer: z.boolean().optional(),
     is_active: z.boolean().optional(),
   })
@@ -534,6 +584,17 @@ export const UpdateRuleBodySchema = z
         code: z.ZodIssueCode.custom,
         path: [],
         message: 'Au moins un champ de règle à modifier est requis.',
+      });
+    }
+    if (
+      data.target_subcategory_id !== undefined &&
+      data.target_subcategory_id !== null &&
+      data.target_category_id === null
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['target_subcategory_id'],
+        message: 'target_subcategory_id nécessite un target_category_id non nul.',
       });
     }
     if (
@@ -591,6 +652,8 @@ export const RuleViewSchema = z.object({
   match_mode: RuleMatchModeSchema,
   pattern: z.string().min(1).max(200),
   target_category: z.string().min(1).max(64),
+  target_category_id: CategoryIdSchema.nullable().optional(),
+  target_subcategory_id: CategoryIdSchema.nullable().optional(),
   mark_as_internal_transfer: z.boolean(),
   is_active: z.boolean(),
   matched_transactions_count: z.number().int().nonnegative(),
@@ -658,6 +721,8 @@ export interface RuleEvalRule {
   readonly match_mode: RuleMatchMode;
   readonly pattern: string;
   readonly target_category: string;
+  readonly target_category_id?: CategoryId | null | undefined;
+  readonly target_subcategory_id?: CategoryId | null | undefined;
   readonly mark_as_internal_transfer: boolean;
   readonly is_active: boolean;
   readonly deleted_at: Date | null;
@@ -724,6 +789,8 @@ export function evaluateRuleMatch(
 export interface EvaluatedRuleChange {
   readonly transactionId: TransactionId;
   readonly nextCategory: string;
+  readonly nextTargetCategoryId?: CategoryId | null | undefined;
+  readonly nextTargetSubcategoryId?: CategoryId | null | undefined;
   readonly nextMatchedRuleId: RuleId | null;
   readonly nextIsInternalTransfer: boolean;
 }
@@ -788,6 +855,12 @@ export function computeRuleReapplication(
       changes.push({
         transactionId: tx.id,
         nextCategory,
+        ...(matchedRule?.target_category_id !== undefined
+          ? { nextTargetCategoryId: matchedRule.target_category_id }
+          : {}),
+        ...(matchedRule?.target_subcategory_id !== undefined
+          ? { nextTargetSubcategoryId: matchedRule.target_subcategory_id }
+          : {}),
         nextMatchedRuleId,
         nextIsInternalTransfer,
       });
@@ -1450,4 +1523,152 @@ export function computeAnalyticsOverview(params: {
     computed_at: now.toISOString(),
     data_revision: dataRevision,
   };
+}
+
+// ============================================================================
+// 7. Categories & Subcategories Contracts (GET/POST/PATCH/MERGE/DELETE)
+// ============================================================================
+
+export const CategoryIdParamSchema = z.object({
+  id: CategoryIdSchema,
+});
+
+export const CategoriesQuerySchema = z.object({
+  include_archived: BooleanStringSchema.optional(),
+});
+
+export const CreateCategoryBodySchema = z
+  .object({
+    parent_id: CategoryIdSchema.nullable().default(null),
+    name: z.string().trim().min(1).max(64),
+    budget_group: BudgetGroupSchema,
+    color_token: z.string().trim().min(1).max(32).default('slate'),
+    sort_order: z.number().int().min(0).max(10000).default(500),
+  })
+  .strict();
+export type CreateCategoryInput = z.infer<typeof CreateCategoryBodySchema>;
+
+export const UpdateCategoryBodySchema = z
+  .object({
+    name: z.string().trim().min(1).max(64).optional(),
+    budget_group: BudgetGroupSchema.optional(),
+    color_token: z.string().trim().min(1).max(32).optional(),
+    sort_order: z.number().int().min(0).max(10000).optional(),
+    is_archived: z.boolean().optional(),
+  })
+  .strict()
+  .refine((data) => Object.values(data).some((value) => value !== undefined), {
+    message: 'Au moins un champ de catégorie à modifier est requis.',
+  });
+export type UpdateCategoryInput = z.infer<typeof UpdateCategoryBodySchema>;
+
+export const MergeCategoryBodySchema = z
+  .object({
+    target_category_id: CategoryIdSchema,
+    target_subcategory_id: CategoryIdSchema.nullable().optional(),
+  })
+  .strict();
+export type MergeCategoryInput = z.infer<typeof MergeCategoryBodySchema>;
+
+export const DeleteCategoryBodySchema = z
+  .object({
+    reassign_to_category_id: CategoryIdSchema.optional(),
+    reassign_to_subcategory_id: CategoryIdSchema.nullable().optional(),
+  })
+  .strict()
+  .refine(
+    (data) =>
+      !(
+        data.reassign_to_subcategory_id !== undefined &&
+        data.reassign_to_subcategory_id !== null &&
+        data.reassign_to_category_id === undefined
+      ),
+    {
+      message: 'reassign_to_subcategory_id nécessite reassign_to_category_id.',
+      path: ['reassign_to_subcategory_id'],
+    },
+  );
+export type DeleteCategoryInput = z.infer<typeof DeleteCategoryBodySchema>;
+
+export const CategoryViewSchema = CategorySchema.extend({
+  transaction_count: z.number().int().nonnegative(),
+});
+export type CategoryView = z.infer<typeof CategoryViewSchema>;
+
+export interface CategoriesListResult {
+  readonly categories: readonly CategoryView[];
+  readonly latest_revision: SyncRevision;
+}
+
+export interface CategoryMutationResult {
+  readonly category: CategoryView;
+  readonly updated_transactions_count?: number | undefined;
+  readonly latest_revision: SyncRevision;
+}
+
+export interface CategoryMergeResult {
+  readonly merged_from_id: CategoryId;
+  readonly target_category_id: CategoryId;
+  readonly reassigned_transactions_count: number;
+  readonly latest_revision: SyncRevision;
+}
+
+export interface CategoryDeleteResult {
+  readonly deleted_category_id: CategoryId;
+  readonly reassigned_transactions_count: number;
+  readonly latest_revision: SyncRevision;
+}
+
+export type CreateCategoryOutcome =
+  | { readonly ok: true; readonly data: CategoryMutationResult }
+  | {
+      readonly ok: false;
+      readonly reason: 'parent_not_found' | 'depth_exceeded' | 'conflict';
+      readonly message: string;
+    };
+
+export type UpdateCategoryOutcome =
+  | { readonly ok: true; readonly data: CategoryMutationResult }
+  | {
+      readonly ok: false;
+      readonly reason: 'not_found' | 'conflict';
+      readonly message: string;
+    };
+
+export type MergeCategoryOutcome =
+  | { readonly ok: true; readonly data: CategoryMergeResult }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | 'source_not_found'
+        | 'target_not_found'
+        | 'same_category'
+        | 'depth_exceeded'
+        | 'protected_or_has_children';
+      readonly message: string;
+    };
+
+export type DeleteCategoryOutcome =
+  | { readonly ok: true; readonly data: CategoryDeleteResult }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | 'not_found'
+        | 'target_not_found'
+        | 'reassign_required'
+        | 'has_children_or_system';
+      readonly message: string;
+    };
+
+export interface CategoriesRepository {
+  listCategories(options?: {
+    readonly include_archived?: boolean | undefined;
+  }): Promise<CategoriesListResult>;
+  createCategory(input: CreateCategoryInput): Promise<CreateCategoryOutcome>;
+  updateCategory(id: CategoryId, input: UpdateCategoryInput): Promise<UpdateCategoryOutcome>;
+  mergeCategory(id: CategoryId, input: MergeCategoryInput): Promise<MergeCategoryOutcome>;
+  deleteCategory(
+    id: CategoryId,
+    input?: DeleteCategoryInput | undefined,
+  ): Promise<DeleteCategoryOutcome>;
 }
