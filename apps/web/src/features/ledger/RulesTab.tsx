@@ -3,11 +3,13 @@ import type {
   AccountId,
   Bank,
   CategorizationRule,
+  Category,
   RuleId,
   Transaction,
 } from '@clairflux/shared';
 import { memo, useEffect, useMemo, useState, type FormEvent, type ReactElement } from 'react';
 import { BANK_LABELS } from '../dashboard/types';
+import { GroupedCategorySelectOptions } from './CategorySelectors';
 import { LEDGER_CATEGORIES } from './csvExport';
 
 export interface SaveRuleInput {
@@ -23,6 +25,7 @@ export interface RulesTabProps {
   readonly accounts: readonly Account[];
   readonly transactions: readonly Transaction[];
   readonly rules: readonly CategorizationRule[];
+  readonly categories?: readonly Category[] | undefined;
   readonly isOnline: boolean;
   readonly rulePrefillPattern: string;
   readonly onSaveRule: (input: SaveRuleInput) => void;
@@ -43,6 +46,7 @@ export const RulesTab = memo(function RulesTab({
   accounts,
   transactions,
   rules,
+  categories,
   isOnline,
   rulePrefillPattern,
   onSaveRule,
@@ -183,7 +187,7 @@ export const RulesTab = memo(function RulesTab({
           <div className="cf-field-group">
             <label htmlFor="cf-rule-cat" className="cf-field-label">Catégorie cible</label>
             <select id="cf-rule-cat" disabled={!isOnline} value={targetCategory} onChange={(e) => setTargetCategory(e.target.value)} className="cf-field-input">
-              {LEDGER_CATEGORIES.map((cat) => <option key={cat} value={cat}>{cat}</option>)}
+              <GroupedCategorySelectOptions categories={categories} selectedValue={targetCategory} />
             </select>
           </div>
           <div className="cf-field-group">

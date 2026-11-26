@@ -60,7 +60,7 @@ const BottomSheetNoteDialog = lazy(() => import('./features/ledger/BottomSheetNo
 
 const HEADING_BY_TAB: Readonly<Record<AppTab['kind'], string>> = {
   overview: 'overview-heading',
-  transactions: 'ledger-section-heading',
+  transactions: 'ledger-heading',
   sync: 'sync-heading',
 };
 
@@ -287,6 +287,7 @@ function ClairFluxApp(): ReactElement {
               transactions={dataset.transactions}
               notes={dataset.notes}
               rules={dataset.rules}
+              categories={dataset.categories}
               activeSubTab={activeSubTab}
               onChangeSubTab={setActiveSubTab}
               currencyMode={currencyMode}
@@ -299,6 +300,10 @@ function ClairFluxApp(): ReactElement {
               onReorderRule={store.reorderRule}
               onToggleRule={store.toggleRule}
               onReapplyRules={store.reapplyRules}
+              onCreateCategory={store.createCategory}
+              onUpdateCategory={store.updateCategory}
+              onMergeCategory={store.mergeCategory}
+              onDeleteCategory={store.deleteCategory}
             />
           </Suspense>
         );
@@ -402,6 +407,7 @@ function ClairFluxApp(): ReactElement {
           <BottomSheetNoteDialog
             transaction={selectedTx}
             account={selectedAccount}
+            categories={dataset.categories}
             currentNote={currentNote}
             isOnline={isOnline}
             onClose={() => setSelectedTxId(null)}

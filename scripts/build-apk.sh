@@ -107,6 +107,110 @@ ensure_capacitor_packages() {
   fi
 }
 
+patch_android_pixel8_manifest_and_styles() {
+  local manifest_path="${ANDROID_DIR}/app/src/main/AndroidManifest.xml"
+  local styles_path="${ANDROID_DIR}/app/src/main/res/values/styles.xml"
+
+  if [ ! -f "${manifest_path}" ]; then
+    fail "AndroidManifest.xml introuvable : ${manifest_path}"
+  fi
+
+  log "Application idempotente du profil Google Pixel 8 / Android 15 SDK 35 (Manifest + styles.xml)..."
+  node - "${manifest_path}" "${styles_path}" <<'NODE_EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const [manifestPath, stylesPath] = process.argv.slice(2);
+const expectedConfigChanges =
+  'orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode';
+
+let manifest = fs.readFileSync(manifestPath, 'utf8');
+const activityMatch = /<activity\b[\s\S]*?>/.exec(manifest);
+if (!activityMatch) {
+  throw new Error(`Balise <activity> introuvable dans ${manifestPath}`);
+}
+
+let activityTag = activityMatch[0];
+const upsertActivityAttr = (tag, attrName, attrValue) => {
+  const attrRegex = new RegExp(`\\b${attrName}\\s*=\\s*"[^"]*"`);
+  if (attrRegex.test(tag)) {
+    return tag.replace(attrRegex, `${attrName}="${attrValue}"`);
+  }
+  if (tag.endsWith('/>')) {
+    return `${tag.slice(0, -2)} ${attrName}="${attrValue}" />`;
+  }
+  return `${tag.slice(0, -1)} ${attrName}="${attrValue}">`;
+};
+
+activityTag = upsertActivityAttr(activityTag, 'android:screenOrientation', 'fullUser');
+activityTag = upsertActivityAttr(activityTag, 'android:configChanges', expectedConfigChanges);
+activityTag = upsertActivityAttr(activityTag, 'android:windowSoftInputMode', 'adjustResize');
+manifest =
+  manifest.slice(0, activityMatch.index) +
+  activityTag +
+  manifest.slice(activityMatch.index + activityMatch[0].length);
+fs.writeFileSync(manifestPath, manifest, 'utf8');
+
+const styleItems = [
+  ['android:windowLayoutInDisplayCutoutMode', 'shortEdges'],
+  ['android:windowLightStatusBar', 'true'],
+  ['android:windowLightNavigationBar', 'true'],
+];
+
+if (!fs.existsSync(stylesPath)) {
+  fs.mkdirSync(path.dirname(stylesPath), { recursive: true });
+  const initialXml = [
+    '<?xml version="1.0" encoding="utf-8"?>',
+    '<resources>',
+    '    <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">',
+    ...styleItems.map(([name, val]) => `        <item name="${name}">${val}</item>`),
+    '    </style>',
+    '</resources>',
+    '',
+  ].join('\n');
+  fs.writeFileSync(stylesPath, initialXml, 'utf8');
+} else {
+  let styles = fs.readFileSync(stylesPath, 'utf8');
+  const styleBlockRegex =
+    /(<style\b[^>]*name="(?:AppTheme\.NoActionBar|AppTheme)"[^>]*>)([\s\S]*?)(<\/style>)/;
+  const styleMatch = styleBlockRegex.exec(styles);
+  if (!styleMatch) {
+    const fallbackClosingIdx = styles.lastIndexOf('</resources>');
+    if (fallbackClosingIdx === -1) {
+      throw new Error(`Balise </resources> introuvable dans ${stylesPath}`);
+    }
+    const injectedStyle = [
+      '    <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">',
+      ...styleItems.map(([name, val]) => `        <item name="${name}">${val}</item>`),
+      '    </style>',
+      '',
+    ].join('\n');
+    styles = styles.slice(0, fallbackClosingIdx) + injectedStyle + styles.slice(fallbackClosingIdx);
+  } else {
+    let body = styleMatch[2];
+    for (const [name, val] of styleItems) {
+      const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const itemRegex = new RegExp(`<item\\s+name="${escapedName}"\\s*>[\\s\\S]*?<\\/item>`);
+      const replacement = `<item name="${name}">${val}</item>`;
+      if (itemRegex.test(body)) {
+        body = body.replace(itemRegex, replacement);
+      } else {
+        const trimmedEnd = body.replace(/\s*$/, '');
+        body = `${trimmedEnd}\n        ${replacement}\n    `;
+      }
+    }
+    styles =
+      styles.slice(0, styleMatch.index) +
+      styleMatch[1] +
+      body +
+      styleMatch[3] +
+      styles.slice(styleMatch.index + styleMatch[0].length);
+  }
+  fs.writeFileSync(stylesPath, styles, 'utf8');
+}
+NODE_EOF
+}
+
 # ------------------------------------------------------------------------------
 # Étape 1 : Build du bundle web (@clairflux/web)
 # ------------------------------------------------------------------------------
@@ -132,6 +236,8 @@ fi
 
 log "Exécution de npx cap sync android..."
 npx --no-install cap sync android
+
+patch_android_pixel8_manifest_and_styles
 
 if [ ! -x "${ANDROID_DIR}/gradlew" ] && [ ! -f "${ANDROID_DIR}/gradlew" ]; then
   fail "Wrapper Gradle introuvable dans ${ANDROID_DIR}/gradlew après cap sync."

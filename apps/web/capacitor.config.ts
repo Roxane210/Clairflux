@@ -8,6 +8,7 @@ export interface CapacitorServerConfig {
 export interface CapacitorAndroidConfig {
   readonly allowMixedContent: boolean;
   readonly captureInput: boolean;
+  readonly adjustMarginsForEdgeToEdge?: 'auto' | 'force' | 'disable';
   readonly webContentsDebuggingEnabled?: boolean;
 }
 
@@ -36,6 +37,8 @@ const config: CapacitorConfig = {
   android: {
     allowMixedContent: false,
     captureInput: true,
+    adjustMarginsForEdgeToEdge: 'auto',
+    webContentsDebuggingEnabled: false,
   },
 };
 

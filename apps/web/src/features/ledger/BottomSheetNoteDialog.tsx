@@ -1,6 +1,7 @@
 import {
   formatMoney,
   type Account,
+  type Category,
   type Transaction,
   type TransactionId,
 } from '@clairflux/shared';
@@ -15,11 +16,15 @@ import {
   type ReactElement,
 } from 'react';
 import { ACCOUNT_TYPE_LABELS, BANK_LABELS } from '../dashboard/types';
-import { LEDGER_CATEGORIES } from './csvExport';
+import {
+  GroupedCategorySelectOptions,
+  isDialogBackdropClickOutside,
+} from './CategorySelectors';
 
 export interface BottomSheetNoteDialogProps {
   readonly transaction: Transaction | null;
   readonly account: Account | null;
+  readonly categories?: readonly Category[] | undefined;
   readonly currentNote: string;
   readonly isOnline: boolean;
   readonly onClose: () => void;
@@ -35,6 +40,7 @@ export interface BottomSheetNoteDialogProps {
 export const BottomSheetNoteDialog = memo(function BottomSheetNoteDialog({
   transaction,
   account,
+  categories,
   currentNote,
   isOnline,
   onClose,
@@ -63,14 +69,25 @@ export const BottomSheetNoteDialog = memo(function BottomSheetNoteDialog({
     const dialog = dialogRef.current;
     if (!dialog) return;
     if (transaction !== null && !dialog.open) {
+      dialog.returnValue = '';
       dialog.showModal();
     } else if (transaction === null && dialog.open) {
+      dialog.returnValue = '';
       dialog.close();
     }
   }, [transaction]);
 
+  const closeSafely = (): void => {
+    if (dialogRef.current) {
+      dialogRef.current.returnValue = '';
+    }
+    onClose();
+  };
+
   const handleBackdropClick = (event: MouseEvent<HTMLDialogElement>): void => {
-    if (event.target === dialogRef.current) onClose();
+    if (isDialogBackdropClickOutside(event, dialogRef.current)) {
+      closeSafely();
+    }
   };
 
   const handleNoteSubmit = (event: FormEvent<HTMLFormElement>): void => {
@@ -85,11 +102,6 @@ export const BottomSheetNoteDialog = memo(function BottomSheetNoteDialog({
     if (!transaction) return;
     onUpdateCategory(transaction.id, category, isInternalTransfer);
   };
-
-  const categoryOptions =
-    transaction && !LEDGER_CATEGORIES.includes(transaction.category)
-      ? [transaction.category, ...LEDGER_CATEGORIES]
-      : LEDGER_CATEGORIES;
 
   const accountLabel = account
     ? `${account.nickname} (${ACCOUNT_TYPE_LABELS[account.account_type]})`
@@ -106,9 +118,9 @@ export const BottomSheetNoteDialog = memo(function BottomSheetNoteDialog({
       onClick={handleBackdropClick}
       onCancel={(e) => {
         e.preventDefault();
-        onClose();
+        closeSafely();
       }}
-      onClose={onClose}
+      onClose={closeSafely}
     >
       {transaction ? (
         <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -116,7 +128,7 @@ export const BottomSheetNoteDialog = memo(function BottomSheetNoteDialog({
             <h2 id={titleId} style={{ fontSize: '1.125rem', minInlineSize: 0, overflowWrap: 'anywhere' }}>
               {transaction.clean_label}
             </h2>
-            <button type="button" className="cf-btn" onClick={onClose}>Fermer</button>
+            <button type="button" className="cf-btn" onClick={closeSafely}>Fermer</button>
           </div>
 
           <div
@@ -192,9 +204,7 @@ export const BottomSheetNoteDialog = memo(function BottomSheetNoteDialog({
                 onChange={(e) => setCategory(e.target.value)}
                 className="cf-field-input"
               >
-                {categoryOptions.map((cat) => (
-                  <option key={cat} value={cat}>{cat}</option>
-                ))}
+                <GroupedCategorySelectOptions categories={categories} selectedValue={category} />
               </select>
             </div>
             <label style={{ display: 'flex', alignItems: 'center', gap: '10px', minBlockSize: '44px', cursor: 'pointer' }}>

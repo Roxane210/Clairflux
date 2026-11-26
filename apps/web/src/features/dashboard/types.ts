@@ -1,5 +1,6 @@
 import {
   ALLOWED_DRIVE_FOLDERS,
+  DEFAULT_FRENCH_CATEGORY_PACK,
   assertNever,
   convertToEurCents,
   parseAccountId,
@@ -13,6 +14,7 @@ import {
   type AccountType,
   type Bank,
   type CategorizationRule,
+  type Category,
   type Cents,
   type CumulativeBalancePoint,
   type Currency,
@@ -42,7 +44,7 @@ export type AppTab =
   | { readonly kind: 'transactions' }
   | { readonly kind: 'sync' };
 
-export type TransactionsSubTab = 'operations' | 'rules';
+export type TransactionsSubTab = 'operations' | 'rules' | 'categories';
 
 export type ExpenseComparisonMode = 'none' | 'prev_month' | 'avg_3m';
 
@@ -71,6 +73,7 @@ export type ClairFluxDataset = {
   readonly transactions: readonly Transaction[];
   readonly notes: readonly TransactionNote[];
   readonly rules: readonly CategorizationRule[];
+  readonly categories?: readonly Category[] | undefined;
   readonly budgets: readonly BudgetLimit[];
   readonly driveFiles: readonly DriveSyncFileStatus[];
   readonly revision: number;
@@ -1082,6 +1085,7 @@ export const EMPTY_LIVE_DATASET: ClairFluxDataset = {
   transactions: [],
   notes: [],
   rules: [],
+  categories: [],
   budgets: [],
   driveFiles: [],
   revision: 0,
@@ -1093,6 +1097,7 @@ export const INITIAL_SEED_DATASET: ClairFluxDataset = {
   transactions: INITIAL_TRANSACTIONS,
   notes: INITIAL_NOTES,
   rules: INITIAL_RULES,
+  categories: DEFAULT_FRENCH_CATEGORY_PACK,
   budgets: INITIAL_BUDGETS,
   driveFiles: INITIAL_DRIVE_FILES,
   revision: 1482,

@@ -1,10 +1,14 @@
 import {
   ApiErrorEnvelopeSchema,
+  CategorySchema,
   parseRuleId,
   toSyncRevision,
   type AccountId,
   type Bank,
+  type BudgetGroup,
   type CategorizationRule,
+  type Category,
+  type CategoryId,
   type DriveSyncRunSummary,
   type RuleId,
   type Transaction,
@@ -35,6 +39,42 @@ import {
 // Public Types (Contract with main.tsx, TransactionsSection & BottomSheetNoteDialog)
 // ============================================================================
 
+export const CATEGORY_OFFLINE_MESSAGE =
+  'Gestion des catégories indisponible hors-ligne — connexion requise.' as const;
+
+export interface CreateCategoryInput {
+  readonly parent_id: CategoryId | null;
+  readonly name: string;
+  readonly budget_group: BudgetGroup;
+  readonly color_token?: string | undefined;
+  readonly sort_order?: number | undefined;
+}
+
+export interface UpdateCategoryInput {
+  readonly id: CategoryId;
+  readonly name?: string | undefined;
+  readonly budget_group?: BudgetGroup | undefined;
+  readonly color_token?: string | undefined;
+  readonly sort_order?: number | undefined;
+  readonly is_archived?: boolean | undefined;
+}
+
+export interface MergeCategoryInput {
+  readonly sourceCategoryId: CategoryId;
+  readonly target_category_id: CategoryId;
+  readonly target_subcategory_id?: CategoryId | null | undefined;
+}
+
+export interface DeleteCategoryInput {
+  readonly id: CategoryId;
+  readonly reassign_to_category_id: CategoryId;
+  readonly reassign_to_subcategory_id?: CategoryId | null | undefined;
+}
+
+export type CategoryActionResult =
+  | { readonly ok: true; readonly message: string }
+  | { readonly ok: false; readonly message: string };
+
 export interface SaveRuleInput {
   readonly id?: RuleId | undefined;
   readonly name: string;
@@ -56,6 +96,10 @@ export interface OfflineStoreApi {
     category: string,
     isInternalTransfer: boolean,
   ) => Promise<void>;
+  readonly createCategory: (input: CreateCategoryInput) => Promise<CategoryActionResult>;
+  readonly updateCategory: (input: UpdateCategoryInput) => Promise<CategoryActionResult>;
+  readonly mergeCategory: (input: MergeCategoryInput) => Promise<CategoryActionResult>;
+  readonly deleteCategory: (input: DeleteCategoryInput) => Promise<CategoryActionResult>;
   readonly saveRule: (input: SaveRuleInput) => Promise<void>;
   readonly reorderRule: (ruleId: RuleId, direction: 'up' | 'down') => Promise<void>;
   readonly toggleRule: (ruleId: RuleId) => Promise<void>;
@@ -95,6 +139,10 @@ export interface OfflineController {
     category: string,
     isInternalTransfer: boolean,
   ): Promise<void>;
+  createCategory(input: CreateCategoryInput): Promise<CategoryActionResult>;
+  updateCategory(input: UpdateCategoryInput): Promise<CategoryActionResult>;
+  mergeCategory(input: MergeCategoryInput): Promise<CategoryActionResult>;
+  deleteCategory(input: DeleteCategoryInput): Promise<CategoryActionResult>;
   saveRule(input: SaveRuleInput): Promise<void>;
   reorderRule(ruleId: RuleId, direction: 'up' | 'down'): Promise<void>;
   toggleRule(ruleId: RuleId): Promise<void>;
@@ -361,8 +409,240 @@ export function createOfflineController(
     });
   };
 
-  return {
-    getState(): OfflineStoreState {
+    const requestCategoryApi = async (
+      path: `/api/${string}`,
+      method: 'POST' | 'PATCH' | 'DELETE',
+      bodyPayload: Record<string, unknown>,
+      fallbackError: string,
+    ): Promise<
+      | { readonly ok: true; readonly json: unknown }
+      | { readonly ok: false; readonly message: string }
+    > => {
+      if (!state.isOnline) {
+        emit({ syncMessage: CATEGORY_OFFLINE_MESSAGE });
+        return { ok: false, message: CATEGORY_OFFLINE_MESSAGE };
+      }
+
+      try {
+        const response = await fetcher(buildApiEndpointUrl(apiBaseUrl, path), {
+          method,
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'X-Clairflux-Client': 'web',
+          },
+          body: JSON.stringify(bodyPayload),
+        });
+
+        if (response.status === 401) {
+          options.onUnauthorized?.();
+          const msg = 'Session expirée — veuillez vous reconnecter.';
+          emit({ syncMessage: msg });
+          return { ok: false, message: msg };
+        }
+
+        if (!response.ok) {
+          let detailed = `${fallbackError} (HTTP ${response.status}).`;
+          try {
+            const parsedErr = ApiErrorEnvelopeSchema.safeParse(await response.json());
+            if (parsedErr.success) {
+              detailed = parsedErr.data.error.message;
+            }
+          } catch {
+            // Keep HTTP fallback message
+          }
+          emit({ syncMessage: detailed });
+          return { ok: false, message: detailed };
+        }
+
+        let json: unknown = null;
+        try {
+          json = await response.json();
+        } catch {
+          // Non-JSON body still triggers delta sync refresh
+        }
+        return { ok: true, json };
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : fallbackError;
+        emit({ syncMessage: msg });
+        return { ok: false, message: msg };
+      }
+    };
+
+    const finalizeCategoryDataset = async (
+      optimisticDataset: ClairFluxDataset,
+      successMessage: string,
+    ): Promise<CategoryActionResult> => {
+      await persistSnapshot(optimisticDataset);
+      let finalDataset = optimisticDataset;
+      const pullOutcome = await pullCompleteDelta(optimisticDataset);
+      if (pullOutcome.ok) {
+        finalDataset = pullOutcome.dataset;
+        await persistSnapshot(finalDataset);
+      }
+      emit({ dataset: finalDataset, syncMessage: successMessage });
+      return { ok: true, message: successMessage };
+    };
+
+    async function createCategory(input: CreateCategoryInput): Promise<CategoryActionResult> {
+      const apiOutcome = await requestCategoryApi(
+        '/api/categories',
+        'POST',
+        {
+          parent_id: input.parent_id,
+          name: input.name.trim(),
+          budget_group: input.budget_group,
+          ...(input.color_token !== undefined ? { color_token: input.color_token } : {}),
+          ...(input.sort_order !== undefined ? { sort_order: input.sort_order } : {}),
+        },
+        'Impossible de créer la catégorie',
+      );
+      if (!apiOutcome.ok) {
+        return apiOutcome;
+      }
+
+      let nextDataset = state.dataset;
+      if (
+        typeof apiOutcome.json === 'object' &&
+        apiOutcome.json !== null &&
+        'category' in apiOutcome.json
+      ) {
+        const parsedCat = CategorySchema.safeParse(Reflect.get(apiOutcome.json, 'category'));
+        if (parsedCat.success) {
+          const existing = (state.dataset.categories ?? []).filter(
+            (cat) => cat.id !== parsedCat.data.id,
+          );
+          nextDataset = {
+            ...state.dataset,
+            categories: [...existing, parsedCat.data],
+            syncedAt: nowProvider(),
+          };
+        }
+      }
+      return finalizeCategoryDataset(nextDataset, `Catégorie « ${input.name.trim()} » créée.`);
+    }
+
+    async function updateCategory(input: UpdateCategoryInput): Promise<CategoryActionResult> {
+      const apiOutcome = await requestCategoryApi(
+        `/api/categories/${encodeURIComponent(input.id)}`,
+        'PATCH',
+        {
+          ...(input.name !== undefined ? { name: input.name.trim() } : {}),
+          ...(input.budget_group !== undefined ? { budget_group: input.budget_group } : {}),
+          ...(input.color_token !== undefined ? { color_token: input.color_token } : {}),
+          ...(input.sort_order !== undefined ? { sort_order: input.sort_order } : {}),
+          ...(input.is_archived !== undefined ? { is_archived: input.is_archived } : {}),
+        },
+        'Impossible de modifier la catégorie',
+      );
+      if (!apiOutcome.ok) {
+        return apiOutcome;
+      }
+
+      let nextDataset = state.dataset;
+      if (
+        typeof apiOutcome.json === 'object' &&
+        apiOutcome.json !== null &&
+        'category' in apiOutcome.json
+      ) {
+        const parsedCat = CategorySchema.safeParse(Reflect.get(apiOutcome.json, 'category'));
+        if (parsedCat.success) {
+          const prevCat = (state.dataset.categories ?? []).find(
+            (cat) => cat.id === parsedCat.data.id,
+          );
+          nextDataset = {
+            ...state.dataset,
+            categories: (state.dataset.categories ?? []).map((cat) =>
+              cat.id === parsedCat.data.id ? parsedCat.data : cat,
+            ),
+            transactions:
+              prevCat !== undefined && prevCat.name !== parsedCat.data.name
+                ? state.dataset.transactions.map((tx) =>
+                    tx.category === prevCat.name ? { ...tx, category: parsedCat.data.name } : tx,
+                  )
+                : state.dataset.transactions,
+            syncedAt: nowProvider(),
+          };
+        }
+      }
+      return finalizeCategoryDataset(nextDataset, 'Catégorie mise à jour.');
+    }
+
+    async function mergeCategory(input: MergeCategoryInput): Promise<CategoryActionResult> {
+      const apiOutcome = await requestCategoryApi(
+        `/api/categories/${encodeURIComponent(input.sourceCategoryId)}/merge`,
+        'POST',
+        {
+          target_category_id: input.target_category_id,
+          ...(input.target_subcategory_id !== undefined
+            ? { target_subcategory_id: input.target_subcategory_id }
+            : {}),
+        },
+        'Impossible de fusionner la catégorie',
+      );
+      if (!apiOutcome.ok) {
+        return apiOutcome;
+      }
+
+      const targetCat = (state.dataset.categories ?? []).find(
+        (cat) => cat.id === (input.target_subcategory_id ?? input.target_category_id),
+      );
+      const sourceCat = (state.dataset.categories ?? []).find(
+        (cat) => cat.id === input.sourceCategoryId,
+      );
+      const nextDataset: ClairFluxDataset = {
+        ...state.dataset,
+        categories: (state.dataset.categories ?? []).filter(
+          (cat) => cat.id !== input.sourceCategoryId,
+        ),
+        transactions:
+          sourceCat !== undefined && targetCat !== undefined
+            ? state.dataset.transactions.map((tx) =>
+                tx.category === sourceCat.name ? { ...tx, category: targetCat.name } : tx,
+              )
+            : state.dataset.transactions,
+        syncedAt: nowProvider(),
+      };
+      return finalizeCategoryDataset(nextDataset, 'Catégorie fusionnée et opérations réaffectées.');
+    }
+
+    async function deleteCategory(input: DeleteCategoryInput): Promise<CategoryActionResult> {
+      const apiOutcome = await requestCategoryApi(
+        `/api/categories/${encodeURIComponent(input.id)}`,
+        'DELETE',
+        {
+          reassign_to_category_id: input.reassign_to_category_id,
+          ...(input.reassign_to_subcategory_id !== undefined
+            ? { reassign_to_subcategory_id: input.reassign_to_subcategory_id }
+            : {}),
+        },
+        'Impossible de supprimer la catégorie',
+      );
+      if (!apiOutcome.ok) {
+        return apiOutcome;
+      }
+
+      const targetCat = (state.dataset.categories ?? []).find(
+        (cat) => cat.id === (input.reassign_to_subcategory_id ?? input.reassign_to_category_id),
+      );
+      const sourceCat = (state.dataset.categories ?? []).find((cat) => cat.id === input.id);
+      const nextDataset: ClairFluxDataset = {
+        ...state.dataset,
+        categories: (state.dataset.categories ?? []).filter((cat) => cat.id !== input.id),
+        transactions:
+          sourceCat !== undefined && targetCat !== undefined
+            ? state.dataset.transactions.map((tx) =>
+                tx.category === sourceCat.name ? { ...tx, category: targetCat.name } : tx,
+              )
+            : state.dataset.transactions,
+        syncedAt: nowProvider(),
+      };
+      return finalizeCategoryDataset(nextDataset, 'Catégorie supprimée et opérations réaffectées.');
+    }
+
+    return {
+      getState(): OfflineStoreState {
       return state;
     },
 
@@ -542,6 +822,11 @@ export function createOfflineController(
         await flushNow();
       }
     },
+
+    createCategory,
+    updateCategory,
+    mergeCategory,
+    deleteCategory,
 
     async saveRule(input: SaveRuleInput): Promise<void> {
       const trimmedName = input.name.trim();
@@ -834,6 +1119,26 @@ export function useOfflineStore(
     [controller],
   );
 
+  const createCategory = useCallback(
+    (input: CreateCategoryInput) => controller.createCategory(input),
+    [controller],
+  );
+
+  const updateCategory = useCallback(
+    (input: UpdateCategoryInput) => controller.updateCategory(input),
+    [controller],
+  );
+
+  const mergeCategory = useCallback(
+    (input: MergeCategoryInput) => controller.mergeCategory(input),
+    [controller],
+  );
+
+  const deleteCategory = useCallback(
+    (input: DeleteCategoryInput) => controller.deleteCategory(input),
+    [controller],
+  );
+
   const saveRule = useCallback(
     (input: SaveRuleInput) => controller.saveRule(input),
     [controller],
@@ -862,6 +1167,10 @@ export function useOfflineStore(
     syncMessage: state.syncMessage,
     saveQuickNote,
     updateManualCategory,
+    createCategory,
+    updateCategory,
+    mergeCategory,
+    deleteCategory,
     saveRule,
     reorderRule,
     toggleRule,

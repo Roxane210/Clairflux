@@ -1,6 +1,7 @@
 import {
   AccountSchema,
   CategorizationRuleSchema,
+  CategorySchema,
   CentsSchema,
   DriveSyncFileStatusSchema,
   TransactionIdSchema,
@@ -34,6 +35,7 @@ export const ClairFluxDatasetSchema = z.object({
   transactions: z.array(TransactionSchema),
   notes: z.array(TransactionNoteSchema),
   rules: z.array(CategorizationRuleSchema),
+  categories: z.array(CategorySchema).optional(),
   budgets: z.array(BudgetLimitSchema),
   driveFiles: z.array(DriveSyncFileStatusSchema),
   revision: z.number().int().nonnegative(),

@@ -214,6 +214,18 @@ export function applyDeltaToDataset(
     ruleMap.set(rule.id, rule);
   }
 
+  const categoryMap = new Map(
+    (reset ? [] : (current.categories ?? [])).map((cat) => [cat.id, cat] as const),
+  );
+  if (delta.categories !== undefined) {
+    for (const deletedId of delta.categories.deleted_ids) {
+      categoryMap.delete(deletedId);
+    }
+    for (const category of delta.categories.upserted) {
+      categoryMap.set(category.id, category);
+    }
+  }
+
   const driveFiles =
     delta.drive_sync_status.files.length > 0 || reset
       ? delta.drive_sync_status.files
@@ -223,12 +235,20 @@ export function applyDeltaToDataset(
     right.booking_date.localeCompare(left.booking_date),
   );
   const sortedRules = [...ruleMap.values()].sort((left, right) => left.priority - right.priority);
+  const sortedCategories = [...categoryMap.values()].sort((left, right) =>
+    left.sort_order !== right.sort_order
+      ? left.sort_order - right.sort_order
+      : left.name.localeCompare(right.name, 'fr'),
+  );
 
   return {
     accounts: [...accountMap.values()],
     transactions: sortedTransactions,
     notes: [...noteMap.values()],
     rules: sortedRules,
+    ...(current.categories !== undefined || delta.categories !== undefined || reset
+      ? { categories: sortedCategories }
+      : {}),
     budgets: current.budgets,
     driveFiles,
     revision: delta.latest_revision,
@@ -680,6 +700,15 @@ function getCapacitorPlugins(): {
 function closeActiveDialogIfPresent(): boolean {
   if (typeof document === 'undefined') {
     return false;
+  }
+  const openPopover = document.querySelector('[popover]:popover-open');
+  if (
+    openPopover !== null &&
+    'hidePopover' in openPopover &&
+    typeof openPopover.hidePopover === 'function'
+  ) {
+    openPopover.hidePopover();
+    return true;
   }
   const activeDialog = document.querySelector('dialog[open]');
   if (activeDialog === null) {

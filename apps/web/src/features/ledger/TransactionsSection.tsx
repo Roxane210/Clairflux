@@ -1,14 +1,21 @@
 import {
   formatMoney,
   type Account,
-  type AccountId,
   type CategorizationRule,
+  type Category,
   type RuleId,
   type Transaction,
   type TransactionId,
   type TransactionNote,
 } from '@clairflux/shared';
 import { memo, useCallback, useDeferredValue, useMemo, useState, type ReactElement } from 'react';
+import type {
+  CategoryActionResult,
+  CreateCategoryInput,
+  DeleteCategoryInput,
+  MergeCategoryInput,
+  UpdateCategoryInput,
+} from '../../offline/useOfflineStore';
 import {
   ACCOUNT_TYPE_LABELS,
   BANK_LABELS,
@@ -18,6 +25,7 @@ import {
   type ResolvedDateBounds,
   type TransactionsSubTab,
 } from '../dashboard/types';
+import { CategoriesTab } from './CategoriesTab';
 import { exportTransactionsToCsv } from './csvExport';
 import { RulesTab, type SaveRuleInput } from './RulesTab';
 
@@ -26,6 +34,7 @@ export interface TransactionsSectionProps {
   readonly transactions: readonly Transaction[];
   readonly notes: readonly TransactionNote[];
   readonly rules: readonly CategorizationRule[];
+  readonly categories?: readonly Category[] | undefined;
   readonly activeSubTab: TransactionsSubTab;
   readonly onChangeSubTab: (subTab: TransactionsSubTab) => void;
   readonly currencyMode: CurrencyViewMode;
@@ -38,6 +47,10 @@ export interface TransactionsSectionProps {
   readonly onReorderRule: (ruleId: RuleId, direction: 'up' | 'down') => void;
   readonly onToggleRule: (ruleId: RuleId) => void;
   readonly onReapplyRules: () => void;
+  readonly onCreateCategory: (input: CreateCategoryInput) => Promise<CategoryActionResult>;
+  readonly onUpdateCategory: (input: UpdateCategoryInput) => Promise<CategoryActionResult>;
+  readonly onMergeCategory: (input: MergeCategoryInput) => Promise<CategoryActionResult>;
+  readonly onDeleteCategory: (input: DeleteCategoryInput) => Promise<CategoryActionResult>;
 }
 
 const BAR_STYLE = {
@@ -55,6 +68,7 @@ export const TransactionsSection = memo(function TransactionsSection({
   transactions,
   notes,
   rules,
+  categories,
   activeSubTab,
   onChangeSubTab,
   currencyMode,
@@ -67,6 +81,10 @@ export const TransactionsSection = memo(function TransactionsSection({
   onReorderRule,
   onToggleRule,
   onReapplyRules,
+  onCreateCategory,
+  onUpdateCategory,
+  onMergeCategory,
+  onDeleteCategory,
 }: TransactionsSectionProps): ReactElement {
   const [searchQuery, setSearchQuery] = useState('');
   const [onlyWithNotes, setOnlyWithNotes] = useState(false);
@@ -128,6 +146,9 @@ export const TransactionsSection = memo(function TransactionsSection({
           <button type="button" className="cf-pill-btn" aria-pressed={activeSubTab === 'rules'} onClick={() => onChangeSubTab('rules')}>
             Règles de catégorisation
           </button>
+          <button type="button" className="cf-pill-btn" aria-pressed={activeSubTab === 'categories'} onClick={() => onChangeSubTab('categories')}>
+            Catégories
+          </button>
         </div>
       </div>
 
@@ -136,12 +157,22 @@ export const TransactionsSection = memo(function TransactionsSection({
           accounts={accounts}
           transactions={transactions}
           rules={rules}
+          categories={categories}
           isOnline={isOnline}
           rulePrefillPattern={rulePrefillPattern}
           onSaveRule={onSaveRule}
           onReorderRule={onReorderRule}
           onToggleRule={onToggleRule}
           onReapplyRules={onReapplyRules}
+        />
+      ) : activeSubTab === 'categories' ? (
+        <CategoriesTab
+          categories={categories}
+          isOnline={isOnline}
+          onCreateCategory={onCreateCategory}
+          onUpdateCategory={onUpdateCategory}
+          onMergeCategory={onMergeCategory}
+          onDeleteCategory={onDeleteCategory}
         />
       ) : (
         <>

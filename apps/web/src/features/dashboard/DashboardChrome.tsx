@@ -82,7 +82,7 @@ export const DesktopSidebar = memo(function DesktopSidebar({
       <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
         <div>
           <h2 style={{ fontSize: '1.125rem' }}>ClairFlux</h2>
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
+          <p className="cf-rail-meta">
             BoursoBank · Revolut
           </p>
         </div>
@@ -109,7 +109,7 @@ export const DesktopSidebar = memo(function DesktopSidebar({
         </nav>
       </div>
 
-      <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', display: 'grid', gap: '4px' }}>
+      <div className="cf-rail-meta">
         <p style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
           {isOnline ? 'En ligne' : 'Hors-ligne (notes locales actives)'}
         </p>
